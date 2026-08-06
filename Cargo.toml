@@ -13,6 +13,8 @@ name = "ric3"
 path = "src/main.rs"
 
 [dependencies]
+# Inductor instrumentation (not upstream; see src/inductor.rs)
+inductor-trace = { path = "../../crates/inductor-trace" }
 aig = { path = "./deps/aig-rs", version = "0.4.6" }
 cadical = { package = "satif-cadical", path = "./deps/cadical-rs", version = "0.2.2" }
 kissat = { package = "satif-kissat", path = "./deps/kissat-rs", version = "0.5.2" }

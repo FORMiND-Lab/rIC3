@@ -6,6 +6,7 @@ pub mod config;
 pub mod frontend;
 pub mod gipsat;
 pub mod ic3;
+pub mod inductor;
 pub mod kind;
 pub mod mp;
 pub mod polynexus;

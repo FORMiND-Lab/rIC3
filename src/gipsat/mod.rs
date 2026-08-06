@@ -52,6 +52,12 @@ pub struct DagCnfSolver {
     constrain_act: Var,
     dc: Gptr<DagCnf>,
     trivial_unsat: bool,
+    /// Inductor instrumentation: per-query timings and counters.
+    pub probe: crate::inductor::QueryProbe,
+    /// Inductor: fanout degree per variable, i.e. how many gates a
+    /// gate-implication BCP path would re-evaluate when this variable is
+    /// assigned. Precomputed once so the hot path costs one lookup.
+    fanout_len: VarMap<u32>,
     mark: LitSet,
     rng: SmallRng,
     pub cfg: Config,
@@ -100,6 +106,8 @@ impl DagCnfSolver {
             constraint: Default::default(),
             statistic: Default::default(),
             trivial_unsat: false,
+            probe: Default::default(),
+            fanout_len: Default::default(),
             rng: SmallRng::seed_from_u64(0),
             cfg: Default::default(),
             mark: Default::default(),
@@ -107,6 +115,22 @@ impl DagCnfSolver {
         while solver.num_var() < solver.dc.num_var() {
             solver.new_var();
         }
+        // Invert the DagCnf dependency lists into fanout degrees. `dep(v)` is
+        // v's fanins, so v contributes one fanout entry to each of them. The
+        // gate that v itself defines must also be re-evaluated, which is the
+        // `+1` applied below for non-leaf variables.
+        solver.fanout_len.reserve(solver.dc.max_var());
+        for v in solver.dc.var_iter() {
+            for d in solver.dc.dep(v).iter() {
+                solver.fanout_len[*d] += 1;
+            }
+        }
+        for v in solver.dc.var_iter() {
+            if !solver.dc.is_leaf(v) {
+                solver.fanout_len[v] += 1;
+            }
+        }
+
         for cls in dc.clause() {
             solver.add_clause_inner(cls, ClauseKind::Trans);
         }
@@ -175,8 +199,13 @@ impl DagCnfSolver {
         constraint: Vec<LitVec>,
         bucket: bool,
     ) -> bool {
+        // GipSAT defers the previous query's teardown to here, so time it
+        // separately: it is the previous query's cost showing up in this one's
+        // setup, and the hardware design needs to know how big it is.
+        let td = crate::inductor::Timer::start();
         self.backtrack(0, self.temporary_domain);
         self.clean_temporary();
+        self.probe.t_teardown_ns = td.ns();
         self.prepared_vsids = false;
 
         for mut c in constraint {
@@ -204,6 +233,8 @@ impl DagCnfSolver {
         }
         self.statistic.avg_decide_var +=
             self.domain.len() as f64 / (self.dc.num_var() - self.trail.len()) as f64;
+        self.probe.domain_size = self.domain.len();
+        self.probe.n_var_total = self.dc.num_var() as u32;
         true
     }
 
@@ -222,11 +253,28 @@ impl DagCnfSolver {
         }
         self.statistic.num_solve += 1;
         let start = Instant::now();
+
+        // --- Inductor instrumentation ---
+        // `t_setup` runs from here to the first decision: domain computation,
+        // temporary-clause install, learnt-DB cleanup, simplification. Together
+        // with `t_core` it is the per-query fixed overhead that a resident
+        // hardware engine can drive toward zero.
+        self.probe.begin();
+        let probe_total = crate::inductor::Timer::start();
+        let probe_setup = crate::inductor::Timer::start();
+        self.probe.n_assump = assump.len() as u32;
+        self.probe.n_constraint_lits = constraint.iter().map(|c| c.len() as u32).sum();
+        self.probe.n_learnt = self.cdb.num_learnt() as u32;
+        self.probe.n_lemma = self.cdb.num_lemma() as u32;
+
         let mut assumption;
         if self.propagate() != CREF_NONE {
             self.trivial_unsat = true;
             self.unsat_core.clear();
             self.statistic.avg_solve_time += start.elapsed();
+            self.probe.t_setup_ns = probe_setup.ns();
+            self.probe.t_total_ns = probe_total.ns();
+            crate::inductor::record(&self.probe, Some(false));
             return Some(false);
         }
         let assump = if !constraint.is_empty() {
@@ -241,6 +289,9 @@ impl DagCnfSolver {
             ) {
                 self.unsat_core.clear();
                 self.statistic.avg_solve_time += start.elapsed();
+                self.probe.t_setup_ns = probe_setup.ns();
+                self.probe.t_total_ns = probe_total.ns();
+                crate::inductor::record(&self.probe, Some(false));
                 return Some(false);
             };
             &assumption
@@ -248,9 +299,42 @@ impl DagCnfSolver {
             assert!(self.new_round(domain.chain(assump.iter().map(|l| l.var())), vec![], true));
             assump
         };
+        // Replay: the assumption literals and the domain the solver just
+        // computed, not merely their sizes. Recorded after `new_round` because
+        // that is what fills the domain, and before the query record is written
+        // because the writer stamps both streams with the same id.
+        if crate::inductor::enabled() {
+            let raw: Vec<u32> = assump.iter().map(|l| Into::<u32>::into(*l)).collect();
+            let dom: Vec<u32> = (0..self.domain.len())
+                .map(|i| Into::<u32>::into(self.domain[i]))
+                .collect();
+            crate::inductor::replay_assumptions(&raw, &dom);
+        }
         self.clean_learnt(true);
         self.simplify();
+        self.probe.t_setup_ns = probe_setup.ns();
+
+        let probe_search = crate::inductor::Timer::start();
         let res = self.search_with_restart(assump, limit);
+        // Core extraction happens inside the search loop, so subtract it out to
+        // leave `t_search` as decide/BCP/conflict-analysis only.
+        self.probe.t_search_ns = probe_search.ns().saturating_sub(self.probe.t_core_ns);
+        self.probe.t_total_ns = probe_total.ns();
+        {
+            use std::sync::atomic::Ordering as O;
+            crate::inductor::BCP_NS.fetch_add(self.probe.t_bcp_ns as u64, O::Relaxed);
+            crate::inductor::SEARCH_NS.fetch_add(self.probe.t_search_ns as u64, O::Relaxed);
+            crate::inductor::TOTAL_NS.fetch_add(self.probe.t_total_ns as u64, O::Relaxed);
+            // Reported as the run goes, not only at the end: the benchmarks
+            // this matters for do not terminate inside a useful timeout, and a
+            // killed process never reaches `finish`.
+            let n = crate::inductor::N_QUERY.fetch_add(1, O::Relaxed) + 1;
+            if n % 20000 == 0 {
+                crate::inductor::report_bcp_share();
+            }
+        }
+        crate::inductor::record(&self.probe, res);
+
         self.statistic.avg_solve_time += start.elapsed();
         res
     }
@@ -359,6 +443,10 @@ impl Satif for DagCnfSolver {
         self.unsat_core.reserve(var);
         self.domain.reserve(var);
         self.mark.reserve(var);
+        // Must grow with every other var-indexed structure: VarMap indexes with
+        // get_unchecked in release builds, so missing this is an out-of-bounds
+        // read, not a panic. Auxiliary variables drive no gates, so 0 is right.
+        self.fanout_len.reserve(var);
         self.constrain_act = var;
         v
     }

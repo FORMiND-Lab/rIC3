@@ -304,8 +304,11 @@ impl IC3 {
     }
 }
 
-impl Engine for IC3 {
-    fn check(&mut self) -> McResult {
+impl IC3 {
+    /// Inductor: the real check loop. `Engine::check` wraps this so the query
+    /// trace is opened and closed exactly once no matter which of the many
+    /// exits below fires.
+    fn check_traced(&mut self) -> McResult {
         if !self.prep_prop_base() {
             self.tracer.trace_state(None, McResult::SAT(0));
             self.finish_progress(McResult::SAT(0));
@@ -317,7 +320,12 @@ impl Engine for IC3 {
             let start = Instant::now();
             debug!("blocking phase begin");
             loop {
-                let terminal = match self.block(None) {
+                let lvl = self.level();
+                let terminal = match crate::inductor::in_phase(
+                    inductor_trace::Phase::Block,
+                    lvl,
+                    || self.block(None),
+                ) {
                     BlockResult::Failure(depth) => Some(McResult::SAT(depth)),
                     BlockResult::Proved => Some(McResult::UNSAT),
                     BlockResult::OverallTimeLimitExceeded => {
@@ -357,7 +365,12 @@ impl Engine for IC3 {
             self.extend();
             self.render_progress();
             let start = Instant::now();
-            let propagate = self.propagate(None);
+            let lvl = self.level();
+            let propagate = crate::inductor::in_phase(
+                inductor_trace::Phase::Push,
+                lvl,
+                || self.propagate(None),
+            );
             self.statistic.propagate.overall_time += start.elapsed();
             if propagate {
                 self.tracer.trace_state(None, McResult::UNSAT);
@@ -367,6 +380,130 @@ impl Engine for IC3 {
             self.propagate_to_inf();
             self.render_progress();
         }
+    }
+}
+
+impl Engine for IC3 {
+    fn check(&mut self) -> McResult {
+        let shape = {
+            let rel = &self.tsctx.rel;
+            let gates = rel.var_iter().filter(|v| !rel.is_leaf(*v)).count() as u64;
+            // Size of the inverted fanin lists, counted exactly as the
+            // gate-implication path walks them: v contributes one entry to each
+            // of its fanins, plus one self-entry for the gate it defines. This
+            // must stay in step with how `fanout_len` is built in gipsat/mod.rs.
+            let deps: u64 = rel.var_iter().map(|v| rel.dep(v).len() as u64).sum();
+
+            // Gate shape, as the HLS evaluator has to unroll over it. Clauses
+            // are grouped by defining variable, which is exactly the grouping
+            // the hardware's per-gate record uses, so this counts the same
+            // thing the kernel would.
+            let mut max_gate_clauses = 0u32;
+            let mut max_gate_slots = 0u32;
+            let mut max_clause_len = 0u32;
+            let mut n_gate_unfit = 0u32;
+            let mut gate_clause_hist = [0u32; 6];
+            let mut visit_clause_hist = [0u64; 6];
+            let mut pool_words = 0u64;
+            let mut total_lits = 0u64;
+            let mut pool_words_aligned = [0u64; 3];
+            let mut slots: Vec<Var> = Vec::with_capacity(8);
+            for (_v, cls_of_gate) in rel.iter() {
+                if cls_of_gate.is_empty() {
+                    continue;
+                }
+                let n_cls = cls_of_gate.len() as u32;
+                if n_cls > max_gate_clauses {
+                    max_gate_clauses = n_cls;
+                }
+                slots.clear();
+                let mut longest = 0u32;
+                for cls in cls_of_gate.iter() {
+                    let l = cls.len() as u32;
+                    if l > longest {
+                        longest = l;
+                    }
+                    // The pool stores each clause as one length word followed by
+                    // its literals. The aligned variants pad the literal run to
+                    // a lane boundary, which is what would make a lane's bank
+                    // index a compile-time constant.
+                    total_lits += l as u64;
+                    pool_words += 1 + l as u64;
+                    for (idx, lanes) in [4u64, 8, 16].iter().enumerate() {
+                        let padded = (l as u64).div_ceil(*lanes) * lanes;
+                        pool_words_aligned[idx] += 1 + padded;
+                    }
+                    for lit in cls.iter() {
+                        if !slots.contains(&lit.var()) {
+                            slots.push(lit.var());
+                        }
+                    }
+                }
+                if longest > max_clause_len {
+                    max_clause_len = longest;
+                }
+                if slots.len() as u32 > max_gate_slots {
+                    max_gate_slots = slots.len() as u32;
+                }
+                // The kernel's fixed-size record holds 6 clauses over 4 distinct
+                // variables with at most 3 literals each. Past any of those, the
+                // gate cannot be stored as one entry.
+                if n_cls > 6 || slots.len() > 4 || longest > 3 {
+                    n_gate_unfit += 1;
+                }
+                // A gate sits in the fanout list of every variable it mentions,
+                // so its fanout degree -- how often propagation has to evaluate
+                // it -- is exactly its distinct-variable count. Weighting by
+                // that gives the size distribution the datapath actually sees,
+                // as opposed to the one the netlist merely contains.
+                let bucket = match n_cls {
+                    0..=4 => 0,
+                    5..=6 => 1,
+                    7..=8 => 2,
+                    9..=16 => 3,
+                    17..=64 => 4,
+                    _ => 5,
+                };
+                gate_clause_hist[bucket] += 1;
+                visit_clause_hist[bucket] += slots.len() as u64;
+            }
+
+            crate::inductor::NetlistShape {
+                n_var: rel.num_var() as u32,
+                n_clause: rel.num_clause() as u32,
+                n_gate: gates as u32,
+                n_fanout_total: deps + gates,
+                max_gate_clauses,
+                max_gate_slots,
+                max_clause_len,
+                n_gate_unfit,
+                gate_clause_hist,
+                visit_clause_hist,
+                pool_words,
+                total_lits,
+                pool_words_aligned,
+            }
+        };
+        crate::inductor::dump_netlist(&self.tsctx.rel);
+        crate::inductor::init("", shape);
+        let t0 = Instant::now();
+        let res = self.check_traced();
+        let name = match res {
+            McResult::UNSAT => "safe",
+            McResult::SAT(_) => "unsafe",
+            McResult::Unknown(_) => "unknown",
+        };
+        crate::inductor::finish(
+            name,
+            t0.elapsed().as_nanos() as u64,
+            (
+                self.statistic.mic_drop.succ() as u64,
+                self.statistic.mic_drop.total() as u64,
+            ),
+            self.statistic.num_down as u64,
+            self.statistic.num_down_sat as u64,
+        );
+        res
     }
 
     fn add_tracer(&mut self, tracer: Box<dyn TracerIf>) {

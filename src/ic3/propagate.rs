@@ -14,6 +14,8 @@ impl IC3 {
         for frame_idx in from..level {
             let mut frame = self.frame[frame_idx].clone();
             frame.sort_by_key(|x| x.len());
+            let _op =
+                crate::inductor::macro_scope(inductor_trace::Phase::Push, frame_idx + 1);
             for mut lemma in frame {
                 if self.frame[frame_idx].iter().all(|l| l.ne(&lemma)) {
                     continue;
@@ -21,6 +23,7 @@ impl IC3 {
                 for ctp in 0..3 {
                     if self
                         .blocked(frame_idx + 1, &lemma)
+                        .in_phase(inductor_trace::Phase::Push)
                         .with_act_order(false)
                         .check()
                     {
@@ -43,7 +46,13 @@ impl IC3 {
                     }
                     let (ctp, _) = self.get_pred(frame_idx + 1, false);
                     if !self.tsctx.cube_subsume_init(&ctp)
-                        && self.solvers[frame_idx - 1].inductive(&ctp, true)
+                        && {
+                            let _ctx = crate::inductor::set_context(
+                                inductor_trace::Phase::Push,
+                                frame_idx - 1,
+                            );
+                            self.solvers[frame_idx - 1].inductive(&ctp, true)
+                        }
                     {
                         let core = self.solvers[frame_idx - 1].inductive_core().unwrap();
                         let mic =
@@ -71,7 +80,10 @@ impl IC3 {
         };
         let mut lemma = lastf.swap_remove(lidx);
         loop {
-            if self.inf_solver.inductive(&lemma, true) {
+            if {
+                let _ctx = crate::inductor::set_context(inductor_trace::Phase::Inf, usize::MAX);
+                self.inf_solver.inductive(&lemma, true)
+            } {
                 if let Some(po) = &mut lemma.po {
                     self.obligations.remove(po);
                 }
@@ -97,7 +109,11 @@ impl IC3 {
         lastf.shuffle(&mut self.rng);
         while let Some(mut lemma) = lastf.pop() {
             loop {
-                if self.inf_solver.inductive(&lemma, true) {
+                if {
+                    let _ctx =
+                        crate::inductor::set_context(inductor_trace::Phase::Inf, usize::MAX);
+                    self.inf_solver.inductive(&lemma, true)
+                } {
                     if let Some(po) = &mut lemma.po {
                         self.obligations.remove(po);
                     }

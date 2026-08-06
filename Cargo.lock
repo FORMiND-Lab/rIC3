@@ -1154,6 +1154,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "inductor-trace"
+version = "0.1.0"
+
+[[package]]
 name = "instability"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1916,6 +1920,7 @@ dependencies = [
  "env_logger",
  "fork",
  "giputils",
+ "inductor-trace",
  "intertrait",
  "ipc-channel",
  "linkme",

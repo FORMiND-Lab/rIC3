@@ -76,6 +76,7 @@ impl IC3 {
             self.statistic.num_down_sat += 1;
             if self
                 .blocked(frame, &cube)
+                .in_phase(inductor_trace::Phase::Gen)
                 .with_act_order(false)
                 .with_strengthen()
                 .with_constraint(constraint)
@@ -137,6 +138,7 @@ impl IC3 {
             self.statistic.num_down_sat += 1;
             if self
                 .blocked(frame, &cube)
+                .in_phase(inductor_trace::Phase::Gen)
                 .with_act_order(false)
                 .with_strengthen()
                 .check()
@@ -212,6 +214,7 @@ impl IC3 {
         parameter: DropVarParameter,
     ) -> LitVec {
         let start = Instant::now();
+        let _op = crate::inductor::macro_scope(inductor_trace::Phase::Gen, frame);
         if parameter.level == 0 {
             self.solvers[frame - 1].set_domain(
                 self.tsctx

@@ -13,6 +13,17 @@ impl DagCnfSolver {
 
     #[inline]
     pub fn assign(&mut self, lit: Lit, reason: CRef) {
+        // Inductor: what a gate-implication BCP path would have to visit, and
+        // what that costs at each candidate lane count. ceil() per assignment,
+        // because a variable with fanout 3 occupies a 16-lane datapath for a
+        // whole cycle and leaves 13 lanes idle -- dividing totals would hide
+        // exactly the underutilisation we need to size the datapath against.
+        let fan = self.fanout_len[lit.var()];
+        self.probe.n_fanout_visit += fan as u64;
+        for (i, lanes) in crate::inductor::LANES.iter().enumerate() {
+            self.probe.bcp_cycles[i] += fan.div_ceil(*lanes) as u64;
+        }
+        self.probe.n_assign += 1;
         self.trail.push(lit);
         self.value.set(lit);
         self.reason[lit] = reason;
@@ -81,9 +92,14 @@ impl DagCnfSolver {
     pub fn search(&mut self, assumption: &[Lit], noc: Option<f64>) -> Option<bool> {
         let mut num_conflict = 0.0_f64;
         'ml: loop {
+            // BCP alone, separated from the decide and analyse it shares
+            // `t_search` with.
+            let probe_bcp = crate::inductor::Timer::start();
             let conflict = self.propagate();
+            self.probe.t_bcp_ns = self.probe.t_bcp_ns.saturating_add(probe_bcp.ns());
             if conflict != CREF_NONE {
                 num_conflict += 1.0;
+                self.probe.n_conflict += 1;
                 if self.highest_level() == 0 {
                     self.unsat_core.clear();
                     return Some(false);
@@ -124,7 +140,12 @@ impl DagCnfSolver {
                             }
                         }
                         Lbool::FALSE => {
+                            // UNSAT-core extraction: the other half of the
+                            // per-query fixed overhead, and the operation with
+                            // essentially no hardware prior art.
+                            let t = crate::inductor::Timer::start();
                             self.analyze_unsat_core(a);
+                            self.probe.t_core_ns += t.ns();
                             return Some(false);
                         }
                         _ => {

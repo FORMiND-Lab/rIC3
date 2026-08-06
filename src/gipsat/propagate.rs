@@ -100,6 +100,7 @@ impl DagCnfSolver {
                     }
                     return cid;
                 }
+                self.probe.n_prop += 1;
                 self.assign(cref0, cid);
                 w += 1;
             }
@@ -164,6 +165,7 @@ impl DagCnfSolver {
                     }
                     return cid;
                 }
+                self.probe.n_prop += 1;
                 self.assign(cref0, cid);
                 w += 1;
             }

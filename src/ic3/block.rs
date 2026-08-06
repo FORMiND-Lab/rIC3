@@ -20,7 +20,9 @@ pub enum BlockResult {
 impl IC3 {
     fn push_lemma(&mut self, frame: usize, mut cube: LitVec) -> (usize, LitVec) {
         let start = Instant::now();
+        let _op = crate::inductor::macro_scope(inductor_trace::Phase::Push, frame);
         for i in frame + 1..=self.level() {
+            let _ctx = crate::inductor::set_context(inductor_trace::Phase::Push, i);
             if self.solvers[i - 1].inductive(&cube, true) {
                 cube = self.solvers[i - 1].inductive_core().unwrap_or(cube);
             } else {
@@ -127,6 +129,7 @@ impl IC3 {
             let blocked_start = Instant::now();
             let blocked = self
                 .blocked(po.frame, &po.state)
+                .in_phase(inductor_trace::Phase::Block)
                 .with_act_order(false)
                 .check();
             self.statistic.block.blocked_time += blocked_start.elapsed();
@@ -199,7 +202,11 @@ impl IC3 {
         *limit -= 1;
         loop {
             if self
+                // CTG blocking is reached from `ctg_down` inside generalization,
+                // so it counts as Q_gen in the paper's taxonomy even though the
+                // query has the shape of a blocking query.
                 .blocked(frame, &lemma)
+                .in_phase(inductor_trace::Phase::Gen)
                 .with_act_order(false)
                 .with_strengthen()
                 .with_constraint(constraint)

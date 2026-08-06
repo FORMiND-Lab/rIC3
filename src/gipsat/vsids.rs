@@ -321,6 +321,7 @@ impl DagCnfSolver {
                     Lit::new(decide, self.phase_saving[decide] != Lbool::FALSE)
                 };
                 self.pos_in_trail.push(self.trail.len() as u32);
+                self.probe.n_decide += 1;
                 self.assign(decide, CREF_NONE);
                 return true;
             }

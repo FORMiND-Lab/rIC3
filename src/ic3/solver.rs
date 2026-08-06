@@ -12,6 +12,8 @@ pub(super) struct Blocked<'a, 'cube> {
     order: BlockedOrder,
     strengthen: bool,
     constraint: Vec<LitVec>,
+    /// Inductor: which IC3 activity this query serves. Only the caller knows.
+    phase: inductor_trace::Phase,
 }
 
 #[derive(Default)]
@@ -37,6 +39,12 @@ impl<'a, 'cube> Blocked<'a, 'cube> {
         self
     }
 
+    /// Inductor: label the query for the workload trace.
+    pub(super) fn in_phase(mut self, phase: inductor_trace::Phase) -> Self {
+        self.phase = phase;
+        self
+    }
+
     pub(super) fn with_strengthen(mut self) -> Self {
         self.strengthen = true;
         self
@@ -55,6 +63,7 @@ impl<'a, 'cube> Blocked<'a, 'cube> {
             order,
             strengthen,
             constraint,
+            phase,
         } = self;
 
         let ordered_cube = match order {
@@ -74,6 +83,7 @@ impl<'a, 'cube> Blocked<'a, 'cube> {
             .as_ref()
             .map(|cube| cube.as_slice())
             .unwrap_or_else(|| cube.as_slice());
+        let _ctx = crate::inductor::set_context(phase, frame);
         ic3.solvers[frame - 1].inductive_with_constrain(cube, strengthen, constraint)
     }
 }
@@ -86,6 +96,8 @@ impl IC3 {
         } else {
             let start = Instant::now();
             assert!(self.tsctx.bad.len() == 1);
+            let lvl = self.solvers.len();
+            let _ctx = crate::inductor::set_context(inductor_trace::Phase::Bad, lvl);
             let res = self.solvers.last_mut().unwrap().solve(&[self.tsctx.bad[0]]);
             self.statistic.block.get_bad_time += start.elapsed();
             res.then(|| {
@@ -116,6 +128,7 @@ impl IC3 {
             frame,
             cube,
             order: BlockedOrder::default(),
+            phase: inductor_trace::Phase::Other,
             strengthen: false,
             constraint: Vec::new(),
         }
