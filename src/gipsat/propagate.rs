@@ -67,7 +67,7 @@ impl DagCnfSolver {
                 }
                 let cid = unsafe { (*wtrs_p_dat.add(w)).clause };
                 let mut cref = self.cdb.get(cid);
-                {
+                if crate::inductor::kind_counting() {
                     // Which side of D2 this visit belongs to. `is_trans` is the
                     // transition relation, which the accelerator's gate
                     // implication covers; everything else is the unbuilt second
