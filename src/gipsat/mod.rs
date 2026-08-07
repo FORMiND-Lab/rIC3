@@ -342,6 +342,16 @@ impl DagCnfSolver {
             if n % 1000 == 0 {
                 let n_lit = (self.dc.num_var() + 1) * 2;
                 let (visits, lits) = self.cdb.lemma_occurrence_visits(&self.trail, n_lit);
+                let (_v, sat, raw, blk) = self.cdb.lemma_blocker_saving(&self.trail, n_lit, |l| {
+                    match self.value.v(l) {
+                        logicrs::Lbool::TRUE => Some(true),
+                        logicrs::Lbool::FALSE => Some(false),
+                        _ => None,
+                    }
+                });
+                crate::inductor::OCC_SAT.fetch_add(sat, O::Relaxed);
+                crate::inductor::OCC_RAW.fetch_add(raw, O::Relaxed);
+                crate::inductor::OCC_BLK.fetch_add(blk, O::Relaxed);
                 crate::inductor::OCC_VISITS.fetch_add(visits, O::Relaxed);
                 crate::inductor::OCC_LITS.fetch_add(lits, O::Relaxed);
                 crate::inductor::OCC_SAMPLES.fetch_add(1, O::Relaxed);

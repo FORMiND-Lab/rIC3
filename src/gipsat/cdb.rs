@@ -341,6 +341,61 @@ impl ClauseDB {
     /// O(lemma literals + trail). Call it on a sample of queries, never on all
     /// of them: walking the lemma database every query doubled rIC3's runtime
     /// when that was tried.
+    /// As above, but also counting what a blocker would save: for each clause an
+    /// occurrence index would visit, whether it is already satisfied, and how
+    /// many literals reading it would have cost.
+    ///
+    /// Returns (visits, satisfied visits, literals read without a blocker,
+    /// literals read with one). The gap between the last two is what the blocker
+    /// is worth here, and 7m says it is worth nothing on the gate side -- the
+    /// difference being that a lemma clause is fifty times longer.
+    pub fn lemma_blocker_saving<F: Fn(Lit) -> Option<bool>>(
+        &self,
+        trail: &[Lit],
+        n_lit: usize,
+        value: F,
+    ) -> (u64, u64, u64, u64) {
+        let mut occ: Vec<Vec<u32>> = vec![Vec::new(); n_lit];
+        for (ci, c) in self.lemmas.iter().enumerate() {
+            let cl = self.allocator.get(*c);
+            for i in 0..cl.len() {
+                let idx = Into::<u32>::into(cl[i]) as usize;
+                if idx < n_lit {
+                    occ[idx].push(ci as u32);
+                }
+            }
+        }
+        let (mut visits, mut sat_visits, mut raw, mut with_blocker) = (0u64, 0u64, 0u64, 0u64);
+        for p in trail {
+            let idx = Into::<u32>::into(!*p) as usize;
+            if idx >= n_lit {
+                continue;
+            }
+            for ci in occ[idx].iter() {
+                let cl = self.allocator.get(self.lemmas[*ci as usize]);
+                let len = cl.len() as u64;
+                visits += 1;
+                raw += len;
+                // Satisfied clauses are exactly the ones a blocker skips: one
+                // read instead of the whole clause.
+                let mut sat = false;
+                for i in 0..cl.len() {
+                    if value(cl[i]) == Some(true) {
+                        sat = true;
+                        break;
+                    }
+                }
+                if sat {
+                    sat_visits += 1;
+                    with_blocker += 1;
+                } else {
+                    with_blocker += len;
+                }
+            }
+        }
+        (visits, sat_visits, raw, with_blocker)
+    }
+
     pub fn lemma_occurrence_visits(&self, trail: &[Lit], n_lit: usize) -> (u64, u64) {
         let mut occ = vec![0u32; n_lit];
         let mut lits = 0u64;

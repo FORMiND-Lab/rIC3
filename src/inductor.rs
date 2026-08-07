@@ -461,6 +461,9 @@ pub static OCC_VISITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub static OCC_WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static OCC_LITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static OCC_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OCC_SAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OCC_RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OCC_BLK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static W_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static W_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -509,6 +512,17 @@ pub fn report_bcp_share() {
             let ow = W_OTHER.load(Ordering::Relaxed) as f64
                 / N_QUERY.load(Ordering::Relaxed).max(1) as f64;
             let ol = OCC_LITS.load(Ordering::Relaxed) as f64;
+            let sat = OCC_SAT.load(Ordering::Relaxed) as f64;
+            let raw = OCC_RAW.load(Ordering::Relaxed) as f64;
+            let blk = OCC_BLK.load(Ordering::Relaxed) as f64;
+            eprintln!(
+                "inductor: blocker on the lemma side -- {:.0}% of visited clauses already \
+                 satisfied; literal reads {:.0} -> {:.0} per query, {:.1}x less",
+                if ov > 0.0 { 100.0 * sat / ov } else { 0.0 },
+                raw / sm,
+                blk / sm,
+                if blk > 0.0 { raw / blk } else { 0.0 }
+            );
             eprintln!(
                 "inductor: second path indexing, {sm:.0} sampled queries -- occurrence \
                  index {:.0} clause visits/query against watched {:.0}, ratio {:.1}x; \
