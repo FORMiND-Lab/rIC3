@@ -115,6 +115,24 @@ pub fn replay_assumptions(assump: &[u32], domain: &[u32]) {
     }
 }
 
+/// Record one lemma into the replay stream as it is added.
+///
+/// Without this the stream carries assumptions and domains only, and the
+/// accelerator's second BCP path -- 30-65% of the literal work by 7p -- has no
+/// real data to run against. Bounded by the same replay limit as queries: a
+/// full run's lemmas are large where its statistics are not.
+pub fn replay_lemma(lits: &[u32]) {
+    if !enabled() || replay_limit() == 0 {
+        return;
+    }
+    if REPLAY_WRITTEN.load(Ordering::Relaxed) >= replay_limit() {
+        return;
+    }
+    if let Some(w) = WRITER.get() {
+        w.lock().unwrap().replay_lemma(lits);
+    }
+}
+
 /// Dump the transition relation to a file, if `INDUCTOR_DUMP_NETLIST` is set.
 ///
 /// The point is to get *real* netlists in front of the hardware packer and the

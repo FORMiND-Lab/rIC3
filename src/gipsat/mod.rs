@@ -503,6 +503,10 @@ impl Satif for DagCnfSolver {
         for l in clause.iter() {
             self.add_domain(l.var(), true);
         }
+        if crate::inductor::enabled() {
+            let raw: Vec<u32> = clause.iter().map(|l| Into::<u32>::into(*l)).collect();
+            crate::inductor::replay_lemma(&raw);
+        }
         self.add_clause_inner(clause, ClauseKind::Lemma);
     }
 
