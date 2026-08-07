@@ -454,6 +454,14 @@ pub fn kind_counting() -> bool {
     *ON.get_or_init(|| std::env::var("INDUCTOR_KIND").is_ok())
 }
 
+/// Sampled comparison of the two indexing schemes for the second BCP path.
+/// Accumulated on one query in a thousand, because the lemma-database walk it
+/// needs is what doubled runtime when it was done on every query.
+pub static OCC_VISITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OCC_WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OCC_LITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OCC_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static W_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static W_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static L_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -488,6 +496,27 @@ pub fn report_bcp_share() {
                 wo / n,
                 lt / n,
                 lo / n
+            );
+        }
+    }
+    {
+        let sm = OCC_SAMPLES.load(Ordering::Relaxed) as f64;
+        if sm > 0.0 {
+            let ov = OCC_VISITS.load(Ordering::Relaxed) as f64;
+            // Watched visits per query, from the run total. OCC_WATCH held a
+            // cumulative count and was being read as if it were per query,
+            // which made the ratio look like 0.0x.
+            let ow = W_OTHER.load(Ordering::Relaxed) as f64
+                / N_QUERY.load(Ordering::Relaxed).max(1) as f64;
+            let ol = OCC_LITS.load(Ordering::Relaxed) as f64;
+            eprintln!(
+                "inductor: second path indexing, {sm:.0} sampled queries -- occurrence \
+                 index {:.0} clause visits/query against watched {:.0}, ratio {:.1}x; \
+                 lemma db {:.0} literals",
+                ov / sm,
+                ow,
+                if ow > 0.0 { (ov / sm) / ow } else { 0.0 },
+                ol / sm
             );
         }
     }

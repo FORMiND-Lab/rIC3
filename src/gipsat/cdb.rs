@@ -327,6 +327,42 @@ impl ClauseDB {
     pub fn lemma_lits(&self) -> u64 {
         self.lemmas.iter().map(|c| self.allocator.get(*c).len() as u64).sum()
     }
+
+    /// What a static occurrence index would visit for one query: for every
+    /// literal on the trail, the lemma clauses mentioning its negation.
+    ///
+    /// This is the question the accelerator's second path turns on. Watched
+    /// literals visit two entries per clause and keep the invariant by *moving*
+    /// watches, which is the part hardware is bad at. An occurrence index never
+    /// moves anything -- it is a CSR array built once per lemma -- but it visits
+    /// a clause once per literal it contains, and lemma clauses run to 144
+    /// literals. This measures the trade instead of arguing it.
+    ///
+    /// O(lemma literals + trail). Call it on a sample of queries, never on all
+    /// of them: walking the lemma database every query doubled rIC3's runtime
+    /// when that was tried.
+    pub fn lemma_occurrence_visits(&self, trail: &[Lit], n_lit: usize) -> (u64, u64) {
+        let mut occ = vec![0u32; n_lit];
+        let mut lits = 0u64;
+        for c in self.lemmas.iter() {
+            let cl = self.allocator.get(*c);
+            for i in 0..cl.len() {
+                let idx = Into::<u32>::into(cl[i]) as usize;
+                if idx < n_lit {
+                    occ[idx] += 1;
+                    lits += 1;
+                }
+            }
+        }
+        let mut visits = 0u64;
+        for p in trail {
+            let idx = Into::<u32>::into(!*p) as usize;
+            if idx < n_lit {
+                visits += occ[idx] as u64;
+            }
+        }
+        (visits, lits)
+    }
 }
 
 impl Default for ClauseDB {

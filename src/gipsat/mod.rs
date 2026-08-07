@@ -334,6 +334,23 @@ impl DagCnfSolver {
         // leave `t_search` as decide/BCP/conflict-analysis only.
         self.probe.t_search_ns = probe_search.ns().saturating_sub(self.probe.t_core_ns);
         self.probe.t_total_ns = probe_total.ns();
+        if crate::inductor::kind_counting() {
+            use std::sync::atomic::Ordering as O;
+            // One query in a thousand. The walk is O(lemma literals); doing it
+            // on every query doubled runtime and produced nothing usable.
+            let n = crate::inductor::N_QUERY.load(O::Relaxed);
+            if n % 1000 == 0 {
+                let n_lit = (self.dc.num_var() + 1) * 2;
+                let (visits, lits) = self.cdb.lemma_occurrence_visits(&self.trail, n_lit);
+                crate::inductor::OCC_VISITS.fetch_add(visits, O::Relaxed);
+                crate::inductor::OCC_LITS.fetch_add(lits, O::Relaxed);
+                crate::inductor::OCC_SAMPLES.fetch_add(1, O::Relaxed);
+                crate::inductor::OCC_WATCH.store(
+                    crate::inductor::W_OTHER.load(O::Relaxed),
+                    O::Relaxed,
+                );
+            }
+        }
         {
             use std::sync::atomic::Ordering as O;
             crate::inductor::BCP_NS.fetch_add(self.probe.t_bcp_ns as u64, O::Relaxed);
