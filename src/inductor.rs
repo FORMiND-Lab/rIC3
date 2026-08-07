@@ -420,6 +420,22 @@ pub static BCP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 pub static SEARCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static N_QUERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Setup's three parts. `t_setup_ns` is 21.5% of a query and the largest block
+/// after BCP, but it is not one thing: the domain is a backward reachability
+/// walk over resident structure, which is the shape an accelerator is good at,
+/// while database cleanup and simplification are control-heavy, which is the
+/// shape it is worst at. Deciding whether any of setup belongs on a card needs
+/// them apart.
+pub static DOMAIN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DB_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SETUP_BCP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SETUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Search minus BCP is the second largest block, and it is two things with
+/// opposite hardware prospects: conflict analysis resolves clauses literal by
+/// literal, which is the shape BCP already is, while the decision heap is
+/// pointer work an accelerator's clock is thirteen times worse at.
+pub static ANALYZE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DECIDE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Print the running BCP share. Called periodically and at `finish`.
 pub fn report_bcp_share() {
@@ -430,6 +446,26 @@ pub fn report_bcp_share() {
     if t <= 0.0 {
         return;
     }
+    let dom = DOMAIN_NS.load(Ordering::Relaxed) as f64;
+    let db = DB_NS.load(Ordering::Relaxed) as f64;
+    let sbcp = SETUP_BCP_NS.load(Ordering::Relaxed) as f64;
+    let setup = SETUP_NS.load(Ordering::Relaxed) as f64;
+    let an = ANALYZE_NS.load(Ordering::Relaxed) as f64;
+    let de = DECIDE_NS.load(Ordering::Relaxed) as f64;
+    eprintln!(
+        "inductor: search-minus-bcp = analyze {:.1}% + decide {:.1}% of query",
+        100.0 * an / t,
+        100.0 * de / t
+    );
+    eprintln!(
+        "inductor: setup {:.1}% of query = domain {:.1}% + db {:.1}% + setup-bcp {:.1}% \
+         (+{:.1}% unaccounted)",
+        100.0 * setup / t,
+        100.0 * dom / t,
+        100.0 * db / t,
+        100.0 * sbcp / t,
+        100.0 * (setup - dom - db - sbcp).max(0.0) / t
+    );
     eprintln!(
         "inductor: {n} queries; bcp {:.1}% of query, {:.1}% of search   \
          (bcp {:.1} ms, search {:.1} ms, query {:.1} ms)",

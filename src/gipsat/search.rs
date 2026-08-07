@@ -104,7 +104,10 @@ impl DagCnfSolver {
                     self.unsat_core.clear();
                     return Some(false);
                 }
+                let probe_an = crate::inductor::Timer::start();
                 let (learnt, btl) = self.analyze(conflict);
+                crate::inductor::ANALYZE_NS
+                    .fetch_add(probe_an.ns() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.backtrack(btl, true);
                 if learnt.len() == 1 {
                     debug_assert!(btl == 0);
@@ -158,7 +161,11 @@ impl DagCnfSolver {
                         }
                     }
                 }
-                if !self.decide() {
+                let probe_de = crate::inductor::Timer::start();
+                let decided = self.decide();
+                crate::inductor::DECIDE_NS
+                    .fetch_add(probe_de.ns() as u64, std::sync::atomic::Ordering::Relaxed);
+                if !decided {
                     return Some(true);
                 }
             }

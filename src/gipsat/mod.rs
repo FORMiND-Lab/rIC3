@@ -167,7 +167,11 @@ impl DagCnfSolver {
                     Lbool::TRUE | Lbool::FALSE => todo!(),
                     _ => {
                         self.assign(clause[0], CREF_NONE);
-                        if self.propagate() != CREF_NONE {
+                        let probe_sbcp = crate::inductor::Timer::start();
+        let setup_conflict = self.propagate();
+        crate::inductor::SETUP_BCP_NS
+            .fetch_add(probe_sbcp.ns() as u64, std::sync::atomic::Ordering::Relaxed);
+        if setup_conflict != CREF_NONE {
                             self.trivial_unsat = true;
                         }
                         CREF_NONE
@@ -282,11 +286,15 @@ impl DagCnfSolver {
             assumption.push(self.constrain_act.lit());
             assumption.extend_from_slice(assump);
             let cc: Vec<Lit> = constraint.iter().flatten().copied().collect();
-            if !self.new_round(
+            let probe_dom = crate::inductor::Timer::start();
+            let nr_ok = self.new_round(
                 domain.chain(assump.iter().chain(cc.iter()).map(|l| l.var())),
                 constraint,
                 true,
-            ) {
+            );
+            crate::inductor::DOMAIN_NS
+                .fetch_add(probe_dom.ns() as u64, std::sync::atomic::Ordering::Relaxed);
+            if !nr_ok {
                 self.unsat_core.clear();
                 self.statistic.avg_solve_time += start.elapsed();
                 self.probe.t_setup_ns = probe_setup.ns();
@@ -296,7 +304,10 @@ impl DagCnfSolver {
             };
             &assumption
         } else {
+            let probe_dom2 = crate::inductor::Timer::start();
             assert!(self.new_round(domain.chain(assump.iter().map(|l| l.var())), vec![], true));
+            crate::inductor::DOMAIN_NS
+                .fetch_add(probe_dom2.ns() as u64, std::sync::atomic::Ordering::Relaxed);
             assump
         };
         // Replay: the assumption literals and the domain the solver just
@@ -310,8 +321,11 @@ impl DagCnfSolver {
                 .collect();
             crate::inductor::replay_assumptions(&raw, &dom);
         }
+        let probe_db = crate::inductor::Timer::start();
         self.clean_learnt(true);
         self.simplify();
+        crate::inductor::DB_NS
+            .fetch_add(probe_db.ns() as u64, std::sync::atomic::Ordering::Relaxed);
         self.probe.t_setup_ns = probe_setup.ns();
 
         let probe_search = crate::inductor::Timer::start();
@@ -325,6 +339,7 @@ impl DagCnfSolver {
             crate::inductor::BCP_NS.fetch_add(self.probe.t_bcp_ns as u64, O::Relaxed);
             crate::inductor::SEARCH_NS.fetch_add(self.probe.t_search_ns as u64, O::Relaxed);
             crate::inductor::TOTAL_NS.fetch_add(self.probe.t_total_ns as u64, O::Relaxed);
+            crate::inductor::SETUP_NS.fetch_add(self.probe.t_setup_ns as u64, O::Relaxed);
             // Reported as the run goes, not only at the end: the benchmarks
             // this matters for do not terminate inside a useful timeout, and a
             // killed process never reaches `finish`.
