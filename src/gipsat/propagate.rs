@@ -144,7 +144,7 @@ impl DagCnfSolver {
                 }
                 let cid = unsafe { (*wtrs_p_dat.add(w)).clause };
                 let mut cref = self.cdb.get(cid);
-                {
+                if crate::inductor::kind_counting() {
                     use std::sync::atomic::Ordering as O;
                     let n = cref.len() as u64;
                     if cref.is_trans() {

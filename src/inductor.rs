@@ -443,6 +443,17 @@ pub static DECIDE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// clauses, is unbuilt. Every propagation figure measured so far therefore
 /// covers `T` alone, and how much that leaves out has been assumed, not
 /// measured. These count watcher visits and literal reads on each side.
+/// Counting by kind costs two atomics on every watcher visit, in BCP's
+/// innermost loop, and that inflates BCP's own share -- 63.6% became 69.1% on
+/// token_ring with the counters in. The counts are still right; the *timings*
+/// taken from the same run are not. Off unless `INDUCTOR_KIND` is set, so the
+/// two cannot be read from one run by accident.
+pub fn kind_counting() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INDUCTOR_KIND").is_ok())
+}
+
 pub static W_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static W_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static L_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

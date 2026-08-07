@@ -320,6 +320,13 @@ impl ClauseDB {
     pub fn num_lemma(&self) -> usize {
         self.lemmas.len()
     }
+
+    /// Total literals across the lemma set, for sizing the accelerator's second
+    /// propagation path: watched literals visit two entries a clause, an
+    /// occurrence index one a literal, so the ratio is the mean clause length.
+    pub fn lemma_lits(&self) -> u64 {
+        self.lemmas.iter().map(|c| self.allocator.get(*c).len() as u64).sum()
+    }
 }
 
 impl Default for ClauseDB {
