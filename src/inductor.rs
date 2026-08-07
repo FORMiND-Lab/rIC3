@@ -436,6 +436,17 @@ pub static SETUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// pointer work an accelerator's clock is thirteen times worse at.
 pub static ANALYZE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DECIDE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// BCP work split by what kind of clause it lands on.
+///
+/// The accelerator implements gate implication over the transition relation
+/// only; D2's second path, watched literals for lemma, learnt and temporary
+/// clauses, is unbuilt. Every propagation figure measured so far therefore
+/// covers `T` alone, and how much that leaves out has been assumed, not
+/// measured. These count watcher visits and literal reads on each side.
+pub static W_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static W_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static L_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static L_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Print the running BCP share. Called periodically and at `finish`.
 pub fn report_bcp_share() {
@@ -450,6 +461,25 @@ pub fn report_bcp_share() {
     let db = DB_NS.load(Ordering::Relaxed) as f64;
     let sbcp = SETUP_BCP_NS.load(Ordering::Relaxed) as f64;
     let setup = SETUP_NS.load(Ordering::Relaxed) as f64;
+    {
+        let wt = W_TRANS.load(Ordering::Relaxed) as f64;
+        let wo = W_OTHER.load(Ordering::Relaxed) as f64;
+        let lt = L_TRANS.load(Ordering::Relaxed) as f64;
+        let lo = L_OTHER.load(Ordering::Relaxed) as f64;
+        let n = N_QUERY.load(Ordering::Relaxed).max(1) as f64;
+        if wt + wo > 0.0 {
+            eprintln!(
+                "inductor: bcp work by clause kind -- trans {:.1}% of visits, {:.1}% of \
+                 literal reads; per query {:.0} trans + {:.0} other visits, {:.0} + {:.0} reads",
+                100.0 * wt / (wt + wo),
+                100.0 * lt / (lt + lo).max(1.0),
+                wt / n,
+                wo / n,
+                lt / n,
+                lo / n
+            );
+        }
+    }
     let an = ANALYZE_NS.load(Ordering::Relaxed) as f64;
     let de = DECIDE_NS.load(Ordering::Relaxed) as f64;
     eprintln!(

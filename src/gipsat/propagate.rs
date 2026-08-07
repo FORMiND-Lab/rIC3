@@ -67,6 +67,21 @@ impl DagCnfSolver {
                 }
                 let cid = unsafe { (*wtrs_p_dat.add(w)).clause };
                 let mut cref = self.cdb.get(cid);
+                {
+                    // Which side of D2 this visit belongs to. `is_trans` is the
+                    // transition relation, which the accelerator's gate
+                    // implication covers; everything else is the unbuilt second
+                    // path.
+                    use std::sync::atomic::Ordering as O;
+                    let n = cref.len() as u64;
+                    if cref.is_trans() {
+                        crate::inductor::W_TRANS.fetch_add(1, O::Relaxed);
+                        crate::inductor::L_TRANS.fetch_add(n, O::Relaxed);
+                    } else {
+                        crate::inductor::W_OTHER.fetch_add(1, O::Relaxed);
+                        crate::inductor::L_OTHER.fetch_add(n, O::Relaxed);
+                    }
+                }
                 if cref[0] == !p {
                     cref.swap(0, 1);
                 }
@@ -129,6 +144,17 @@ impl DagCnfSolver {
                 }
                 let cid = unsafe { (*wtrs_p_dat.add(w)).clause };
                 let mut cref = self.cdb.get(cid);
+                {
+                    use std::sync::atomic::Ordering as O;
+                    let n = cref.len() as u64;
+                    if cref.is_trans() {
+                        crate::inductor::W_TRANS.fetch_add(1, O::Relaxed);
+                        crate::inductor::L_TRANS.fetch_add(n, O::Relaxed);
+                    } else {
+                        crate::inductor::W_OTHER.fetch_add(1, O::Relaxed);
+                        crate::inductor::L_OTHER.fetch_add(n, O::Relaxed);
+                    }
+                }
                 if cref[0] == !p {
                     cref.swap(0, 1);
                 }
