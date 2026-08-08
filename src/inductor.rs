@@ -146,6 +146,27 @@ pub fn replay_lemma(lits: &[u32]) {
     }
 }
 
+/// The transition relation in the flat form `ind_accel_load_netlist` takes:
+/// per gate, its variable, its clause count, then per clause a length and its
+/// literals. The same encoding the dump uses, so the two cannot drift.
+pub fn netlist_flat(dc: &logicrs::DagCnf) -> (u32, Vec<u32>) {
+    let mut out = Vec::with_capacity(1 << 16);
+    for (v, cls) in dc.iter() {
+        if cls.is_empty() {
+            continue;
+        }
+        out.push(Into::<u32>::into(v));
+        out.push(cls.len() as u32);
+        for c in cls.iter() {
+            out.push(c.len() as u32);
+            for l in c.iter() {
+                out.push(Into::<u32>::into(*l));
+            }
+        }
+    }
+    (dc.num_var() as u32, out)
+}
+
 /// Snapshot the live lemma set every `INDUCTOR_SNAPSHOT` queries, default 500.
 ///
 /// Bounded by the query replay limit, unlike individual lemmas: a snapshot is

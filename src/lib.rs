@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+pub mod accel;
 pub mod bmc;
 pub mod cegar;
 pub mod config;

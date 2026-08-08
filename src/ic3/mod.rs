@@ -203,8 +203,19 @@ impl IC3 {
         if let Some(predprop) = self.predprop.as_mut() {
             predprop.extend(self.frame.inf.iter().map(|l| l.as_litvec()));
         }
-        let solver = self.inf_solver.clone();
+        let mut solver = self.inf_solver.clone();
+        // A clone is a new solver and needs its own identity, or one id names
+        // every frame and the card mirrors all of their lemmas.
+        solver.dcs.accel_id = crate::gipsat::DagCnfSolver::fresh_accel_id();
         self.solvers.push(solver);
+        // Frame 1, as soon as it exists. Frame 0 holds the initial states and
+        // answers few queries; the frontier moves as the run goes on, so any
+        // fixed choice is arbitrary, but a fixed one is what lets the card's
+        // clause set stay in step with a solver's.
+        if self.solvers.len() == 2 {
+            crate::accel::bind_solver(self.solvers[1].dcs.accel_id);
+            log::info!("inductor: card bound to frame 1's solver");
+        }
         self.frame.extend();
         if self.level() == 0 {
             for init in self.tsctx.init.clone() {
@@ -485,6 +496,24 @@ impl Engine for IC3 {
             }
         };
         crate::inductor::dump_netlist(&self.tsctx.rel);
+        // Bring the card up on the same transition relation the solver is about
+        // to use. Shadow mode from here: the solver answers its own queries and
+        // the card is asked the same ones, so the state on the card is the
+        // state the solver has -- which a replay cannot guarantee (7v).
+        if let Some(path) = crate::accel::xclbin() {
+            let (n_var, flat) = crate::inductor::netlist_flat(&self.tsctx.rel);
+            match crate::accel::init(&path, n_var, &flat) {
+                Ok(()) => {
+                    log::info!("inductor: accelerator ready on {path}, {n_var} vars");
+                    // Binding happens in `extend`, where frame 1's solver is
+                    // created. Here the vector is still empty -- solvers are
+                    // built as the run extends -- and binding on an empty
+                    // vector is why the first attempt reported solver 0 and
+                    // never called the card.
+                }
+                Err(e) => log::warn!("inductor: accelerator unavailable ({e}); CPU only"),
+            }
+        }
         crate::inductor::init("", shape);
         let t0 = Instant::now();
         let res = self.check_traced();
@@ -505,6 +534,7 @@ impl Engine for IC3 {
                 .collect();
             crate::inductor::report_solver_fanout(self.solvers.len(), &per);
         }
+        crate::accel::report();
         crate::inductor::finish(
             name,
             t0.elapsed().as_nanos() as u64,

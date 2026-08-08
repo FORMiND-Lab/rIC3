@@ -52,6 +52,14 @@ pub struct DagCnfSolver {
     constrain_act: Var,
     dc: Gptr<DagCnf>,
     trivial_unsat: bool,
+    /// Identifies this solver to the accelerator.
+    ///
+    /// IC3 keeps one solver per frame, each with its own lemmas, and builds
+    /// them by cloning. A clone that carried this id would make one id name
+    /// every frame: `is_bound` would be true everywhere and every frame's
+    /// lemmas would go into the one engine on the card. That produced conflicts
+    /// on satisfiable queries until each clone got a fresh id.
+    pub accel_id: u64,
     /// Inductor instrumentation: per-query timings and counters.
     pub probe: crate::inductor::QueryProbe,
     /// Inductor: fanout degree per variable, i.e. how many gates a
@@ -80,6 +88,13 @@ impl Default for Config {
 }
 
 impl DagCnfSolver {
+    /// A new identity, for a solver that must not share the card with another.
+    pub fn fresh_accel_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn new(dc: &DagCnf) -> Self {
         let constrain_act = Var::CONST;
         let mut solver = Self {
@@ -106,6 +121,7 @@ impl DagCnfSolver {
             constraint: Default::default(),
             statistic: Default::default(),
             trivial_unsat: false,
+            accel_id: Self::fresh_accel_id(),
             probe: Default::default(),
             fanout_len: Default::default(),
             rng: SmallRng::seed_from_u64(0),
@@ -339,6 +355,53 @@ impl DagCnfSolver {
         // Core extraction happens inside the search loop, so subtract it out to
         // leave `t_search` as decide/BCP/conflict-analysis only.
         self.probe.t_search_ns = probe_search.ns().saturating_sub(self.probe.t_core_ns);
+
+        // Shadow, checked as an implication rather than an equality.
+        //
+        // Three earlier versions compared things that are not comparable: the
+        // trails (different clause sets, different domains), then the conflict
+        // verdict against `trivial_unsat` -- which is whether level 0 conflicts
+        // *before* the assumptions are asserted, while the card is given the
+        // assumptions and run to a fixpoint. Different questions.
+        //
+        // What does hold: if propagating the assumptions conflicts, the query
+        // is unsatisfiable. The converse does not -- the solver can need
+        // decisions and conflict analysis to get there -- so only one direction
+        // is a defect.
+        if crate::accel::is_bound(self.accel_id) && !assump.is_empty() {
+            crate::accel::sync_index();
+            let dom: Vec<u32> = (0..self.domain.len())
+                .map(|i| Into::<u32>::into(self.domain[i]))
+                .collect();
+            if !crate::accel::batching() {
+                crate::accel::set_domain(&dom);
+            }
+            let raw: Vec<u32> = assump.iter().map(|l| Into::<u32>::into(*l)).collect();
+            thread_local! {
+                static GOT: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            let mut got: Vec<u32> = GOT.with(|g| std::mem::take(&mut *g.borrow_mut()));
+            // Queued, not asked, when batching: per query the call costs more
+            // than the datapath runs for, and nothing here waits on the answer.
+            if crate::accel::batching() {
+                crate::accel::queue_verdict(&raw, res == Some(true));
+            } else if let Some(conflict) = crate::accel::verdict(&raw, &mut got) {
+                use std::sync::atomic::Ordering as O;
+                if conflict && res == Some(true) {
+                    // The card derived a contradiction from a query the solver
+                    // satisfied. It holds a subset of the constraints, so this
+                    // cannot be right.
+                    crate::accel::CARD_ONLY_CONFLICT.fetch_add(1, O::Relaxed);
+                    crate::accel::DISAGREE.fetch_add(1, O::Relaxed);
+                } else {
+                    if !conflict && res == Some(false) {
+                        crate::accel::CPU_ONLY_CONFLICT.fetch_add(1, O::Relaxed);
+                    }
+                    crate::accel::AGREE.fetch_add(1, O::Relaxed);
+                }
+                GOT.with(|g| *g.borrow_mut() = got);
+            }
+        }
         self.probe.t_total_ns = probe_total.ns();
         if crate::inductor::kind_counting() {
             use std::sync::atomic::Ordering as O;

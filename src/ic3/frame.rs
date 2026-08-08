@@ -303,6 +303,21 @@ impl IC3 {
         let clause = !lemma.as_litvec();
         let begin = begin.unwrap_or(1);
         for i in begin..=frame {
+            // Mirror to the card only for the solver it is holding. A lemma
+            // goes into every solver from `begin` to `frame`, so mirroring
+            // unconditionally would put several frames' clause sets into one
+            // engine -- which is exactly what made the replay in 7t measure
+            // nothing real.
+            if crate::accel::is_bound(self.solvers[i].dcs.accel_id) {
+                let raw: Vec<u32> = clause.iter().map(|l| Into::<u32>::into(*l)).collect();
+                if !crate::accel::add_lemma(&raw) {
+                    // Out of room. Unbind rather than carry on with a clause
+                    // set that silently differs from the solver's.
+                    crate::accel::unbind();
+                } else {
+                    crate::accel::mark_dirty();
+                }
+            }
             self.solvers[i].add_clause(&clause);
         }
         if self.level() == frame
