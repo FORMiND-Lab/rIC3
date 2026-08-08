@@ -349,6 +349,20 @@ impl IC3 {
         lastf.retain(|l| !l.eq(&lemma));
         assert_eq!(lastf.len() + 1, olen);
         let clause = !lemma.as_litvec();
+        // Mirror at every frame. An infinity lemma holds unconditionally, and
+        // every frame solver is a clone of `inf_solver`, so a card that never
+        // saw these holds strictly less than the solver it is shadowing. That
+        // showed up as the card completing a search and answering satisfiable
+        // on ~6800 queries the solver found unsat: not unsound, since only its
+        // conflicts are relied on, but it is the reason it finds so few.
+        if crate::accel::ready() {
+            let raw: Vec<u32> = clause.iter().map(|l| Into::<u32>::into(*l)).collect();
+            if !crate::accel::add_lemma(&raw, 0, 0xffff) {
+                crate::accel::unbind();
+            } else {
+                crate::accel::mark_dirty();
+            }
+        }
         self.inf_solver.add_clause(&clause);
         self.frame.inf.push(FrameLemma::new(lemma, None, None));
     }
