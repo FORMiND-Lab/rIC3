@@ -208,14 +208,11 @@ impl IC3 {
         // every frame and the card mirrors all of their lemmas.
         solver.dcs.accel_id = crate::gipsat::DagCnfSolver::fresh_accel_id();
         self.solvers.push(solver);
-        // Frame 1, as soon as it exists. Frame 0 holds the initial states and
-        // answers few queries; the frontier moves as the run goes on, so any
-        // fixed choice is arbitrary, but a fixed one is what lets the card's
-        // clause set stay in step with a solver's.
-        if self.solvers.len() == 2 {
-            crate::accel::bind_solver(self.solvers[1].dcs.accel_id);
-            log::info!("inductor: card bound to frame 1's solver");
-        }
+        // Every solver knows its frame. The card holds all frames' lemmas
+        // with the range each is valid over, so no binding is needed: a query
+        // names its frame and the engine skips what that frame does not hold.
+        let frontier = self.solvers.len() - 1;
+        self.solvers[frontier].dcs.accel_level = frontier as u32;
         self.frame.extend();
         if self.level() == 0 {
             for init in self.tsctx.init.clone() {

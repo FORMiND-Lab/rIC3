@@ -60,6 +60,9 @@ pub struct DagCnfSolver {
     /// lemmas would go into the one engine on the card. That produced conflicts
     /// on satisfiable queries until each clone got a fresh id.
     pub accel_id: u64,
+    /// The frame this solver belongs to. Queries pass it to the card, which
+    /// holds every frame's lemmas and skips the ones this frame does not.
+    pub accel_level: u32,
     /// Inductor instrumentation: per-query timings and counters.
     pub probe: crate::inductor::QueryProbe,
     /// Inductor: fanout degree per variable, i.e. how many gates a
@@ -122,6 +125,7 @@ impl DagCnfSolver {
             statistic: Default::default(),
             trivial_unsat: false,
             accel_id: Self::fresh_accel_id(),
+            accel_level: 0,
             probe: Default::default(),
             fanout_len: Default::default(),
             rng: SmallRng::seed_from_u64(0),
@@ -368,7 +372,7 @@ impl DagCnfSolver {
         // is unsatisfiable. The converse does not -- the solver can need
         // decisions and conflict analysis to get there -- so only one direction
         // is a defect.
-        if crate::accel::is_bound(self.accel_id) && !assump.is_empty() {
+        if crate::accel::ready() && !assump.is_empty() {
             crate::accel::sync_index();
             let dom: Vec<u32> = (0..self.domain.len())
                 .map(|i| Into::<u32>::into(self.domain[i]))
@@ -385,7 +389,7 @@ impl DagCnfSolver {
             // than the datapath runs for, and nothing here waits on the answer.
             if crate::accel::batching() {
                 crate::accel::queue_verdict(&raw, res == Some(true));
-            } else if let Some(conflict) = crate::accel::verdict(&raw, &mut got) {
+            } else if let Some(conflict) = crate::accel::verdict(&raw, self.accel_level, &mut got) {
                 use std::sync::atomic::Ordering as O;
                 if conflict && res == Some(true) {
                     // The card derived a contradiction from a query the solver
@@ -396,6 +400,11 @@ impl DagCnfSolver {
                 } else {
                     if !conflict && res == Some(false) {
                         crate::accel::CPU_ONLY_CONFLICT.fetch_add(1, O::Relaxed);
+                    } else if conflict && res == Some(false) {
+                        // Propagation alone settled a query the solver also
+                        // found unsat. This is the only case where the card
+                        // does work the solver would otherwise have to do.
+                        crate::accel::CARD_RESOLVED.fetch_add(1, O::Relaxed);
                     }
                     crate::accel::AGREE.fetch_add(1, O::Relaxed);
                 }

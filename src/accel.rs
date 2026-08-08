@@ -35,19 +35,21 @@ pub struct AccelStats {
     pub ns_p50: u64,
     pub ns_min: u64,
     pub ns_p99: u64,
+    pub lemma_count: u64,
 }
 
 unsafe extern "C" {
     fn ind_accel_open(path: *const std::os::raw::c_char) -> i32;
     fn ind_accel_load_netlist(n_var: u32, flat: *const u32, n_word: u64) -> i32;
     fn ind_accel_reset_lemmas() -> i32;
-    fn ind_accel_add_lemma(lits: *const u32, n_lit: u32) -> i32;
+    fn ind_accel_add_lemma(lits: *const u32, n_lit: u32, lo: u32, hi: u32) -> i32;
     fn ind_accel_reindex() -> i32;
     fn ind_accel_set_domain(vars: *const u32, n: u32) -> i32;
-    fn ind_accel_verdict(assump: *const u32, n: u32, out_len: *mut u32) -> i32;
+    fn ind_accel_verdict(assump: *const u32, n: u32, level: u32, out_len: *mut u32) -> i32;
     fn ind_accel_propagate(
         assump: *const u32,
         n_assump: u32,
+        level: u32,
         out: *mut u32,
         cap: u32,
         out_len: *mut u32,
@@ -264,17 +266,44 @@ pub fn reset_lemmas() {
     }
 }
 
-pub fn add_lemma(lits: &[u32]) -> bool {
-    ready() && unsafe { ind_accel_add_lemma(lits.as_ptr(), lits.len() as u32) } == 0
+/// Lemmas offered, and lemmas the card took. The card reported zero resident
+/// while the mirroring code looked correct, so the two ends are counted
+/// separately: nothing offered is a binding problem, offered but not taken is
+/// a capacity one.
+pub static LEMMA_OFFERED: AtomicU64 = AtomicU64::new(0);
+pub static LEMMA_TAKEN: AtomicU64 = AtomicU64::new(0);
+pub static REINDEXED: AtomicU64 = AtomicU64::new(0);
+/// Unsat queries the card settled by propagation alone. The interesting ratio
+/// is this against the unsat queries the solver had to use decisions for: a
+/// BCP-only oracle that resolves none of them cannot help IC3 however fast it
+/// runs.
+pub static CARD_RESOLVED: AtomicU64 = AtomicU64::new(0);
+
+/// Mirror one lemma, with the frames it is valid over.
+///
+/// IC3 puts a lemma in `solvers[begin..=frame]`, so the card carries the range
+/// and skips lemmas the querying frame does not hold. Without it one resident
+/// clause set cannot serve every frame: frame 1's lemmas are a subset of every
+/// frame's and so are sound everywhere, but on cal97 that subset was one lemma
+/// and settled none of 2033 unsat queries.
+pub fn add_lemma(lits: &[u32], lo: u32, hi: u32) -> bool {
+    LEMMA_OFFERED.fetch_add(1, Ordering::Relaxed);
+    let ok = ready()
+        && unsafe { ind_accel_add_lemma(lits.as_ptr(), lits.len() as u32, lo, hi) } == 0;
+    if ok {
+        LEMMA_TAKEN.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
 }
 
 pub fn reindex() -> bool {
+    REINDEXED.fetch_add(1, Ordering::Relaxed);
     ready() && unsafe { ind_accel_reindex() } == 0
 }
 
 /// Returns `Some(conflict)` with the implied literals, or `None` if the call
 /// failed -- in which case the caller keeps its own answer.
-pub fn propagate(assump: &[u32], out: &mut Vec<u32>) -> Option<bool> {
+pub fn propagate(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<bool> {
     if !ready() {
         return None;
     }
@@ -290,6 +319,7 @@ pub fn propagate(assump: &[u32], out: &mut Vec<u32>) -> Option<bool> {
         ind_accel_propagate(
             assump.as_ptr(),
             assump.len() as u32,
+            level,
             out.as_mut_ptr(),
             out.len() as u32,
             &mut n,
@@ -309,22 +339,22 @@ pub fn set_domain(vars: &[u32]) -> bool {
 
 /// Verdict only, over the zero-sync path. Falls back to the buffered call when
 /// the cube is larger than the control registers hold.
-pub fn verdict(assump: &[u32], got: &mut Vec<u32>) -> Option<bool> {
+pub fn verdict(assump: &[u32], level: u32, got: &mut Vec<u32>) -> Option<bool> {
     // Both modes seed from the same buffer since the signature was slimmed, so
     // routing through MODE_RUN says whether a disagreement belongs to
     // RUN_LITE or to the seed handling both share.
     if std::env::var("INDUCTOR_NO_LITE").is_ok() {
-        return propagate(assump, got);
+        return propagate(assump, level, got);
     }
     if !ready() {
         return None;
     }
     let mut n: u32 = 0;
-    let r = unsafe { ind_accel_verdict(assump.as_ptr(), assump.len() as u32, &mut n) };
+    let r = unsafe { ind_accel_verdict(assump.as_ptr(), assump.len() as u32, level, &mut n) };
     if r >= 0 {
         return Some(r == 1);
     }
-    if r == -6 { propagate(assump, got) } else { None }
+    if r == -6 { propagate(assump, level, got) } else { None }
 }
 
 /// Refuse to read counters through a layout the library disagrees with.
@@ -417,15 +447,27 @@ pub fn report() {
         CPU_ONLY_CONFLICT.load(Ordering::Relaxed),
         CARD_ONLY_CONFLICT.load(Ordering::Relaxed)
     );
+    {
+        use std::sync::atomic::Ordering as O;
+        eprintln!(
+            "inductor: lemmas {} offered, {} taken, {} reindexes; unsat queries {} of which the card resolved {}",
+            LEMMA_OFFERED.load(O::Relaxed),
+            LEMMA_TAKEN.load(O::Relaxed),
+            REINDEXED.load(O::Relaxed),
+            CPU_ONLY_CONFLICT.load(O::Relaxed) + CARD_RESOLVED.load(O::Relaxed),
+            CARD_RESOLVED.load(O::Relaxed)
+        );
+    }
     eprintln!(
         "inductor: accelerator {} calls, {} conflicts, {:.1} us each; shadow {} agree, \
-         {} disagree; gate {} chunks, lemma {} visits ({} blocked)",
+         {} disagree; gate {} chunks, {} lemmas resident, {} visits ({} blocked)",
         s.calls,
         s.conflicts,
         if s.calls > 0 { s.ns_total as f64 / s.calls as f64 / 1000.0 } else { 0.0 },
         ok,
         bad,
         s.gate_chunks,
+        s.lemma_count,
         s.lemma_visits,
         s.lemma_blocked
     );

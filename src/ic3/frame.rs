@@ -302,22 +302,26 @@ impl IC3 {
         }
         let clause = !lemma.as_litvec();
         let begin = begin.unwrap_or(1);
-        for i in begin..=frame {
-            // Mirror to the card only for the solver it is holding. A lemma
-            // goes into every solver from `begin` to `frame`, so mirroring
-            // unconditionally would put several frames' clause sets into one
-            // engine -- which is exactly what made the replay in 7t measure
-            // nothing real.
-            if crate::accel::is_bound(self.solvers[i].dcs.accel_id) {
-                let raw: Vec<u32> = clause.iter().map(|l| Into::<u32>::into(*l)).collect();
-                if !crate::accel::add_lemma(&raw) {
-                    // Out of room. Unbind rather than carry on with a clause
-                    // set that silently differs from the solver's.
-                    crate::accel::unbind();
-                } else {
-                    crate::accel::mark_dirty();
-                }
+        // Mirrored once, with the frames it belongs to. The card holds one
+        // clause set and each query names its frame, so `begin..=frame` is
+        // exactly what the engine needs to decide whether this lemma applies.
+        //
+        // This used to mirror only the one solver the card was bound to, which
+        // put a single frame's clause set on the card. Frame 1 is the sound
+        // choice for that -- its lemmas are a subset of every frame's -- and on
+        // cal97 it amounted to one lemma and settled none of 2033 unsat
+        // queries.
+        if crate::accel::ready() {
+            let raw: Vec<u32> = clause.iter().map(|l| Into::<u32>::into(*l)).collect();
+            if !crate::accel::add_lemma(&raw, begin as u32, frame as u32) {
+                // Out of room. Unbind rather than carry on with a clause set
+                // that silently differs from the solvers'.
+                crate::accel::unbind();
+            } else {
+                crate::accel::mark_dirty();
             }
+        }
+        for i in begin..=frame {
             self.solvers[i].add_clause(&clause);
         }
         if self.level() == frame
