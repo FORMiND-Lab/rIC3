@@ -36,6 +36,7 @@ pub struct AccelStats {
     pub ns_min: u64,
     pub ns_p99: u64,
     pub lemma_count: u64,
+    pub unknown: u64,
 }
 
 unsafe extern "C" {
@@ -278,6 +279,30 @@ pub static REINDEXED: AtomicU64 = AtomicU64::new(0);
 /// BCP-only oracle that resolves none of them cannot help IC3 however fast it
 /// runs.
 pub static CARD_RESOLVED: AtomicU64 = AtomicU64::new(0);
+/// Queries the card handed back instead of answering.
+pub static UNKNOWN: AtomicU64 = AtomicU64::new(0);
+
+/// How many decisions the card's search may make, from INDUCTOR_DECISIONS.
+///
+/// Zero -- the default -- propagates only, which is the behaviour every
+/// measurement so far was taken under and the baseline any decision run has to
+/// be compared against. Capped at 16 bits because the frame and the budget
+/// share one kernel argument, each of which costs 0.68 us of MMIO per call.
+pub fn decision_budget() -> u32 {
+    static B: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("INDUCTOR_DECISIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(0xffff)
+    })
+}
+
+/// The frame and the budget, packed as the kernel expects them.
+pub fn level_arg(frame: u32) -> u32 {
+    (frame & 0xffff) | (decision_budget() << 16)
+}
 
 /// Mirror one lemma, with the frames it is valid over.
 ///
@@ -325,7 +350,10 @@ pub fn propagate(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<bool>
             &mut n,
         )
     };
-    if r < 0 {
+    if r < 0 || r == 2 {
+        if r == 2 {
+            UNKNOWN.fetch_add(1, Ordering::Relaxed);
+        }
         return None;
     }
     out.truncate(n as usize);
@@ -351,6 +379,12 @@ pub fn verdict(assump: &[u32], level: u32, got: &mut Vec<u32>) -> Option<bool> {
     }
     let mut n: u32 = 0;
     let r = unsafe { ind_accel_verdict(assump.as_ptr(), assump.len() as u32, level, &mut n) };
+    // 2 is "the search gave up" -- the decision cap, or no domain to search.
+    // Not an answer, so the caller keeps its own.
+    if r == 2 {
+        UNKNOWN.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     if r >= 0 {
         return Some(r == 1);
     }
@@ -450,12 +484,14 @@ pub fn report() {
     {
         use std::sync::atomic::Ordering as O;
         eprintln!(
-            "inductor: lemmas {} offered, {} taken, {} reindexes; unsat queries {} of which the card resolved {}",
+            "inductor: lemmas {} offered, {} taken, {} reindexes; unsat queries {} of which the card resolved {}; {} handed back (budget {})",
             LEMMA_OFFERED.load(O::Relaxed),
             LEMMA_TAKEN.load(O::Relaxed),
             REINDEXED.load(O::Relaxed),
             CPU_ONLY_CONFLICT.load(O::Relaxed) + CARD_RESOLVED.load(O::Relaxed),
-            CARD_RESOLVED.load(O::Relaxed)
+            CARD_RESOLVED.load(O::Relaxed),
+            UNKNOWN.load(O::Relaxed),
+            decision_budget()
         );
     }
     eprintln!(

@@ -389,7 +389,7 @@ impl DagCnfSolver {
             // than the datapath runs for, and nothing here waits on the answer.
             if crate::accel::batching() {
                 crate::accel::queue_verdict(&raw, res == Some(true));
-            } else if let Some(conflict) = crate::accel::verdict(&raw, self.accel_level, &mut got) {
+            } else if let Some(conflict) = crate::accel::verdict(&raw, crate::accel::level_arg(self.accel_level), &mut got) {
                 use std::sync::atomic::Ordering as O;
                 if conflict && res == Some(true) {
                     // The card derived a contradiction from a query the solver
