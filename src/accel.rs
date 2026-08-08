@@ -55,6 +55,7 @@ unsafe extern "C" {
     fn ind_accel_verdict_batch(flat: *const u32, n_word: u64, n_query: u32,
                                out: *mut u8) -> i32;
     fn ind_accel_last_call(dom: *mut u32, n: *mut u32);
+    fn ind_accel_stats_size() -> u64;
     fn ind_accel_get_stats(out: *mut AccelStats);
 }
 
@@ -168,10 +169,20 @@ pub fn mark_dirty() {
 }
 
 pub fn sync_index() {
-    if ready() && DIRTY.swap(false, Ordering::Relaxed) {
-        reindex();
+    if ready() && DIRTY.swap(false, Ordering::Relaxed) && !reindex() {
+        // The occurrence index overflowed. add_lemma's failure was already
+        // handled this way and this one was not, so the card stayed bound with
+        // a corrupt index -- which is not a quiet failure: it makes the engine
+        // visit clauses that are not there and derive conflicts from them. On
+        // cal97 that read as 3401 conflicts on satisfiable queries, against
+        // benchmarks small enough to never reach the limit reading as zero.
+        REINDEX_FULL.fetch_add(1, Ordering::Relaxed);
+        unbind();
     }
 }
+
+/// How many times the occurrence index overflowed.
+pub static REINDEX_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Stop mirroring. Used when the card runs out of room: a clause set that
 /// silently differs from the solver's is worse than none.
@@ -299,6 +310,12 @@ pub fn set_domain(vars: &[u32]) -> bool {
 /// Verdict only, over the zero-sync path. Falls back to the buffered call when
 /// the cube is larger than the control registers hold.
 pub fn verdict(assump: &[u32], got: &mut Vec<u32>) -> Option<bool> {
+    // Both modes seed from the same buffer since the signature was slimmed, so
+    // routing through MODE_RUN says whether a disagreement belongs to
+    // RUN_LITE or to the seed handling both share.
+    if std::env::var("INDUCTOR_NO_LITE").is_ok() {
+        return propagate(assump, got);
+    }
     if !ready() {
         return None;
     }
@@ -310,7 +327,32 @@ pub fn verdict(assump: &[u32], got: &mut Vec<u32>) -> Option<bool> {
     if r == -6 { propagate(assump, got) } else { None }
 }
 
+/// Refuse to read counters through a layout the library disagrees with.
+///
+/// `AccelStats` and `ind_accel_stats` have to match field for field. While
+/// fields were being added to one side and not the other, get_stats wrote past
+/// the end of this struct and produced 34 defects that were not real. Checked
+/// once, loudly.
+fn layout_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let theirs = unsafe { ind_accel_stats_size() } as usize;
+        let ours = std::mem::size_of::<AccelStats>();
+        if theirs != ours {
+            eprintln!(
+                "inductor: stats layout mismatch, library {theirs} bytes and solver {ours}; \
+                 counters disabled"
+            );
+            return false;
+        }
+        true
+    })
+}
+
 pub fn stats() -> AccelStats {
+    if !layout_ok() {
+        return AccelStats::default();
+    }
     let mut s = AccelStats::default();
     if ready() {
         unsafe { ind_accel_get_stats(&mut s) };
@@ -355,6 +397,13 @@ pub fn report() {
             s.ns_read as f64 / n / 1000.0,
             s.polls as f64 / n
         );
+    }
+    {
+        use std::sync::atomic::Ordering as O;
+        let rf = REINDEX_FULL.load(O::Relaxed);
+        if rf > 0 {
+            eprintln!("inductor: occurrence index overflowed {rf} times; card unbound");
+        }
     }
     eprintln!(
         "inductor: bound solver {}, unbound {} times",
