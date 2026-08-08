@@ -125,12 +125,70 @@ pub fn replay_lemma(lits: &[u32]) {
     if !enabled() || replay_limit() == 0 {
         return;
     }
-    if REPLAY_WRITTEN.load(Ordering::Relaxed) >= replay_limit() {
+    // Bounded separately from queries, and far more loosely.
+    //
+    // Tying lemmas to the query limit truncated them to the start of a run,
+    // where IC3's cubes are short: a 4,000-query bound on token_ring covered
+    // the first 4% and recorded nothing longer than 8 literals, while the
+    // clauses propagation actually reads there average 21.1 and on cv32e40x
+    // 319.2. The interesting lemmas arrive after the queries stop being
+    // recorded, and they are cheap to keep -- tens of thousands of them are a
+    // few megabytes where a full query stream is tens of gigabytes.
+    let limit = std::env::var("INDUCTOR_REPLAY_LEMMAS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(200_000);
+    if LEMMA_WRITTEN.fetch_add(1, Ordering::Relaxed) >= limit {
         return;
     }
     if let Some(w) = WRITER.get() {
         w.lock().unwrap().replay_lemma(lits);
     }
+}
+
+/// Snapshot the live lemma set every `INDUCTOR_SNAPSHOT` queries, default 500.
+///
+/// Bounded by the query replay limit, unlike individual lemmas: a snapshot is
+/// only useful for queries that are themselves replayed.
+pub fn replay_lemma_snapshot(clauses: &[Vec<u32>]) {
+    if !enabled() || replay_limit() == 0 {
+        return;
+    }
+    if REPLAY_WRITTEN.load(Ordering::Relaxed) >= replay_limit() {
+        return;
+    }
+    if let Some(w) = WRITER.get() {
+        w.lock().unwrap().replay_lemma_snapshot(clauses);
+    }
+}
+
+/// Report the solver fan-out: IC3 keeps one solver per frame, each with its own
+/// lemma set, and the replay loads a snapshot from whichever one was running.
+/// If a query's propagation reads far more than that snapshot holds, this is
+/// where the difference is.
+pub fn report_solver_fanout(n_solver: usize, per_solver: &[(usize, u64)]) {
+    if !enabled() {
+        return;
+    }
+    let total_cls: usize = per_solver.iter().map(|(c, _)| c).sum();
+    let total_lits: u64 = per_solver.iter().map(|(_, l)| l).sum();
+    let mx = per_solver.iter().map(|(c, _)| *c).max().unwrap_or(0);
+    eprintln!(
+        "inductor: {n_solver} solvers; lemma clauses {total_cls} total, {mx} in the \
+         largest, {:.1} literals each",
+        if total_cls > 0 { total_lits as f64 / total_cls as f64 } else { 0.0 }
+    );
+}
+
+pub fn snapshot_every() -> u64 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("INDUCTOR_SNAPSHOT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500)
+    })
 }
 
 /// Dump the transition relation to a file, if `INDUCTOR_DUMP_NETLIST` is set.
@@ -438,6 +496,7 @@ pub static BCP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 pub static SEARCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static N_QUERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LEMMA_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Setup's three parts. `t_setup_ns` is 21.5% of a query and the largest block
 /// after BCP, but it is not one thing: the domain is a backward reachability
 /// walk over resident structure, which is the shape an accelerator is good at,
@@ -487,6 +546,16 @@ pub static W_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 pub static W_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static L_TRANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static L_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// "Other" split three ways. 7p lumped lemma, learnt and temporary together,
+/// and the accelerator's second path stores only the first: lemmas persist
+/// across queries and can be shipped and indexed between them, where learnt
+/// clauses are produced by conflict analysis inside a query. The recorded
+/// lemmas average 2.3-3.1 literals against the 76.3-143.9 that "other" reads
+/// per visit, which is the gap this measures.
+pub static W_LEMMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static L_LEMMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static W_LEARNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static L_LEARNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Print the running BCP share. Called periodically and at `finish`.
 pub fn report_bcp_share() {
@@ -549,6 +618,24 @@ pub fn report_bcp_share() {
                 ow,
                 if ow > 0.0 { (ov / sm) / ow } else { 0.0 },
                 ol / sm
+            );
+        }
+    }
+    {
+        let wl = W_LEMMA.load(Ordering::Relaxed) as f64;
+        let ll = L_LEMMA.load(Ordering::Relaxed) as f64;
+        let wr = W_LEARNT.load(Ordering::Relaxed) as f64;
+        let lr = L_LEARNT.load(Ordering::Relaxed) as f64;
+        let lo = L_OTHER.load(Ordering::Relaxed) as f64;
+        if lo > 0.0 {
+            eprintln!(
+                "inductor: non-trans literal reads -- lemma {:.1}% ({:.1} per visit), \
+                 learnt {:.1}% ({:.1} per visit), temporary {:.1}%",
+                100.0 * ll / lo,
+                if wl > 0.0 { ll / wl } else { 0.0 },
+                100.0 * lr / lo,
+                if wr > 0.0 { lr / wr } else { 0.0 },
+                100.0 * (lo - ll - lr).max(0.0) / lo
             );
         }
     }

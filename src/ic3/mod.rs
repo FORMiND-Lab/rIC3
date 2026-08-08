@@ -493,6 +493,18 @@ impl Engine for IC3 {
             McResult::SAT(_) => "unsafe",
             McResult::Unknown(_) => "unknown",
         };
+        // One solver per frame, each with its own lemma set: `add_lemma` writes
+        // a clause into `solvers[begin..=frame]`. A replay that loads one
+        // snapshot is loading one of these, while the queries it replays came
+        // from many. This reports how far apart those are.
+        {
+            let per: Vec<(usize, u64)> = self
+                .solvers
+                .iter()
+                .map(|s| s.dcs.lemma_size())
+                .collect();
+            crate::inductor::report_solver_fanout(self.solvers.len(), &per);
+        }
         crate::inductor::finish(
             name,
             t0.elapsed().as_nanos() as u64,

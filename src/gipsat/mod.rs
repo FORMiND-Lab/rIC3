@@ -315,6 +315,12 @@ impl DagCnfSolver {
         // that is what fills the domain, and before the query record is written
         // because the writer stamps both streams with the same id.
         if crate::inductor::enabled() {
+            // A snapshot before the query it applies to, so a reader can take
+            // the most recent one at or before a query id.
+            let n = crate::inductor::N_QUERY.load(std::sync::atomic::Ordering::Relaxed);
+            if n % crate::inductor::snapshot_every() == 0 {
+                crate::inductor::replay_lemma_snapshot(&self.cdb.lemma_snapshot());
+            }
             let raw: Vec<u32> = assump.iter().map(|l| Into::<u32>::into(*l)).collect();
             let dom: Vec<u32> = (0..self.domain.len())
                 .map(|i| Into::<u32>::into(self.domain[i]))
@@ -379,6 +385,14 @@ impl DagCnfSolver {
 
         self.statistic.avg_solve_time += start.elapsed();
         res
+    }
+
+    /// This solver's lemma set. IC3 keeps one solver per frame and `add_lemma`
+    /// writes into a range of them, so the total across frames is far larger
+    /// than any one -- which is the gap between a replay that loads one
+    /// snapshot and the propagation figures measured across the whole run.
+    pub fn lemma_size(&self) -> (usize, u64) {
+        (self.cdb.num_lemma(), self.cdb.lemma_lits())
     }
 
     pub fn solve_with_restart_limit(

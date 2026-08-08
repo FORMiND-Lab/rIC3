@@ -80,6 +80,16 @@ impl DagCnfSolver {
                     } else {
                         crate::inductor::W_OTHER.fetch_add(1, O::Relaxed);
                         crate::inductor::L_OTHER.fetch_add(n, O::Relaxed);
+                        // Lemma and learnt are stored and produced differently,
+                        // and only the first can be shipped to the accelerator
+                        // between queries.
+                        if cref.is_learnt() {
+                            crate::inductor::W_LEARNT.fetch_add(1, O::Relaxed);
+                            crate::inductor::L_LEARNT.fetch_add(n, O::Relaxed);
+                        } else {
+                            crate::inductor::W_LEMMA.fetch_add(1, O::Relaxed);
+                            crate::inductor::L_LEMMA.fetch_add(n, O::Relaxed);
+                        }
                     }
                 }
                 if cref[0] == !p {
@@ -153,6 +163,16 @@ impl DagCnfSolver {
                     } else {
                         crate::inductor::W_OTHER.fetch_add(1, O::Relaxed);
                         crate::inductor::L_OTHER.fetch_add(n, O::Relaxed);
+                        // Lemma and learnt are stored and produced differently,
+                        // and only the first can be shipped to the accelerator
+                        // between queries.
+                        if cref.is_learnt() {
+                            crate::inductor::W_LEARNT.fetch_add(1, O::Relaxed);
+                            crate::inductor::L_LEARNT.fetch_add(n, O::Relaxed);
+                        } else {
+                            crate::inductor::W_LEMMA.fetch_add(1, O::Relaxed);
+                            crate::inductor::L_LEMMA.fetch_add(n, O::Relaxed);
+                        }
                     }
                 }
                 if cref[0] == !p {

@@ -324,6 +324,17 @@ impl ClauseDB {
     /// Total literals across the lemma set, for sizing the accelerator's second
     /// propagation path: watched literals visit two entries a clause, an
     /// occurrence index one a literal, so the ratio is the mean clause length.
+    /// The live lemma set, for a replay snapshot.
+    pub fn lemma_snapshot(&self) -> Vec<Vec<u32>> {
+        self.lemmas
+            .iter()
+            .map(|c| {
+                let cl = self.allocator.get(*c);
+                (0..cl.len()).map(|i| Into::<u32>::into(cl[i])).collect()
+            })
+            .collect()
+    }
+
     pub fn lemma_lits(&self) -> u64 {
         self.lemmas.iter().map(|c| self.allocator.get(*c).len() as u64).sum()
     }
