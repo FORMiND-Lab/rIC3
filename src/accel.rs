@@ -37,6 +37,7 @@ pub struct AccelStats {
     pub ns_p99: u64,
     pub lemma_count: u64,
     pub unknown: u64,
+    pub cores: u64,
 }
 
 unsafe extern "C" {
@@ -55,10 +56,12 @@ unsafe extern "C" {
         cap: u32,
         out_len: *mut u32,
     ) -> i32;
-    fn ind_accel_verdict_batch(flat: *const u32, n_word: u64, n_query: u32,
+    fn ind_accel_verdict_batch(flat: *const u32, n_word: u64, n_query: u32, level: u32,
                                out: *mut u8) -> i32;
     fn ind_accel_last_call(dom: *mut u32, n: *mut u32);
     fn ind_accel_stats_size() -> u64;
+    fn ind_accel_core(assump: *const u32, n: u32, level: u32, out: *mut u32, cap: u32,
+                      out_len: *mut u32) -> i32;
     fn ind_accel_get_stats(out: *mut AccelStats);
 }
 
@@ -282,6 +285,27 @@ pub static CARD_RESOLVED: AtomicU64 = AtomicU64::new(0);
 /// Queries the card handed back instead of answering.
 pub static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 
+/// Cube lengths seen at generalization, bucketed. The batch a speculative
+/// round could issue is one query per literal, so this is the batch-size
+/// distribution the design would actually see.
+pub static MIC_N: AtomicU64 = AtomicU64::new(0);
+pub static MIC_LITS: AtomicU64 = AtomicU64::new(0);
+pub static MIC_GE8: AtomicU64 = AtomicU64::new(0);
+pub static MIC_GE32: AtomicU64 = AtomicU64::new(0);
+pub static MIC_MAX: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_mic(len: usize) {
+    MIC_N.fetch_add(1, Ordering::Relaxed);
+    MIC_LITS.fetch_add(len as u64, Ordering::Relaxed);
+    if len >= 8 {
+        MIC_GE8.fetch_add(1, Ordering::Relaxed);
+    }
+    if len >= 32 {
+        MIC_GE32.fetch_add(1, Ordering::Relaxed);
+    }
+    MIC_MAX.fetch_max(len as u64, Ordering::Relaxed);
+}
+
 /// How many decisions the card's search may make, from INDUCTOR_DECISIONS.
 ///
 /// Zero -- the default -- propagates only, which is the behaviour every
@@ -413,6 +437,48 @@ fn layout_ok() -> bool {
     })
 }
 
+/// The unsat core for a query, or None if the card did not derive one.
+///
+/// This is the only call whose result IC3 acts on. `down()` turns the core
+/// into the generalized lemma, so a verdict bit was never usable however fast
+/// it came back. Sound to use directly: the card holds a subset of the
+/// solver's clauses, and a subset of assumptions that conflicts against fewer
+/// clauses conflicts against more.
+pub fn core(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
+    if !ready() || assump.is_empty() {
+        return None;
+    }
+    CORE_ASKED.fetch_add(1, Ordering::Relaxed);
+    out.resize(assump.len(), 0);
+    let mut n: u32 = 0;
+    let r = unsafe {
+        ind_accel_core(assump.as_ptr(), assump.len() as u32, level, out.as_mut_ptr(),
+                       out.len() as u32, &mut n)
+    };
+    if r <= 0 || n == 0 {
+        return None;
+    }
+    out.truncate(n as usize);
+    CORE_GOT.fetch_add(1, Ordering::Relaxed);
+    CORE_IN.fetch_add(assump.len() as u64, Ordering::Relaxed);
+    CORE_OUT.fetch_add(n as u64, Ordering::Relaxed);
+    Some(n as usize)
+}
+
+/// Off by default. Turning it on changes what IC3 computes -- the card's core
+/// replaces the solver's -- so every run with it on is a different run, and
+/// the baseline has to be the run with it off.
+pub fn core_offload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INDUCTOR_CORE").is_ok())
+}
+
+pub static CORE_USED: AtomicU64 = AtomicU64::new(0);
+pub static CORE_ASKED: AtomicU64 = AtomicU64::new(0);
+pub static CORE_GOT: AtomicU64 = AtomicU64::new(0);
+pub static CORE_IN: AtomicU64 = AtomicU64::new(0);
+pub static CORE_OUT: AtomicU64 = AtomicU64::new(0);
+
 pub fn stats() -> AccelStats {
     if !layout_ok() {
         return AccelStats::default();
@@ -464,6 +530,30 @@ pub fn report() {
     }
     {
         use std::sync::atomic::Ordering as O;
+        let n = MIC_N.load(O::Relaxed);
+        if n > 0 {
+            eprintln!(
+                "inductor: {} generalizations, mean cube {:.1}, {:.0}% >= 8, {:.0}% >= 32, longest {}",
+                n,
+                MIC_LITS.load(O::Relaxed) as f64 / n as f64,
+                100.0 * MIC_GE8.load(O::Relaxed) as f64 / n as f64,
+                100.0 * MIC_GE32.load(O::Relaxed) as f64 / n as f64,
+                MIC_MAX.load(O::Relaxed)
+            );
+        }
+        let ca = CORE_ASKED.load(O::Relaxed);
+        if ca > 0 {
+            let cg = CORE_GOT.load(O::Relaxed);
+            eprintln!(
+                "inductor: cores asked {} got {} ({:.1}%), {} used by IC3, {} literals in {} out ({:.2}x smaller)",
+                ca, cg, 100.0 * cg as f64 / ca as f64,
+                CORE_USED.load(O::Relaxed),
+                CORE_IN.load(O::Relaxed), CORE_OUT.load(O::Relaxed),
+                if CORE_OUT.load(O::Relaxed) > 0 {
+                    CORE_IN.load(O::Relaxed) as f64 / CORE_OUT.load(O::Relaxed) as f64
+                } else { 0.0 }
+            );
+        }
         let rf = REINDEX_FULL.load(O::Relaxed);
         if rf > 0 {
             eprintln!("inductor: occurrence index overflowed {rf} times; card unbound");

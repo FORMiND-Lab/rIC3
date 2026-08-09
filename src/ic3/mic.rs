@@ -74,6 +74,52 @@ impl IC3 {
                 return None;
             }
             self.statistic.num_down_sat += 1;
+
+            // Ask the card before the solver, because asking after saves
+            // nothing. It returns the unsat core -- the subset of the
+            // next-state assumptions that conflicts -- which is exactly what
+            // `inductive_core()` reconstructs and what becomes the lemma.
+            //
+            // Sound to use directly. The card holds a subset of this solver's
+            // clauses and none of the per-query constraints, including the
+            // `strengthen` clause, so it is strictly weaker: a conflict it
+            // derives is a conflict here. A core that subsumes the initial
+            // states is handed back rather than repaired, since
+            // `inductive_core` has its own handling for that and duplicating
+            // it here would be a second implementation of a subtle rule.
+            if crate::accel::core_offload() && crate::accel::ready() {
+                let assump = self.tsctx.lits_next(&cube);
+                let raw: Vec<u32> = assump.iter().map(|l| Into::<u32>::into(*l)).collect();
+                let dom: Vec<u32> = assump
+                    .iter()
+                    .copied()
+                    .chain(cube.iter().copied())
+                    .map(|l| Into::<u32>::into(l.var()))
+                    .collect();
+                crate::accel::set_domain(&dom);
+                let mut got: Vec<u32> = Vec::new();
+                if crate::accel::core(
+                    &raw,
+                    crate::accel::level_arg((frame - 1) as u32),
+                    &mut got,
+                )
+                .is_some()
+                {
+                    let inset: std::collections::HashSet<u32> = got.into_iter().collect();
+                    let mut ans = LitVec::new();
+                    for &l in cube.iter() {
+                        if inset.contains(&Into::<u32>::into(self.tsctx.next(l))) {
+                            ans.push(l);
+                        }
+                    }
+                    if !ans.is_empty() && !self.tsctx.cube_subsume_init(&ans) {
+                        crate::accel::CORE_USED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Some(ans);
+                    }
+                }
+            }
+
             if self
                 .blocked(frame, &cube)
                 .in_phase(inductor_trace::Phase::Gen)
@@ -226,6 +272,12 @@ impl IC3 {
         }
         self.statistic.avg_mic_cube_len += cube.len();
         self.statistic.num_mic += 1;
+        // How many independent queries one generalization could issue at once.
+        // Every speculative drop is a subset of this cube, so they share the
+        // domain set just above and the clause set, which is fixed for the
+        // duration of a mic -- the two conditions RUN_BATCH needs and the two
+        // that the earlier per-query batching attempt could not meet.
+        crate::accel::note_mic(cube.len());
         let mut cex = Vec::new();
         if self.rng.random_bool(0.2) {
             cube.shuffle(&mut self.rng);
