@@ -90,13 +90,20 @@ impl IC3 {
             if crate::accel::core_offload() && crate::accel::ready() {
                 let assump = self.tsctx.lits_next(&cube);
                 let raw: Vec<u32> = assump.iter().map(|l| Into::<u32>::into(*l)).collect();
-                let dom: Vec<u32> = assump
-                    .iter()
-                    .copied()
-                    .chain(cube.iter().copied())
-                    .map(|l| Into::<u32>::into(l.var()))
-                    .collect();
-                crate::accel::set_domain(&dom);
+                // No domain restriction here.
+                //
+                // The solver's domain is the transitive closure `enable_local`
+                // builds, and it is built inside `solve()` -- after this point.
+                // Sending the surface set instead, the assumptions and the cube,
+                // gave the card a domain so small it propagated almost nothing:
+                // 5 cores from 2,892 asks with every constraint accepted.
+                //
+                // Dropping the restriction is sound in the direction that
+                // matters. It only lets propagation reach further over clauses
+                // that are all real constraints, so a conflict it derives is
+                // still a conflict for the query; the domain can lose
+                // implications, never invent them.
+                crate::accel::set_domain(&[]);
                 // The clauses this query carries. `down` calls `blocked` with
                 // `.with_strengthen()`, which adds `!cube`, plus whatever the
                 // caller passed; the card needs both or it is weaker than the
@@ -116,13 +123,21 @@ impl IC3 {
                 }
                 crate::accel::set_constraint(&flat);
                 let mut got: Vec<u32> = Vec::new();
-                if crate::accel::core(
+                let got_core = crate::accel::core(
                     &raw,
                     crate::accel::level_arg((frame - 1) as u32),
                     &mut got,
                 )
-                .is_some()
-                {
+                .is_some();
+                // Drop them again before anything else asks.
+                //
+                // A constraint belongs to this query. Left in place it makes
+                // the card stronger than the solver on every query that
+                // follows, which showed up as 488 conflicts on satisfiable
+                // queries -- the shadow check catching the card claiming
+                // something the solver's own clauses do not support.
+                crate::accel::set_constraint(&[]);
+                if got_core {
                     let inset: std::collections::HashSet<u32> = got.into_iter().collect();
                     let mut ans = LitVec::new();
                     for &l in cube.iter() {

@@ -452,8 +452,22 @@ fn layout_ok() -> bool {
 /// the solver's clauses is sound, but a subset missing the one clause that
 /// makes the query unsatisfiable produces no core at all.
 pub fn set_constraint(flat: &[u32]) -> bool {
-    ready() && unsafe { ind_accel_set_constraint(flat.as_ptr(), flat.len() as u32) } == 0
+    if !ready() {
+        return false;
+    }
+    let ok = unsafe { ind_accel_set_constraint(flat.as_ptr(), flat.len() as u32) } == 0;
+    if flat.is_empty() {
+        return ok;
+    }
+    CON_SET.fetch_add(1, Ordering::Relaxed);
+    if !ok {
+        CON_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
 }
+
+pub static CON_SET: AtomicU64 = AtomicU64::new(0);
+pub static CON_FAIL: AtomicU64 = AtomicU64::new(0);
 
 pub fn core(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
     if !ready() || assump.is_empty() {
@@ -551,6 +565,11 @@ pub fn report() {
                 100.0 * MIC_GE32.load(O::Relaxed) as f64 / n as f64,
                 MIC_MAX.load(O::Relaxed)
             );
+        }
+        let cs = CON_SET.load(O::Relaxed);
+        if cs > 0 {
+            eprintln!("inductor: constraints set {} times, {} refused by the card",
+                      cs, CON_FAIL.load(O::Relaxed));
         }
         let ca = CORE_ASKED.load(O::Relaxed);
         if ca > 0 {
