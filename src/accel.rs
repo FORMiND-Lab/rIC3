@@ -38,6 +38,7 @@ pub struct AccelStats {
     pub lemma_count: u64,
     pub unknown: u64,
     pub cores: u64,
+    pub ddr_overflow: u64,
 }
 
 unsafe extern "C" {
