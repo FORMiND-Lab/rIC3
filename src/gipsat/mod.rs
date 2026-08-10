@@ -372,7 +372,7 @@ impl DagCnfSolver {
         // is unsatisfiable. The converse does not -- the solver can need
         // decisions and conflict analysis to get there -- so only one direction
         // is a defect.
-        if crate::accel::ready() && !assump.is_empty() {
+        if crate::accel::shadow() && crate::accel::ready() && !assump.is_empty() {
             crate::accel::sync_index();
             let dom: Vec<u32> = (0..self.domain.len())
                 .map(|i| Into::<u32>::into(self.domain[i]))

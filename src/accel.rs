@@ -39,6 +39,12 @@ pub struct AccelStats {
     pub unknown: u64,
     pub cores: u64,
     pub ddr_overflow: u64,
+    pub ns_constraint: u64,
+    pub n_constraint: u64,
+    pub ns_core_probe: u64,
+    pub ns_core_min: u64,
+    pub ns_domain: u64,
+    pub n_domain: u64,
 }
 
 unsafe extern "C" {
@@ -493,6 +499,18 @@ pub fn core(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
 /// Off by default. Turning it on changes what IC3 computes -- the card's core
 /// replaces the solver's -- so every run with it on is a different run, and
 /// the baseline has to be the run with it off.
+/// Whether to ask the card a question whose answer is thrown away.
+///
+/// The shadow check compares every query against the card and uses none of the
+/// results. It is what proved the integration correct, and it is 12.4 s of a
+/// 16.5 s run: 18,535 calls at 670 us each, because with a decision budget
+/// every one of them runs a full on-card search. Off unless asked for, so a
+/// run that is using the card does not also pay to audit it.
+pub fn shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INDUCTOR_SHADOW").is_ok())
+}
+
 pub fn core_offload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("INDUCTOR_CORE").is_ok())
@@ -564,6 +582,15 @@ pub fn report() {
                 100.0 * MIC_GE8.load(O::Relaxed) as f64 / n as f64,
                 100.0 * MIC_GE32.load(O::Relaxed) as f64 / n as f64,
                 MIC_MAX.load(O::Relaxed)
+            );
+        }
+        if s.n_constraint > 0 || s.n_domain > 0 {
+            eprintln!(
+                "inductor: constraint {:.1} ms over {} calls, domain {:.1} ms over {}, \
+                 core probe {:.1} ms, core minimise {:.1} ms",
+                s.ns_constraint as f64 / 1e6, s.n_constraint,
+                s.ns_domain as f64 / 1e6, s.n_domain,
+                s.ns_core_probe as f64 / 1e6, s.ns_core_min as f64 / 1e6
             );
         }
         let cs = CON_SET.load(O::Relaxed);

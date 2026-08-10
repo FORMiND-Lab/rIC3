@@ -88,6 +88,14 @@ impl IC3 {
             // `inductive_core` has its own handling for that and duplicating
             // it here would be a second implementation of a subtle rule.
             if crate::accel::core_offload() && crate::accel::ready() {
+                // The lemmas the frame has gained are not visible to the card
+                // until its occurrence index is rebuilt, and that used to happen
+                // in the shadow block. Gating the shadow took it with it, and
+                // the card went on propagating over a stale index: cores fell
+                // from 84 to 10 while the run got ten times faster, which is
+                // the shape of an engine that has stopped seeing the lemmas
+                // rather than one that got quicker.
+                crate::accel::sync_index();
                 let assump = self.tsctx.lits_next(&cube);
                 let raw: Vec<u32> = assump.iter().map(|l| Into::<u32>::into(*l)).collect();
                 // No domain restriction here.
