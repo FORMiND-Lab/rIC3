@@ -61,6 +61,7 @@ unsafe extern "C" {
                                out: *mut u8) -> i32;
     fn ind_accel_last_call(dom: *mut u32, n: *mut u32);
     fn ind_accel_stats_size() -> u64;
+    fn ind_accel_set_constraint(flat: *const u32, n_word: u32) -> i32;
     fn ind_accel_core(assump: *const u32, n: u32, level: u32, out: *mut u32, cap: u32,
                       out_len: *mut u32) -> i32;
     fn ind_accel_get_stats(out: *mut AccelStats);
@@ -445,6 +446,15 @@ fn layout_ok() -> bool {
 /// it came back. Sound to use directly: the card holds a subset of the
 /// solver's clauses, and a subset of assumptions that conflicts against fewer
 /// clauses conflicts against more.
+/// The clauses this query carries, replacing the last query's.
+///
+/// `down()` asks with `!cube` under `strengthen`; the card holding a subset of
+/// the solver's clauses is sound, but a subset missing the one clause that
+/// makes the query unsatisfiable produces no core at all.
+pub fn set_constraint(flat: &[u32]) -> bool {
+    ready() && unsafe { ind_accel_set_constraint(flat.as_ptr(), flat.len() as u32) } == 0
+}
+
 pub fn core(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
     if !ready() || assump.is_empty() {
         return None;

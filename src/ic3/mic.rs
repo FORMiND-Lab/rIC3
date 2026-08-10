@@ -97,6 +97,24 @@ impl IC3 {
                     .map(|l| Into::<u32>::into(l.var()))
                     .collect();
                 crate::accel::set_domain(&dom);
+                // The clauses this query carries. `down` calls `blocked` with
+                // `.with_strengthen()`, which adds `!cube`, plus whatever the
+                // caller passed; the card needs both or it is weaker than the
+                // solver on exactly these queries.
+                let mut flat: Vec<u32> = Vec::new();
+                {
+                    let mut push = |c: &LitVec| {
+                        flat.push(c.len() as u32);
+                        for l in c.iter() {
+                            flat.push(Into::<u32>::into(*l));
+                        }
+                    };
+                    push(&LitVec::from_iter(cube.iter().map(|l| !*l)));
+                    for c in constraint.iter() {
+                        push(c);
+                    }
+                }
+                crate::accel::set_constraint(&flat);
                 let mut got: Vec<u32> = Vec::new();
                 if crate::accel::core(
                     &raw,
