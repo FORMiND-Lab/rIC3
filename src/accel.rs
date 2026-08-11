@@ -39,6 +39,9 @@ pub struct AccelStats {
     pub unknown: u64,
     pub cores: u64,
     pub ddr_overflow: u64,
+    pub con_full_rebuilds: u64,
+    pub cores_unminimised: u64,
+    pub lem_full_rebuilds: u64,
     pub ns_constraint: u64,
     pub n_constraint: u64,
     pub ns_core_probe: u64,
@@ -511,6 +514,21 @@ pub fn shadow() -> bool {
     *ON.get_or_init(|| std::env::var("INDUCTOR_SHADOW").is_ok())
 }
 
+pub static CORE_THIN: AtomicU64 = AtomicU64::new(0);
+
+/// How many literals the card must remove before its core is worth taking.
+/// One by default: a core equal to the cube is sound but generalizes nothing,
+/// and adopting it skips the solver's own `down`, which would have done better.
+pub fn core_gain() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INDUCTOR_CORE_GAIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
+}
+
 pub fn core_offload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("INDUCTOR_CORE").is_ok())
@@ -592,11 +610,39 @@ pub fn report() {
                 s.ns_domain as f64 / 1e6, s.n_domain,
                 s.ns_core_probe as f64 / 1e6, s.ns_core_min as f64 / 1e6
             );
+            // A constraint is inserted into slack reserved in the occurrence
+            // index. When the slack does not fit, it is rebuilt in instead --
+            // correct, and the cost the slack was there to remove. Silence on
+            // this reads exactly like the optimisation not working.
+            if s.cores_unminimised > 0 {
+                eprintln!(
+                    "inductor: {} cores returned unminimised (too short to be worth it)",
+                    s.cores_unminimised
+                );
+            }
+            if s.lem_full_rebuilds > 0 {
+                eprintln!("inductor: {} lemma appends rebuilt the whole index",
+                          s.lem_full_rebuilds);
+            }
+            if s.con_full_rebuilds > 0 {
+                eprintln!(
+                    "inductor: {} constraint appends rebuilt the whole index \
+                     ({:.1}% of {}); the index slack is too small for this design",
+                    s.con_full_rebuilds,
+                    100.0 * s.con_full_rebuilds as f64 / s.n_constraint.max(1) as f64,
+                    s.n_constraint
+                );
+            }
         }
         let cs = CON_SET.load(O::Relaxed);
         if cs > 0 {
             eprintln!("inductor: constraints set {} times, {} refused by the card",
                       cs, CON_FAIL.load(O::Relaxed));
+        }
+        let ct = CORE_THIN.load(O::Relaxed);
+        if ct > 0 {
+            eprintln!("inductor: {} cores declined for generalizing less than {} literal(s)",
+                      ct, core_gain());
         }
         let ca = CORE_ASKED.load(O::Relaxed);
         if ca > 0 {

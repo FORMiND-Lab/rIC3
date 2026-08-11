@@ -153,11 +153,31 @@ impl IC3 {
                             ans.push(l);
                         }
                     }
-                    if !ans.is_empty() && !self.tsctx.cube_subsume_init(&ans) {
+                    // Only when the card actually generalized something.
+                    //
+                    // A core equal to the cube is sound and IC3 will take it,
+                    // but it is a lemma no stronger than what was asked about,
+                    // and taking it skips the solver's own `down`, which would
+                    // have returned a smaller one. Measured on
+                    // Problem03_label51, 8,153 such cores went in at 2.00
+                    // literals and came back at 2.00, and IC3 then called mic
+                    // 24,514 times against the CPU-only run's 2,157 -- an
+                    // eleven-fold increase that cost more than everything the
+                    // card saved.
+                    //
+                    // `INDUCTOR_CORE_GAIN` is how many literals the card has to
+                    // remove to be worth believing. 0 restores the old
+                    // behaviour of taking every core.
+                    let gain = cube.len().saturating_sub(ans.len());
+                    if !ans.is_empty()
+                        && gain >= crate::accel::core_gain()
+                        && !self.tsctx.cube_subsume_init(&ans)
+                    {
                         crate::accel::CORE_USED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Some(ans);
                     }
+                    crate::accel::CORE_THIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
