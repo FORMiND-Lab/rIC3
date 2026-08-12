@@ -634,12 +634,23 @@ pub fn shadow() -> bool {
 pub static CORE_THIN: AtomicU64 = AtomicU64::new(0);
 pub static MIC_TAKEN: AtomicU64 = AtomicU64::new(0);
 
-/// Whether to run mic's drop loop on the card. On by default where the
-/// bitstream has it: it is the largest piece of IC3 the card can hold that is
-/// not just propagation.
+/// Whether to run mic's drop loop on the card. Off unless INDUCTOR_MIC is set.
+///
+/// It is the largest piece of IC3 the card holds that is not propagation, and
+/// it is sound, but measured it does not pay on the benchmark that has the
+/// volume. On Problem03_label51 it spent 169 s over 4,945 calls and 339,436
+/// attempted drops to remove 9,452 literals -- 1.03x -- and the cubes it
+/// handed back sent IC3 down a path needing 474,188 down() calls against
+/// 227,216 without it. The run went from about 310 s to 605 s and produced no
+/// cores at all.
+///
+/// The reason is structural, not a tuning problem. The solver's loop shrinks
+/// the cube from its model on the satisfiable branch, which is where most
+/// drops land; the card has no model there and can only keep the literal. So
+/// the card tries every drop and wins the few that propagation alone settles.
 pub fn mic_offload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("INDUCTOR_NO_MIC").is_err())
+    *ON.get_or_init(|| std::env::var("INDUCTOR_MIC").is_ok())
 }
 
 /// How many literals the card must remove before its core is worth taking.
