@@ -129,22 +129,20 @@ impl IC3 {
                         push(c);
                     }
                 }
-                crate::accel::set_constraint(&flat);
                 let mut got: Vec<u32> = Vec::new();
-                let got_core = crate::accel::core(
-                    &raw,
-                    crate::accel::level_arg((frame - 1) as u32),
-                    &mut got,
-                )
-                .is_some();
-                // Drop them again before anything else asks.
-                //
-                // A constraint belongs to this query. Left in place it makes
-                // the card stronger than the solver on every query that
-                // follows, which showed up as 488 conflicts on satisfiable
-                // queries -- the shadow check catching the card claiming
-                // something the solver's own clauses do not support.
-                crate::accel::set_constraint(&[]);
+                let lvl = crate::accel::level_arg((frame - 1) as u32);
+                // One round trip where there were four. The card installs the
+                // constraint, answers, minimises, and takes the constraint
+                // back out itself, so the drop below is only for the
+                // bitstreams that predate the fused mode.
+                let got_core = if crate::accel::have_down() {
+                    crate::accel::down(&flat, &raw, lvl, &mut got).is_some()
+                } else {
+                    crate::accel::set_constraint(&flat);
+                    let r = crate::accel::core(&raw, lvl, &mut got).is_some();
+                    crate::accel::set_constraint(&[]);
+                    r
+                };
                 if got_core {
                     let inset: std::collections::HashSet<u32> = got.into_iter().collect();
                     let mut ans = LitVec::new();

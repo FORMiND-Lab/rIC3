@@ -42,6 +42,8 @@ pub struct AccelStats {
     pub con_full_rebuilds: u64,
     pub cores_unminimised: u64,
     pub lem_full_rebuilds: u64,
+    pub ns_down: u64,
+    pub n_down: u64,
     pub ns_constraint: u64,
     pub n_constraint: u64,
     pub ns_core_probe: u64,
@@ -69,6 +71,9 @@ unsafe extern "C" {
     fn ind_accel_verdict_batch(flat: *const u32, n_word: u64, n_query: u32, level: u32,
                                out: *mut u8) -> i32;
     fn ind_accel_last_call(dom: *mut u32, n: *mut u32);
+    fn ind_accel_down(con_flat: *const u32, n_con_word: u32, assump: *const u32,
+                      n_assump: u32, level: u32, out_core: *mut u32, cap: u32,
+                      out_len: *mut u32) -> i32;
     fn ind_accel_stats_size() -> u64;
     fn ind_accel_set_constraint(flat: *const u32, n_word: u32) -> i32;
     fn ind_accel_core(assump: *const u32, n: u32, level: u32, out: *mut u32, cap: u32,
@@ -478,6 +483,67 @@ pub fn set_constraint(flat: &[u32]) -> bool {
 pub static CON_SET: AtomicU64 = AtomicU64::new(0);
 pub static CON_FAIL: AtomicU64 = AtomicU64::new(0);
 
+/// One down() iteration in one round trip: the constraint goes in, the query
+/// is answered, the core comes back, and the constraint comes out again --
+/// without the host issuing four calls to walk that sequence.
+///
+/// `None` means this bitstream predates the mode and the caller should fall
+/// back to set_constraint/core/set_constraint. `Some(0)` means no conflict.
+pub fn down(con_flat: &[u32], assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
+    if !ready() || assump.is_empty() {
+        return None;
+    }
+    CORE_ASKED.fetch_add(1, Ordering::Relaxed);
+    out.resize(assump.len(), 0);
+    let mut n: u32 = 0;
+    let rc = unsafe {
+        ind_accel_down(
+            con_flat.as_ptr(),
+            con_flat.len() as u32,
+            assump.as_ptr(),
+            assump.len() as u32,
+            level,
+            out.as_mut_ptr(),
+            assump.len() as u32,
+            &mut n,
+        )
+    };
+    if rc == -2 {
+        return None; // no fused mode in this bitstream
+    }
+    if rc < 0 {
+        CON_FAIL.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    out.truncate(n as usize);
+    if n > 0 {
+        CORE_GOT.fetch_add(1, Ordering::Relaxed);
+    }
+    Some(n as usize)
+}
+
+/// Whether the fused path is available, so the caller can skip building the
+/// separate constraint payload when it is not.
+pub fn have_down() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if !ready() {
+            return false;
+        }
+        let a = [0u32];
+        let mut o: Vec<u32> = Vec::new();
+        o.resize(1, 0);
+        let mut n: u32 = 0;
+        // A probe with one assumption. -2 is the only answer that matters;
+        // anything else means the mode exists and this query simply did or did
+        // not conflict.
+        let rc = unsafe {
+            ind_accel_down(std::ptr::null(), 0, a.as_ptr(), 1, 0, o.as_mut_ptr(), 1, &mut n)
+        };
+        rc != -2
+    })
+}
+
 pub fn core(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
     if !ready() || assump.is_empty() {
         return None;
@@ -633,6 +699,11 @@ pub fn report() {
                     s.n_constraint
                 );
             }
+        }
+        if s.n_down > 0 {
+            eprintln!("inductor: fused down {:.1} ms over {} calls ({:.1} us each)",
+                      s.ns_down as f64 / 1e6, s.n_down,
+                      s.ns_down as f64 / 1e3 / s.n_down as f64);
         }
         let cs = CON_SET.load(O::Relaxed);
         if cs > 0 {
