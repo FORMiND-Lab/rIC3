@@ -350,6 +350,57 @@ impl IC3 {
             cube.sort_by_key(|x| parent.contains(x));
         }
         let mut keep = GHashSet::new();
+
+        // Let the card run the drop loop first.
+        //
+        // It tries the same removals this loop does, with propagation instead
+        // of the solver, and returns a sub-cube that still blocks. Weaker: on
+        // the satisfiable branch the solver shrinks the cube from its model
+        // and the card has no model, so it keeps the literal. But every
+        // literal it did drop was dropped because a conflict survived without
+        // it, so what comes back is a sound starting point -- and the loop
+        // below still runs, so nothing this misses is lost.
+        //
+        // One call for the whole loop. The assumptions and the constraint are
+        // both derived from the cube and both change every time it shrinks,
+        // which is why this could not be a batch of queries prepared here.
+        if crate::accel::mic_offload() && crate::accel::ready() && crate::accel::have_mic() {
+            crate::accel::sync_index();
+            let mut pairs: Vec<u32> = Vec::with_capacity(cube.len() * 2);
+            for l in cube.iter() {
+                pairs.push(Into::<u32>::into(*l));
+                pairs.push(Into::<u32>::into(self.tsctx.next(*l)));
+            }
+            let mut extra: Vec<u32> = Vec::new();
+            for c in constraint.iter() {
+                extra.push(c.len() as u32);
+                for l in c.iter() {
+                    extra.push(Into::<u32>::into(*l));
+                }
+            }
+            let mut got: Vec<u32> = Vec::new();
+            let lvl = crate::accel::level_arg((frame - 1) as u32);
+            if crate::accel::mic(&extra, &pairs, lvl, &mut got).is_some()
+                && !got.is_empty()
+                && got.len() < cube.len()
+            {
+                let inset: std::collections::HashSet<u32> = got.into_iter().collect();
+                let mut shrunk = LitVec::new();
+                for l in cube.iter() {
+                    if inset.contains(&Into::<u32>::into(*l)) {
+                        shrunk.push(*l);
+                    }
+                }
+                // A cube that subsumes the initial states is not a lemma. The
+                // card does not test that, and `down` would have handed such a
+                // cube back rather than repaired it.
+                if !shrunk.is_empty() && !self.tsctx.cube_subsume_init(&shrunk) {
+                    crate::accel::MIC_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    cube = shrunk;
+                }
+            }
+        }
+
         let mut i = 0;
         while i < cube.len() {
             if keep.contains(&cube[i]) {

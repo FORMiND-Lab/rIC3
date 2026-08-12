@@ -44,6 +44,11 @@ pub struct AccelStats {
     pub lem_full_rebuilds: u64,
     pub ns_down: u64,
     pub n_down: u64,
+    pub ns_mic: u64,
+    pub n_mic: u64,
+    pub mic_tried: u64,
+    pub mic_in: u64,
+    pub mic_out: u64,
     pub ns_constraint: u64,
     pub n_constraint: u64,
     pub ns_core_probe: u64,
@@ -74,6 +79,8 @@ unsafe extern "C" {
     fn ind_accel_down(con_flat: *const u32, n_con_word: u32, assump: *const u32,
                       n_assump: u32, level: u32, out_core: *mut u32, cap: u32,
                       out_len: *mut u32) -> i32;
+    fn ind_accel_mic(extra: *const u32, n_extra_word: u32, pairs: *const u32, n_lit: u32,
+                     level: u32, out_cube: *mut u32, cap: u32, out_len: *mut u32) -> i32;
     fn ind_accel_stats_size() -> u64;
     fn ind_accel_set_constraint(flat: *const u32, n_word: u32) -> i32;
     fn ind_accel_core(assump: *const u32, n: u32, level: u32, out: *mut u32, cap: u32,
@@ -489,6 +496,50 @@ pub static CON_FAIL: AtomicU64 = AtomicU64::new(0);
 ///
 /// `None` means this bitstream predates the mode and the caller should fall
 /// back to set_constraint/core/set_constraint. `Some(0)` means no conflict.
+/// mic's drop loop, run on the card.
+///
+/// `pairs` is the cube as [current, next] literal pairs. What comes back is a
+/// sub-cube that still blocks -- weaker than what the solver would find,
+/// because the card has no model to shrink with on the satisfiable branch, but
+/// never unsound: every literal it dropped was dropped because propagation
+/// still derived a conflict without it.
+///
+/// `None` if the bitstream predates the mode or the call failed.
+pub fn mic(extra: &[u32], pairs: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
+    if !ready() || pairs.is_empty() {
+        return None;
+    }
+    let n_lit = (pairs.len() / 2) as u32;
+    out.resize(n_lit as usize, 0);
+    let mut n: u32 = 0;
+    let rc = unsafe {
+        ind_accel_mic(extra.as_ptr(), extra.len() as u32, pairs.as_ptr(), n_lit, level,
+                      out.as_mut_ptr(), n_lit, &mut n)
+    };
+    if rc < 0 {
+        return None;
+    }
+    out.truncate(n as usize);
+    Some(n as usize)
+}
+
+/// Whether the card's drop loop is available in this bitstream.
+pub fn have_mic() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if !ready() {
+            return false;
+        }
+        let pairs = [0u32, 0u32];
+        let mut o: Vec<u32> = vec![0; 1];
+        let mut n: u32 = 0;
+        let rc = unsafe {
+            ind_accel_mic(std::ptr::null(), 0, pairs.as_ptr(), 1, 0, o.as_mut_ptr(), 1, &mut n)
+        };
+        rc != -2
+    })
+}
+
 pub fn down(con_flat: &[u32], assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
     if !ready() || assump.is_empty() {
         return None;
@@ -581,6 +632,15 @@ pub fn shadow() -> bool {
 }
 
 pub static CORE_THIN: AtomicU64 = AtomicU64::new(0);
+pub static MIC_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether to run mic's drop loop on the card. On by default where the
+/// bitstream has it: it is the largest piece of IC3 the card can hold that is
+/// not just propagation.
+pub fn mic_offload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INDUCTOR_NO_MIC").is_err())
+}
 
 /// How many literals the card must remove before its core is worth taking.
 /// One by default: a core equal to the cube is sound but generalizes nothing,
@@ -705,10 +765,21 @@ pub fn report() {
                       s.ns_down as f64 / 1e6, s.n_down,
                       s.ns_down as f64 / 1e3 / s.n_down as f64);
         }
+        if s.n_mic > 0 {
+            eprintln!(
+                "inductor: card mic {:.1} ms over {} calls, {} drops tried, {} literals in {} out ({:.2}x smaller)",
+                s.ns_mic as f64 / 1e6, s.n_mic, s.mic_tried, s.mic_in, s.mic_out,
+                if s.mic_out > 0 { s.mic_in as f64 / s.mic_out as f64 } else { 0.0 }
+            );
+        }
         let cs = CON_SET.load(O::Relaxed);
         if cs > 0 {
             eprintln!("inductor: constraints set {} times, {} refused by the card",
                       cs, CON_FAIL.load(O::Relaxed));
+        }
+        let mt = MIC_TAKEN.load(O::Relaxed);
+        if mt > 0 {
+            eprintln!("inductor: {} cubes started from the card's generalization", mt);
         }
         let ct = CORE_THIN.load(O::Relaxed);
         if ct > 0 {
