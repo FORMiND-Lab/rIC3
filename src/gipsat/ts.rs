@@ -113,6 +113,27 @@ impl TransysSolver {
             .validate_incremental_unsat_core(query, hardware_core)
     }
 
+    /// Restore an exact CPU-preflight core for the ordinary IC3
+    /// `inductive_core` consumer. Unlike a hardware core, this result already
+    /// came from GipSAT and therefore does not require another proof solve.
+    pub fn install_incremental_cpu_unsat_core(
+        &mut self,
+        cube: &[Lit],
+        query: &IncrementalQuery,
+        core: &[Lit],
+        used_constraints: bool,
+    ) -> bool {
+        if !self.dcs.install_incremental_cpu_unsat_core(
+            query,
+            core,
+            used_constraints,
+        ) {
+            return false;
+        }
+        self.relind = LitVec::from(cube);
+        true
+    }
+
     /// Check relative induction using setup and BCP only.
     pub fn inductive_by_propagation(
         &mut self,

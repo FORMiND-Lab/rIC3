@@ -1,4 +1,5 @@
 use crate::{
+    accel::cdcl_host::ActivePreflight,
     gipsat::{IncrementalQuery, IncrementalResult, TransysSolver},
     ic3::{
         frame::{Frame, FrameLemma},
@@ -43,13 +44,13 @@ impl IC3 {
             .iter()
             .map(|(_, _, queries)| queries.len())
             .sum::<usize>();
-        let mut preflight_selected = vec![true; n_queries];
+        let mut preflight = vec![ActivePreflight::Fpga; n_queries];
         if crate::accel::cdcl_host::active_preflight_should_run(n_queries) {
             let mut query_index = 0usize;
             for (frame_idx, _, queries) in &work {
                 for query in queries {
-                    preflight_selected[query_index] =
-                        crate::accel::cdcl_host::active_preflight_select(
+                    preflight[query_index] =
+                        crate::accel::cdcl_host::active_preflight_classify(
                             &mut self.solvers[*frame_idx].dcs,
                             query,
                         );
@@ -64,7 +65,7 @@ impl IC3 {
             for (frame_idx, _, queries) in &work {
                 let solver = &self.solvers[*frame_idx].dcs;
                 for query in queries {
-                    if preflight_selected[query_index] {
+                    if matches!(&preflight[query_index], ActivePreflight::Fpga) {
                         requests.push((solver, query.clone()));
                         request_indices.push(query_index);
                     }
@@ -103,42 +104,82 @@ impl IC3 {
                     // malformed, budgeted, or inconclusive result falls back
                     // to the ordinary full GipSAT inquiry below.
                     let active_answer = if ctp == 0 {
-                        match active_results.get(frame_result_offset + lemma_index) {
-                            Some(IncrementalResult::Sat { model }) => {
-                                let validation_start = Instant::now();
+                        let result_index = frame_result_offset + lemma_index;
+                        match preflight.get(result_index) {
+                            Some(ActivePreflight::Conclusive(
+                                IncrementalResult::Sat { model },
+                            )) => {
+                                let restore_start = Instant::now();
                                 let accepted = self.solvers[frame_idx]
                                     .install_incremental_sat_model(
                                         &active_queries[lemma_index],
                                         model,
                                     );
-                                crate::accel::cdcl_host::note_active_sat_model(
+                                crate::accel::cdcl_host::note_active_preflight_result(
+                                    false,
                                     accepted,
-                                    validation_start.elapsed().as_nanos() as u64,
+                                    restore_start.elapsed().as_nanos() as u64,
                                 );
                                 accepted.then_some(false)
                             }
-                            Some(IncrementalResult::Unsat { core, .. }) => {
-                                let validation_start = Instant::now();
-                                let cpu_core_len = self.solvers[frame_idx]
-                                    .validate_incremental_unsat_core(
+                            Some(ActivePreflight::Conclusive(
+                                IncrementalResult::Unsat {
+                                    core,
+                                    used_constraints,
+                                },
+                            )) => {
+                                let restore_start = Instant::now();
+                                let accepted = self.solvers[frame_idx]
+                                    .install_incremental_cpu_unsat_core(
                                         lemma.as_litvec(),
                                         &active_queries[lemma_index],
                                         core,
+                                        *used_constraints,
                                     );
-                                crate::accel::cdcl_host::note_active_unsat_core(
-                                    cpu_core_len.is_some(),
-                                    active_queries[lemma_index].assumptions.len(),
-                                    core.len(),
-                                    cpu_core_len.unwrap_or(0),
-                                    validation_start.elapsed().as_nanos() as u64,
+                                crate::accel::cdcl_host::note_active_preflight_result(
+                                    true,
+                                    accepted,
+                                    restore_start.elapsed().as_nanos() as u64,
                                 );
-                                cpu_core_len.map(|_| true)
+                                accepted.then_some(true)
                             }
-                            Some(IncrementalResult::Unknown(_)) => {
-                                crate::accel::cdcl_host::note_active_cpu_fallback();
-                                None
-                            }
-                            None => None,
+                            _ => match active_results.get(result_index) {
+                                Some(IncrementalResult::Sat { model }) => {
+                                    let validation_start = Instant::now();
+                                    let accepted = self.solvers[frame_idx]
+                                        .install_incremental_sat_model(
+                                            &active_queries[lemma_index],
+                                            model,
+                                        );
+                                    crate::accel::cdcl_host::note_active_sat_model(
+                                        accepted,
+                                        validation_start.elapsed().as_nanos() as u64,
+                                    );
+                                    accepted.then_some(false)
+                                }
+                                Some(IncrementalResult::Unsat { core, .. }) => {
+                                    let validation_start = Instant::now();
+                                    let cpu_core_len = self.solvers[frame_idx]
+                                        .validate_incremental_unsat_core(
+                                            lemma.as_litvec(),
+                                            &active_queries[lemma_index],
+                                            core,
+                                        );
+                                    crate::accel::cdcl_host::note_active_unsat_core(
+                                        cpu_core_len.is_some(),
+                                        active_queries[lemma_index].assumptions.len(),
+                                        core.len(),
+                                        cpu_core_len.unwrap_or(0),
+                                        validation_start.elapsed().as_nanos() as u64,
+                                    );
+                                    cpu_core_len.map(|_| true)
+                                }
+                                Some(IncrementalResult::Unknown(_)) => {
+                                    crate::accel::cdcl_host::note_active_cpu_fallback();
+                                    None
+                                }
+                                None => None,
+                            },
                         }
                     } else {
                         None

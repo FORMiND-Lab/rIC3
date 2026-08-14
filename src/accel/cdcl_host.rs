@@ -416,6 +416,16 @@ struct PairedPreflightWork {
     selected: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum ActivePreflight {
+    /// No preflight was requested, or this inquiry exhausted its CPU budget.
+    Fpga,
+    /// Keep this inquiry on the ordinary CPU path without a reusable answer.
+    CpuFallback,
+    /// Exact GipSAT completed inside the budget; consume this answer directly.
+    Conclusive(IncrementalResult),
+}
+
 static SHADOW_STATE: std::sync::OnceLock<std::sync::Mutex<ShadowState>> =
     std::sync::OnceLock::new();
 static ACTIVE_STATE: std::sync::OnceLock<std::sync::Mutex<ActiveState>> =
@@ -466,6 +476,10 @@ static ACTIVE_PREFLIGHT_SELECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PREFLIGHT_STATIC_FILTERED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PREFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PREFLIGHT_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_SAT_REUSED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_UNSAT_REUSED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_RESTORE_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
 static PAIRED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PAIRED_FILTERED: AtomicU64 = AtomicU64::new(0);
@@ -762,25 +776,25 @@ pub fn active_preflight_should_run(n_candidates: usize) -> bool {
         && n_candidates >= active_min_batch_size()
 }
 
-/// Return true only for a query that exhausted the live bounded GipSAT
-/// preflight. Conclusive or malformed inquiries remain on the ordinary CPU
-/// path. The result is a scheduling hint; it never proves SAT or UNSAT.
-pub fn active_preflight_select(
+/// Classify one live inquiry. Budget exhaustion is an FPGA scheduling hint;
+/// conclusive SAT/UNSAT is an exact CPU result that may be reused after its
+/// model/core state is restored at the point where IC3 consumes it.
+pub fn active_preflight_classify(
     solver: &mut DagCnfSolver,
     query: &IncrementalQuery,
-) -> bool {
+) -> ActivePreflight {
     let Some(conflict_limit) = active_preflight_conflicts() else {
-        return true;
+        return ActivePreflight::Fpga;
     };
     if query.assumptions.len() > active_preflight_max_assumptions() {
         ACTIVE_PREFLIGHT_STATIC_FILTERED.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return ActivePreflight::CpuFallback;
     }
     let start = std::time::Instant::now();
     let result = solver.classify_incremental_preflight(query, conflict_limit);
     let elapsed_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let selected = matches!(
-        result,
+        &result,
         IncrementalResult::Unknown(UnknownReason::ConflictBudget)
     );
     ACTIVE_PREFLIGHT_CANDIDATES.fetch_add(1, Ordering::Relaxed);
@@ -788,10 +802,16 @@ pub fn active_preflight_select(
     ACTIVE_PREFLIGHT_CONFLICTS.fetch_add(u64::from(solver.probe.n_conflict), Ordering::Relaxed);
     if selected {
         ACTIVE_PREFLIGHT_SELECTED.fetch_add(1, Ordering::Relaxed);
+        ActivePreflight::Fpga
     } else {
         ACTIVE_PREFLIGHT_CONCLUSIVE.fetch_add(1, Ordering::Relaxed);
+        match result {
+            IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
+                ActivePreflight::Conclusive(result)
+            }
+            IncrementalResult::Unknown(_) => ActivePreflight::CpuFallback,
+        }
     }
-    selected
 }
 
 /// Optional measurement-only filter. It lets experiments test whether an
@@ -1611,6 +1631,24 @@ pub fn note_active_cpu_fallback() {
     ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn note_active_preflight_result(
+    unsat: bool,
+    accepted: bool,
+    restore_ns: u64,
+) {
+    ACTIVE_PREFLIGHT_RESTORE_NS.fetch_add(restore_ns, Ordering::Relaxed);
+    if accepted {
+        if unsat {
+            ACTIVE_PREFLIGHT_UNSAT_REUSED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ACTIVE_PREFLIGHT_SAT_REUSED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        ACTIVE_PREFLIGHT_REJECTED.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Queue one already-answered GipSAT inquiry. Queries are grouped by their
 /// exact resident snapshot rather than flushed when IC3 switches frames. This
 /// exposes the batching available to a future multi-context scheduler while
@@ -1789,14 +1827,19 @@ pub fn flush_and_report() {
         if let Some(conflict_limit) = active_preflight_conflicts() {
             let candidates = ACTIVE_PREFLIGHT_CANDIDATES.load(Ordering::Relaxed);
             eprintln!(
-                "inductor-cdcl: active preflight conflicts {}, max assumptions {}, static-filtered {}, candidates {}, conclusive {}, selected {}, service {:.3} ms, mean conflicts/query {:.2}",
+                "inductor-cdcl: active preflight conflicts {}, max assumptions {}, static-filtered {}, candidates {}, conclusive {}, selected {}, reused SAT/UNSAT {}, {}, rejected {}, service {:.3} ms, restore {:.3} ms, mean conflicts/query {:.2}",
                 conflict_limit,
                 active_preflight_max_assumptions(),
                 ACTIVE_PREFLIGHT_STATIC_FILTERED.load(Ordering::Relaxed),
                 candidates,
                 ACTIVE_PREFLIGHT_CONCLUSIVE.load(Ordering::Relaxed),
                 ACTIVE_PREFLIGHT_SELECTED.load(Ordering::Relaxed),
+                ACTIVE_PREFLIGHT_SAT_REUSED.load(Ordering::Relaxed),
+                ACTIVE_PREFLIGHT_UNSAT_REUSED.load(Ordering::Relaxed),
+                ACTIVE_PREFLIGHT_REJECTED.load(Ordering::Relaxed),
                 ACTIVE_PREFLIGHT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                ACTIVE_PREFLIGHT_RESTORE_NS.load(Ordering::Relaxed) as f64
+                    / 1_000_000.0,
                 ACTIVE_PREFLIGHT_CONFLICTS.load(Ordering::Relaxed) as f64
                     / candidates.max(1) as f64,
             );

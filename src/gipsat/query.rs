@@ -270,6 +270,42 @@ impl DagCnfSolver {
         result
     }
 
+    /// Restore the failed-assumption core of an exact CPU preflight without
+    /// repeating the solve. The result was proved against this solver before
+    /// the propagation pass began; IC3 may only have strengthened the frame
+    /// since then, so the UNSAT implication remains valid. This entry point is
+    /// deliberately separate from the untrusted hardware-core validator.
+    pub fn install_incremental_cpu_unsat_core(
+        &mut self,
+        query: &IncrementalQuery,
+        core: &[Lit],
+        used_constraints: bool,
+    ) -> bool {
+        if query.frame != self.accel_level {
+            return false;
+        }
+        let mut unmatched: Vec<Lit> = query.assumptions.iter().copied().collect();
+        for &lit in core {
+            let Some(position) = unmatched.iter().position(|candidate| *candidate == lit)
+            else {
+                return false;
+            };
+            unmatched.swap_remove(position);
+        }
+
+        self.reset();
+        self.assump = query.assumptions.clone();
+        self.constraint = query.constraints.clone();
+        self.unsat_core.clear();
+        for &lit in core {
+            self.unsat_core.insert(lit);
+        }
+        if used_constraints {
+            self.unsat_core.insert(self.constrain_act.lit());
+        }
+        true
+    }
+
     /// Check a hardware SAT model against the exact, current CPU formula.
     ///
     /// This is intentionally stricter than checking the sparse values GipSAT
@@ -596,6 +632,51 @@ mod tests {
         assert!(matches!(
             live.solve_incremental(&query),
             IncrementalResult::Unsat { .. }
+        ));
+    }
+
+    #[test]
+    fn conclusive_cpu_preflight_results_can_be_restored_without_resolving() {
+        // Keep DagCnf alive: DagCnfSolver intentionally stores a non-owning
+        // pointer to it.
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let mut solver = DagCnfSolver::new(&dc);
+        solver.add_clause(&[!a, b]);
+        let mut sat = IncrementalQuery::new(0, LitVec::from([a]));
+        sat.domain = (0..solver.num_var()).map(Var::from).collect();
+        let IncrementalResult::Sat { model } =
+            solver.classify_incremental_preflight(&sat, 8)
+        else {
+            panic!("expected conclusive SAT preflight");
+        };
+        assert!(solver.install_incremental_sat_model(&sat, &model));
+        assert_eq!(solver.sat_value(a), Some(true));
+        assert_eq!(solver.sat_value(b), Some(true));
+
+        let mut unsat = IncrementalQuery::new(0, LitVec::from([a, !b]));
+        unsat.domain = (0..solver.num_var()).map(Var::from).collect();
+        let IncrementalResult::Unsat {
+            core,
+            used_constraints,
+        } = solver.classify_incremental_preflight(&unsat, 8)
+        else {
+            panic!("expected conclusive UNSAT preflight");
+        };
+        // Simulate an earlier push strengthening this frame between the
+        // speculative preflight and ordered IC3 consumption.
+        solver.add_clause(&[b]);
+        assert!(solver.install_incremental_cpu_unsat_core(
+            &unsat,
+            &core,
+            used_constraints,
+        ));
+        assert!(core.iter().all(|lit| solver.unsat_has(*lit)));
+        assert!(!solver.install_incremental_cpu_unsat_core(
+            &unsat,
+            &[!a],
+            used_constraints,
         ));
     }
 
