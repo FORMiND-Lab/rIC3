@@ -422,11 +422,17 @@ static ACTIVE_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_ERROR: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UNSAT_CORE_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UNSAT_CORE_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UNSAT_ASSUMPTION_LITS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UNSAT_HW_CORE_LITS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UNSAT_CPU_CORE_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CPU_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCH_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UNSAT_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_PROPAGATIONS: AtomicU64 = AtomicU64::new(0);
@@ -1095,6 +1101,25 @@ pub fn note_active_sat_model(accepted: bool, validation_ns: u64) {
     }
 }
 
+pub fn note_active_unsat_core(
+    accepted: bool,
+    assumption_lits: usize,
+    hardware_core_lits: usize,
+    cpu_core_lits: usize,
+    validation_ns: u64,
+) {
+    ACTIVE_UNSAT_VALIDATE_NS.fetch_add(validation_ns, Ordering::Relaxed);
+    ACTIVE_UNSAT_ASSUMPTION_LITS.fetch_add(assumption_lits as u64, Ordering::Relaxed);
+    ACTIVE_UNSAT_HW_CORE_LITS.fetch_add(hardware_core_lits as u64, Ordering::Relaxed);
+    if accepted {
+        ACTIVE_UNSAT_CORE_USED.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_UNSAT_CPU_CORE_LITS.fetch_add(cpu_core_lits as u64, Ordering::Relaxed);
+    } else {
+        ACTIVE_UNSAT_CORE_REJECTED.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn note_active_cpu_fallback() {
     ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
 }
@@ -1188,7 +1213,7 @@ pub fn flush_and_report() {
     }
     if active_enabled() {
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, CPU fallbacks executed {}, init {:.3} ms, load {:.3} ms, batches {:.3} ms, validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init {:.3} ms, load {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -1209,11 +1234,17 @@ pub fn flush_and_report() {
             ACTIVE_HW_LEARNTS.load(Ordering::Relaxed),
             ACTIVE_SAT_USED.load(Ordering::Relaxed),
             ACTIVE_SAT_REJECTED.load(Ordering::Relaxed),
+            ACTIVE_UNSAT_CORE_USED.load(Ordering::Relaxed),
+            ACTIVE_UNSAT_CORE_REJECTED.load(Ordering::Relaxed),
+            ACTIVE_UNSAT_ASSUMPTION_LITS.load(Ordering::Relaxed),
+            ACTIVE_UNSAT_HW_CORE_LITS.load(Ordering::Relaxed),
+            ACTIVE_UNSAT_CPU_CORE_LITS.load(Ordering::Relaxed),
             ACTIVE_CPU_FALLBACK.load(Ordering::Relaxed),
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_UNSAT_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         );
     }
     if profile_enabled() {

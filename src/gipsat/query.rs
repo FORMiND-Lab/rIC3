@@ -334,6 +334,40 @@ impl DagCnfSolver {
         self.propagated = self.trail.len() as u32;
         true
     }
+
+    /// Re-prove an FPGA failed-assumption core against the exact live CPU
+    /// formula. The hardware result is only a candidate: literals must form a
+    /// multiset subset of the original assumptions, and GipSAT must establish
+    /// UNSAT again with the same frame, temporary constraints, and domain.
+    /// Hardware scheduling budgets are removed for this proof step.
+    ///
+    /// On success GipSAT's live `unsat_core` is the proof core of the reduced
+    /// query, so downstream IC3 generalization can consume it exactly as after
+    /// an ordinary CPU solve. The returned size is that CPU proof core size;
+    /// `Some(0)` is a valid result when the formula is UNSAT independently of
+    /// assumptions.
+    pub fn validate_incremental_unsat_core(
+        &mut self,
+        query: &IncrementalQuery,
+        hardware_core: &[Lit],
+    ) -> Option<usize> {
+        if query.frame != self.accel_level {
+            return None;
+        }
+        let mut unmatched: Vec<Lit> = query.assumptions.iter().copied().collect();
+        for &lit in hardware_core {
+            let position = unmatched.iter().position(|candidate| *candidate == lit)?;
+            unmatched.swap_remove(position);
+        }
+
+        let mut reduced = query.clone();
+        reduced.assumptions = LitVec::from(hardware_core);
+        reduced.budget = QueryBudget::default();
+        match self.solve_incremental(&reduced) {
+            IncrementalResult::Unsat { core, .. } => Some(core.len()),
+            IncrementalResult::Sat { .. } | IncrementalResult::Unknown(_) => None,
+        }
+    }
 }
 
 /// Use a hardware answer only when it is conclusive. Decision/conflict limits
@@ -513,6 +547,43 @@ mod tests {
         query.budget.conflicts = 1;
         let result = solve_with_cpu_fallback(&mut BudgetUnknown, &mut cpu, &query);
         assert!(matches!(result, IncrementalResult::Sat { model } if model.contains(&a)));
+    }
+
+    #[test]
+    fn hardware_unsat_core_is_subset_checked_and_reproved_without_budgets() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let c = dc.new_var().lit();
+        let mut solver = DagCnfSolver::new(&dc);
+        solver.add_clause(&[!a, b]);
+
+        let mut query = IncrementalQuery::new(0, LitVec::from([c, a, !b]));
+        query.budget.decisions = 7;
+        query.budget.conflicts = 3;
+        query.domain = (0..solver.num_var()).map(Var::from).collect();
+
+        assert_eq!(
+            solver.validate_incremental_unsat_core(&query, &[a, !b]),
+            Some(2),
+        );
+        assert!(solver.unsat_has(a));
+        assert!(solver.unsat_has(!b));
+        assert!(!solver.unsat_has(c));
+
+        // A literal outside the original assumption multiset is malformed,
+        // while an insufficient subset is rejected by the exact CPU solve.
+        assert_eq!(
+            solver.validate_incremental_unsat_core(&query, &[!c]),
+            None,
+        );
+        assert_eq!(solver.validate_incremental_unsat_core(&query, &[a]), None);
+
+        let single_a = IncrementalQuery::new(0, LitVec::from([a]));
+        assert_eq!(
+            solver.validate_incremental_unsat_core(&single_a, &[a, a]),
+            None,
+        );
     }
 
     #[test]

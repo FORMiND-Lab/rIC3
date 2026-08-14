@@ -62,7 +62,11 @@ impl IC3 {
                     continue;
                 }
                 for ctp in 0..3 {
-                    let active_sat = if ctp == 0 {
+                    // A validated SAT model means the lemma is not blocked;
+                    // a CPU-reproved FPGA core means it is blocked. Any stale,
+                    // malformed, budgeted, or inconclusive result falls back
+                    // to the ordinary full GipSAT inquiry below.
+                    let active_answer = if ctp == 0 {
                         match active_results.get(frame_result_offset + lemma_index) {
                             Some(IncrementalResult::Sat { model }) => {
                                 let validation_start = Instant::now();
@@ -75,24 +79,41 @@ impl IC3 {
                                     accepted,
                                     validation_start.elapsed().as_nanos() as u64,
                                 );
-                                accepted
+                                accepted.then_some(false)
                             }
-                            Some(_) => {
+                            Some(IncrementalResult::Unsat { core, .. }) => {
+                                let validation_start = Instant::now();
+                                let cpu_core_len = self.solvers[frame_idx]
+                                    .validate_incremental_unsat_core(
+                                        lemma.as_litvec(),
+                                        &active_queries[lemma_index],
+                                        core,
+                                    );
+                                crate::accel::cdcl_host::note_active_unsat_core(
+                                    cpu_core_len.is_some(),
+                                    active_queries[lemma_index].assumptions.len(),
+                                    core.len(),
+                                    cpu_core_len.unwrap_or(0),
+                                    validation_start.elapsed().as_nanos() as u64,
+                                );
+                                cpu_core_len.map(|_| true)
+                            }
+                            Some(IncrementalResult::Unknown(_)) => {
                                 crate::accel::cdcl_host::note_active_cpu_fallback();
-                                false
+                                None
                             }
-                            None => false,
+                            None => None,
                         }
                     } else {
-                        false
+                        None
                     };
-                    let blocked = if active_sat {
-                        false
-                    } else {
-                        self.blocked(frame_idx + 1, &lemma)
+                    let blocked = match active_answer {
+                        Some(blocked) => blocked,
+                        None => self
+                            .blocked(frame_idx + 1, &lemma)
                             .in_phase(inductor_trace::Phase::Push)
                             .with_act_order(false)
-                            .check()
+                            .check(),
                     };
                     if blocked {
                         let core = self.solvers[frame_idx]

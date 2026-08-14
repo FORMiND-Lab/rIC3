@@ -99,6 +99,20 @@ impl TransysSolver {
         self.dcs.install_incremental_sat_model(query, model)
     }
 
+    /// Validate a hardware assumption core with an exact reduced GipSAT
+    /// solve. Keeping the original cube in `relind` preserves the literal
+    /// mapping and initial-state repair used by `inductive_core`.
+    pub fn validate_incremental_unsat_core(
+        &mut self,
+        cube: &[Lit],
+        query: &IncrementalQuery,
+        hardware_core: &[Lit],
+    ) -> Option<usize> {
+        self.relind = LitVec::from(cube);
+        self.dcs
+            .validate_incremental_unsat_core(query, hardware_core)
+    }
+
     /// Check relative induction using setup and BCP only.
     pub fn inductive_by_propagation(
         &mut self,
