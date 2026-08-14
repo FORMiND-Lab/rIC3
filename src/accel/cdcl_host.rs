@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(has_cdcl_accel)]
 unsafe extern "C" {
     fn ind_cdcl_open(path: *const std::os::raw::c_char) -> i32;
+    fn ind_cdcl_connect(path: *const std::os::raw::c_char) -> i32;
     fn ind_cdcl_load_context(request: *const u32, request_words: u32) -> i32;
     fn ind_cdcl_add_frame_clauses(request: *const u32, request_words: u32) -> i32;
     fn ind_cdcl_solve_batch(
@@ -172,8 +173,13 @@ impl HardwareCdcl {
     pub fn open(path: &str) -> Result<Self, HardwareError> {
         #[cfg(has_cdcl_accel)]
         {
-            let path = CString::new(path).map_err(|_| HardwareError::InvalidPath)?;
-            let rc = unsafe { ind_cdcl_open(path.as_ptr()) };
+            let rc = if let Ok(socket) = std::env::var("INDUCTOR_CDCL_SERVER") {
+                let socket = CString::new(socket).map_err(|_| HardwareError::InvalidPath)?;
+                unsafe { ind_cdcl_connect(socket.as_ptr()) }
+            } else {
+                let path = CString::new(path).map_err(|_| HardwareError::InvalidPath)?;
+                unsafe { ind_cdcl_open(path.as_ptr()) }
+            };
             if rc != 0 {
                 return Err(HardwareError::Open(rc));
             }
@@ -462,6 +468,7 @@ static ACTIVE_UNSAT_HW_CORE_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_CPU_CORE_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CPU_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCH_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
@@ -1466,7 +1473,16 @@ pub fn solve_active_batch(
         }
     }
 
-    let Ok(mut state) = active_state().lock() else {
+    let state_wait_start = std::time::Instant::now();
+    let state = active_state().lock();
+    ACTIVE_STATE_WAIT_NS.fetch_add(
+        state_wait_start
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+    let Ok(mut state) = state else {
         let n_pending: usize = groups.iter().map(|group| group.pending.len()).sum();
         ACTIVE_ERROR.fetch_add(n_pending as u64, Ordering::Relaxed);
         return output;
@@ -1791,7 +1807,7 @@ pub fn flush_and_report() {
         }
     } else if active_enabled() {
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init {:.3} ms, load {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init/wait {:.3}/{:.3} ms, load {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -1819,6 +1835,7 @@ pub fn flush_and_report() {
             ACTIVE_UNSAT_CPU_CORE_LITS.load(Ordering::Relaxed),
             ACTIVE_CPU_FALLBACK.load(Ordering::Relaxed),
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_STATE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
