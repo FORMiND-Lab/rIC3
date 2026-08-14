@@ -270,6 +270,21 @@ impl DagCnfSolver {
         result
     }
 
+    /// Finish one speculative inquiry exactly on the live CPU solver and
+    /// restore a clean query boundary. This is used by the active dispatch
+    /// sampler: the answer is reusable, while its measured cost predicts
+    /// whether the remaining compatible inquiries belong on CPU or FPGA.
+    pub fn classify_incremental_exact(
+        &mut self,
+        query: &IncrementalQuery,
+    ) -> IncrementalResult {
+        let mut exact = query.clone();
+        exact.budget = QueryBudget::default();
+        let result = self.solve_incremental(&exact);
+        self.reset();
+        result
+    }
+
     /// Restore the failed-assumption core of an exact CPU preflight without
     /// repeating the solve. The result was proved against this solver before
     /// the propagation pass began; IC3 may only have strengthened the frame
@@ -678,6 +693,19 @@ mod tests {
             &[!a],
             used_constraints,
         ));
+    }
+
+    #[test]
+    fn exact_live_classifier_clears_hardware_budgets_and_restores_boundary() {
+        let (mut solver, a, _) = implication_solver();
+        let mut query = IncrementalQuery::new(0, LitVec::from([a]));
+        query.domain = (0..solver.num_var()).map(Var::from).collect();
+        query.budget.conflicts = 1;
+        assert!(matches!(
+            solver.classify_incremental_exact(&query),
+            IncrementalResult::Sat { .. }
+        ));
+        assert!(solver.assert_value(a).is_none());
     }
 
     #[test]

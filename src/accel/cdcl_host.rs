@@ -487,6 +487,15 @@ static ACTIVE_PREFLIGHT_SAT_REUSED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PREFLIGHT_UNSAT_REUSED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PREFLIGHT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PREFLIGHT_RESTORE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_QUERIES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_FPGA_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_CPU_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_FPGA_RETAINED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_CPU_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_UNDERSIZED_REJECTED: AtomicU64 = AtomicU64::new(0);
 static PAIRED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
 static PAIRED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PAIRED_FILTERED: AtomicU64 = AtomicU64::new(0);
@@ -755,6 +764,16 @@ fn paired_preflight_conflicts() -> Option<u32> {
     })
 }
 
+fn active_compare_cpu_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        active_enabled()
+            && std::env::var("INDUCTOR_CDCL_ACTIVE_COMPARE_CPU")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
 pub fn active_preflight_conflicts() -> Option<u32> {
     static CONFLICTS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *CONFLICTS.get_or_init(|| {
@@ -773,6 +792,40 @@ fn active_preflight_max_assumptions() -> usize {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(usize::MAX)
     })
+}
+
+fn active_sample_queries() -> usize {
+    static QUERIES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *QUERIES.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_SAMPLE_QUERIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn active_sample_min_cpu_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_SAMPLE_MIN_CPU_NS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(200_000)
+    })
+}
+
+fn sample_keeps_fpga(
+    sample_ns: u64,
+    n_sample: usize,
+    n_remaining: usize,
+    min_batch: usize,
+    min_cpu_ns: u64,
+    all_conclusive: bool,
+) -> bool {
+    all_conclusive
+        && n_sample != 0
+        && n_remaining >= min_batch
+        && sample_ns / n_sample as u64 >= min_cpu_ns
 }
 
 /// Avoid paying even the bounded CPU classification cost when the raw
@@ -817,6 +870,90 @@ pub fn active_preflight_classify(
                 ActivePreflight::Conclusive(result)
             }
             IncrementalResult::Unknown(_) => ActivePreflight::CpuFallback,
+        }
+    }
+}
+
+/// Finish a small number of budget-exhausted inquiries exactly on GipSAT
+/// clones and use their mean restart cost to route the rest of this frame.
+/// Cloning keeps the sample from changing live phase/activity and therefore
+/// changing the cost it is trying to predict. Sampled answers are retained as
+/// trusted CPU results rather than discarded. This is opt-in while the
+/// crossover is validated across models.
+pub fn active_sample_select(
+    solver: &DagCnfSolver,
+    queries: &[IncrementalQuery],
+    decisions: &mut [ActivePreflight],
+) {
+    let requested = active_sample_queries();
+    if requested == 0 || queries.len() != decisions.len() {
+        return;
+    }
+    let candidates: Vec<usize> = decisions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, decision)| {
+            matches!(decision, ActivePreflight::Fpga).then_some(index)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    if candidates.len() < active_min_batch_size() {
+        ACTIVE_SAMPLE_UNDERSIZED_REJECTED
+            .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+        for index in candidates {
+            decisions[index] = ActivePreflight::CpuFallback;
+        }
+        return;
+    }
+
+    let n_sample = requested.min(candidates.len());
+    let mut sample_ns = 0u64;
+    let mut sample_clone_ns = 0u64;
+    let mut sample_solve_ns = 0u64;
+    let mut all_conclusive = true;
+    for &index in &candidates[..n_sample] {
+        let start = std::time::Instant::now();
+        let mut sample_solver = solver.clone();
+        let clone_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let solve_start = std::time::Instant::now();
+        let result = sample_solver.classify_incremental_exact(&queries[index]);
+        let solve_ns = solve_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        sample_clone_ns = sample_clone_ns.saturating_add(clone_ns);
+        sample_solve_ns = sample_solve_ns.saturating_add(solve_ns);
+        sample_ns = sample_ns.saturating_add(clone_ns.saturating_add(solve_ns));
+        decisions[index] = match result {
+            IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
+                ActivePreflight::Conclusive(result)
+            }
+            IncrementalResult::Unknown(_) => {
+                all_conclusive = false;
+                ActivePreflight::CpuFallback
+            }
+        };
+    }
+    ACTIVE_SAMPLE_QUERIES.fetch_add(n_sample as u64, Ordering::Relaxed);
+    ACTIVE_SAMPLE_NS.fetch_add(sample_ns, Ordering::Relaxed);
+    ACTIVE_SAMPLE_CLONE_NS.fetch_add(sample_clone_ns, Ordering::Relaxed);
+    ACTIVE_SAMPLE_SOLVE_NS.fetch_add(sample_solve_ns, Ordering::Relaxed);
+
+    let remaining = &candidates[n_sample..];
+    if sample_keeps_fpga(
+        sample_solve_ns,
+        n_sample,
+        remaining.len(),
+        active_min_batch_size(),
+        active_sample_min_cpu_ns(),
+        all_conclusive,
+    ) {
+        ACTIVE_SAMPLE_FPGA_BATCHES.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_SAMPLE_FPGA_RETAINED.fetch_add(remaining.len() as u64, Ordering::Relaxed);
+    } else {
+        ACTIVE_SAMPLE_CPU_BATCHES.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_SAMPLE_CPU_REJECTED.fetch_add(remaining.len() as u64, Ordering::Relaxed);
+        for &index in remaining {
+            decisions[index] = ActivePreflight::CpuFallback;
         }
     }
 }
@@ -1061,13 +1198,14 @@ fn measure_paired_preflight(
     Some(work)
 }
 
-fn measure_paired_cpu(
+fn measure_reference_cpu(
     requests: &[(&DagCnfSolver, IncrementalQuery)],
+    apply_paired_filter: bool,
 ) -> Vec<PairedCpuWork> {
     requests
         .iter()
         .map(|(solver, query)| {
-            if !paired_static_selected(query) {
+            if apply_paired_filter && !paired_static_selected(query) {
                 return PairedCpuWork::default();
             }
             // Clone before starting the timer: the comparison is the work of
@@ -1091,10 +1229,15 @@ fn measure_paired_cpu(
         .collect()
 }
 
-fn paired_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
+fn comparison_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
     PAIRED_WRITER
         .get_or_init(|| {
-            let path = std::env::var_os("INDUCTOR_CDCL_PAIRED_CSV")?;
+            let variable = if paired_enabled() {
+                "INDUCTOR_CDCL_PAIRED_CSV"
+            } else {
+                "INDUCTOR_CDCL_ACTIVE_COMPARE_CSV"
+            };
+            let path = std::env::var_os(variable)?;
             let file = match std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -1104,7 +1247,7 @@ fn paired_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>
                 Ok(file) => file,
                 Err(error) => {
                     eprintln!(
-                        "inductor-cdcl: cannot create paired CSV {}: {error}",
+                        "inductor-cdcl: cannot create comparison CSV {}: {error}",
                         std::path::Path::new(&path).display(),
                     );
                     return None;
@@ -1124,7 +1267,7 @@ fn paired_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>
         .as_ref()
 }
 
-fn record_paired_batch(
+fn record_comparison_batch(
     pass_id: u64,
     context: &ShadowContext,
     pending: &[(usize, IncrementalQuery)],
@@ -1161,7 +1304,7 @@ fn record_paired_batch(
         }
     }
 
-    let Some(writer) = paired_writer() else {
+    let Some(writer) = comparison_writer() else {
         return;
     };
     let Ok(mut writer) = writer.lock() else {
@@ -1236,8 +1379,8 @@ fn record_paired_batch(
     }
 }
 
-fn flush_paired_writer() {
-    if let Some(writer) = paired_writer()
+fn flush_comparison_writer() {
+    if let Some(writer) = comparison_writer()
         && let Ok(mut writer) = writer.lock()
     {
         let _ = writer.flush();
@@ -1407,6 +1550,7 @@ pub fn solve_active_batch(
         return output;
     }
     let paired = paired_enabled();
+    let compare_cpu = paired || active_compare_cpu_enabled();
     let paired_preflight = paired
         .then(|| measure_paired_preflight(&requests))
         .flatten();
@@ -1436,8 +1580,8 @@ pub fn solve_active_batch(
     }
     ACTIVE_OFFERED_PASSES.fetch_add(1, Ordering::Relaxed);
     ACTIVE_OFFERED.fetch_add(selected_count as u64, Ordering::Relaxed);
-    let paired_cpu = paired.then(|| measure_paired_cpu(&requests));
-    if let Some(cpu) = paired_cpu.as_ref() {
+    let reference_cpu = compare_cpu.then(|| measure_reference_cpu(&requests, paired));
+    if let Some(cpu) = reference_cpu.as_ref() {
         PAIRED_BASELINE_CPU_NS.fetch_add(
             cpu.iter().map(|work| work.elapsed_ns).sum(),
             Ordering::Relaxed,
@@ -1566,8 +1710,8 @@ pub fn solve_active_batch(
                         hardware.last_batch_work.learnt_clauses,
                         Ordering::Relaxed,
                     );
-                    if let Some(cpu) = paired_cpu.as_ref() {
-                        record_paired_batch(
+                    if let Some(cpu) = reference_cpu.as_ref() {
+                        record_comparison_batch(
                             pass_id,
                             &group.context,
                             &group.pending[start..end],
@@ -1608,7 +1752,7 @@ pub fn solve_active_batch(
             start = end;
         }
     }
-    if paired_cpu.is_some() {
+    if paired {
         output.fill(unknown);
     }
     output
@@ -1753,7 +1897,7 @@ pub fn flush_and_report() {
         );
     }
     if paired_enabled() {
-        flush_paired_writer();
+        flush_comparison_writer();
         let cpu_ns = PAIRED_CPU_NS.load(Ordering::Relaxed);
         let hw_ns = PAIRED_HW_NS.load(Ordering::Relaxed);
         let service_ratio = cpu_ns as f64 / hw_ns.max(1) as f64;
@@ -1806,6 +1950,9 @@ pub fn flush_and_report() {
             );
         }
     } else if active_enabled() {
+        if active_compare_cpu_enabled() {
+            flush_comparison_writer();
+        }
         eprintln!(
             "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init/wait {:.3}/{:.3} ms, load {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
@@ -1861,6 +2008,51 @@ pub fn flush_and_report() {
                     / candidates.max(1) as f64,
             );
         }
+        let sampled = ACTIVE_SAMPLE_QUERIES.load(Ordering::Relaxed);
+        let undersized = ACTIVE_SAMPLE_UNDERSIZED_REJECTED.load(Ordering::Relaxed);
+        if sampled != 0 || undersized != 0 {
+            eprintln!(
+                "inductor-cdcl: active CPU sample queries {}, mean total/clone/solve {:.3}/{:.3}/{:.3} us, solve threshold {:.3} us, FPGA/CPU batches {}/{}, FPGA retained {}, CPU rejected {}, undersized rejected {}",
+                sampled,
+                ACTIVE_SAMPLE_NS.load(Ordering::Relaxed) as f64
+                    / sampled.max(1) as f64
+                    / 1_000.0,
+                ACTIVE_SAMPLE_CLONE_NS.load(Ordering::Relaxed) as f64
+                    / sampled.max(1) as f64
+                    / 1_000.0,
+                ACTIVE_SAMPLE_SOLVE_NS.load(Ordering::Relaxed) as f64
+                    / sampled.max(1) as f64
+                    / 1_000.0,
+                active_sample_min_cpu_ns() as f64 / 1_000.0,
+                ACTIVE_SAMPLE_FPGA_BATCHES.load(Ordering::Relaxed),
+                ACTIVE_SAMPLE_CPU_BATCHES.load(Ordering::Relaxed),
+                ACTIVE_SAMPLE_FPGA_RETAINED.load(Ordering::Relaxed),
+                ACTIVE_SAMPLE_CPU_REJECTED.load(Ordering::Relaxed),
+                undersized,
+            );
+        }
+        if active_compare_cpu_enabled() {
+            let cpu_ns = PAIRED_CPU_NS.load(Ordering::Relaxed);
+            let hw_ns = PAIRED_HW_NS.load(Ordering::Relaxed);
+            eprintln!(
+                "inductor-cdcl: active CPU comparison queries {}, batches {}, CPU/HW status agree {}, mismatch {}, HW unknown {}, HW-faster batches {}, CPU-reference {:.3} ms, FPGA service {:.3} ms, service ratio {:.3}x, with context load {:.3}x, CSV {}",
+                PAIRED_QUERIES.load(Ordering::Relaxed),
+                PAIRED_BATCH_ID.load(Ordering::Relaxed),
+                PAIRED_AGREE.load(Ordering::Relaxed),
+                PAIRED_MISMATCH.load(Ordering::Relaxed),
+                PAIRED_UNKNOWN.load(Ordering::Relaxed),
+                PAIRED_HW_FASTER_BATCHES.load(Ordering::Relaxed),
+                cpu_ns as f64 / 1_000_000.0,
+                hw_ns as f64 / 1_000_000.0,
+                cpu_ns as f64 / hw_ns.max(1) as f64,
+                cpu_ns as f64
+                    / hw_ns
+                        .saturating_add(ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed))
+                        .max(1) as f64,
+                std::env::var("INDUCTOR_CDCL_ACTIVE_COMPARE_CSV")
+                    .unwrap_or_else(|_| "disabled".to_string()),
+            );
+        }
     }
     if profile_enabled() {
         print_profile();
@@ -1873,6 +2065,15 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn cpu_sample_requires_cost_and_a_remaining_hardware_batch() {
+        assert!(sample_keeps_fpga(600_000, 2, 16, 8, 200_000, true));
+        assert!(!sample_keeps_fpga(300_000, 2, 16, 8, 200_000, true));
+        assert!(!sample_keeps_fpga(600_000, 2, 7, 8, 200_000, true));
+        assert!(!sample_keeps_fpga(0, 0, 16, 8, 200_000, true));
+        assert!(!sample_keeps_fpga(600_000, 2, 16, 8, 200_000, false));
+    }
 
     #[test]
     fn resident_context_packing_rejects_bad_ranges_and_variables() {

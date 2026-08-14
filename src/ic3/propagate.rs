@@ -48,6 +48,7 @@ impl IC3 {
         if crate::accel::cdcl_host::active_preflight_should_run(n_queries) {
             let mut query_index = 0usize;
             for (frame_idx, _, queries) in &work {
+                let frame_result_offset = query_index;
                 for query in queries {
                     preflight[query_index] =
                         crate::accel::cdcl_host::active_preflight_classify(
@@ -56,6 +57,11 @@ impl IC3 {
                         );
                     query_index += 1;
                 }
+                crate::accel::cdcl_host::active_sample_select(
+                    &mut self.solvers[*frame_idx].dcs,
+                    queries,
+                    &mut preflight[frame_result_offset..query_index],
+                );
             }
         }
         let active_results = if propagation_batch_enabled {
