@@ -30,6 +30,13 @@ unsafe extern "C" {
         response_capacity_words: u32,
         out_response_words: *mut u32,
     ) -> i32;
+    fn ind_cdcl_load_context_and_solve_batch(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +165,56 @@ fn sum_hardware_work(records: &[HardwareWork]) -> HardwareWork {
         })
 }
 
+fn pack_batch_request(
+    queries: &[IncrementalQuery],
+) -> Result<(Vec<u32>, usize), HardwareError> {
+    let result_words = queries
+        .iter()
+        .try_fold(0usize, |total, query| {
+            total.checked_add(
+                RESPONSE_HEADER_WORDS + query.domain.len().max(query.assumptions.len()),
+            )
+        })
+        .ok_or(HardwareError::Capacity)?;
+    let result_words_u32 =
+        u32::try_from(result_words).map_err(|_| HardwareError::Capacity)?;
+    let (batch, payload) = pack_batch(queries, result_words_u32);
+    let mut request = Vec::with_capacity(4 + payload.len());
+    let BatchHeader {
+        version,
+        n_queries,
+        n_request_words,
+        result_capacity_words,
+    } = batch;
+    request.extend([version, n_queries, n_request_words, result_capacity_words]);
+    request.extend(payload);
+    u32::try_from(request.len()).map_err(|_| HardwareError::Capacity)?;
+    let response_capacity = result_words.checked_add(4).ok_or(HardwareError::Capacity)?;
+    u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+    Ok((request, response_capacity))
+}
+
+fn pack_load_context_and_batch_request(
+    n_var: u32,
+    clauses: &[ResidentClause],
+    queries: &[IncrementalQuery],
+) -> Result<(Vec<u32>, usize), HardwareError> {
+    let n_clause = u32::try_from(clauses.len()).map_err(|_| HardwareError::Capacity)?;
+    let context = pack_clauses(&[n_var, n_clause], n_var, clauses)?;
+    let context_words = u32::try_from(context.len()).map_err(|_| HardwareError::Capacity)?;
+    let (batch, response_capacity) = pack_batch_request(queries)?;
+    let capacity = 1usize
+        .checked_add(context.len())
+        .and_then(|words| words.checked_add(batch.len()))
+        .ok_or(HardwareError::Capacity)?;
+    u32::try_from(capacity).map_err(|_| HardwareError::Capacity)?;
+    let mut request = Vec::with_capacity(capacity);
+    request.push(context_words);
+    request.extend(context);
+    request.extend(batch);
+    Ok((request, response_capacity))
+}
+
 pub struct HardwareCdcl {
     n_var: u32,
     last_batch_work: HardwareWork,
@@ -281,25 +338,7 @@ impl HardwareCdcl {
         if self.n_var == 0 {
             return Err(HardwareError::InvalidContext);
         }
-        let result_words = queries.iter().try_fold(0usize, |total, query| {
-            total.checked_add(
-                RESPONSE_HEADER_WORDS + query.domain.len().max(query.assumptions.len()),
-            )
-        }).ok_or(HardwareError::Capacity)?;
-        let result_words_u32 =
-            u32::try_from(result_words).map_err(|_| HardwareError::Capacity)?;
-        let (batch, payload) = pack_batch(queries, result_words_u32);
-        let mut request = Vec::with_capacity(4 + payload.len());
-        let BatchHeader {
-            version,
-            n_queries,
-            n_request_words,
-            result_capacity_words,
-        } = batch;
-        request.extend([version, n_queries, n_request_words, result_capacity_words]);
-        request.extend(payload);
-
-        let response_capacity = result_words.checked_add(4).ok_or(HardwareError::Capacity)?;
+        let (request, response_capacity) = pack_batch_request(queries)?;
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
         #[cfg(has_cdcl_accel)]
@@ -326,11 +365,57 @@ impl HardwareCdcl {
                 return Err(HardwareError::Capacity);
             }
             response.truncate(out_words);
-            let results = decode_batch_results(queries, &response)
-                .map_err(HardwareError::Decode)?;
-            self.last_batch_records = decode_batch_work_records(&response, queries.len())
-                .ok_or(HardwareError::Decode(BatchDecodeError::InvalidResultShape))?;
-            self.last_batch_work = sum_hardware_work(&self.last_batch_records);
+            self.decode_batch_response(queries, &response)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, response_capacity_u32, response);
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    /// Atomically replace the resident context and execute its first batch in
+    /// one kernel/RPC command. Older bitstreams reject this extension; callers
+    /// may safely retry with `load_context` followed by `solve_batch`.
+    pub fn load_context_and_solve_batch(
+        &mut self,
+        n_var: u32,
+        clauses: &[ResidentClause],
+        queries: &[IncrementalQuery],
+    ) -> Result<Vec<IncrementalResult>, HardwareError> {
+        self.last_batch_work = HardwareWork::default();
+        self.last_batch_records.clear();
+        let (request, response_capacity) =
+            pack_load_context_and_batch_request(n_var, clauses, queries)?;
+        profile_resident_context(n_var, clauses);
+        let response_capacity_u32 =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        let mut response = vec![0u32; response_capacity];
+        #[cfg(not(has_cdcl_accel))]
+        let response = vec![0u32; response_capacity];
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_load_context_and_solve_batch(
+                    request.as_ptr(),
+                    request.len() as u32,
+                    response.as_mut_ptr(),
+                    response_capacity_u32,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() {
+                return Err(HardwareError::Capacity);
+            }
+            response.truncate(out_words);
+            let results = self.decode_batch_response(queries, &response)?;
+            self.n_var = n_var;
             Ok(results)
         }
         #[cfg(not(has_cdcl_accel))]
@@ -338,6 +423,19 @@ impl HardwareCdcl {
             let _ = (request, response_capacity_u32, response);
             Err(HardwareError::Unavailable)
         }
+    }
+
+    #[cfg(has_cdcl_accel)]
+    fn decode_batch_response(
+        &mut self,
+        queries: &[IncrementalQuery],
+        response: &[u32],
+    ) -> Result<Vec<IncrementalResult>, HardwareError> {
+        let results = decode_batch_results(queries, response).map_err(HardwareError::Decode)?;
+        self.last_batch_records = decode_batch_work_records(response, queries.len())
+            .ok_or(HardwareError::Decode(BatchDecodeError::InvalidResultShape))?;
+        self.last_batch_work = sum_hardware_work(&self.last_batch_records);
+        Ok(results)
     }
 
     /// Batch first, then retry only inconclusive inquiries in GipSAT. All
@@ -455,6 +553,8 @@ static ACTIVE_OFFERED_PASSES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MAX_READY: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOADS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_COMBINED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_COMBINED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_SAT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_UNSAT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNKNOWN: AtomicU64 = AtomicU64::new(0);
@@ -470,6 +570,8 @@ static ACTIVE_CPU_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_COMBINED_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_COMBINED_FALLBACK_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCH_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
@@ -1636,25 +1738,7 @@ pub fn solve_active_batch(
         if pair_scheduler_enabled() {
             schedule_query_pairs(&mut group.pending, |(_, query)| query);
         }
-        if state.loaded_context.as_ref() != Some(&group.context) {
-            let load_start = std::time::Instant::now();
-            let loaded = state
-                .hardware
-                .as_mut()
-                .ok_or(HardwareError::Unavailable)
-                .and_then(|hardware| {
-                    hardware.load_context(group.context.n_var, &group.context.clauses)
-                });
-            context_load_ns = load_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            ACTIVE_CONTEXT_LOAD_NS.fetch_add(context_load_ns, Ordering::Relaxed);
-            if loaded.is_err() {
-                ACTIVE_ERROR.fetch_add(group.pending.len() as u64, Ordering::Relaxed);
-                state.loaded_context = None;
-                continue;
-            }
-            ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
-            state.loaded_context = Some(group.context.clone());
-        }
+        let mut context_ready = state.loaded_context.as_ref() == Some(&group.context);
 
         let mut start = 0usize;
         while start < group.pending.len() {
@@ -1683,13 +1767,85 @@ pub fn solve_active_batch(
                 .map(|(_, query)| query.clone())
                 .collect();
             ACTIVE_BATCHES.fetch_add(1, Ordering::Relaxed);
-            let batch_start = std::time::Instant::now();
-            let result = state
-                .hardware
-                .as_mut()
-                .ok_or(HardwareError::Unavailable)
-                .and_then(|hardware| hardware.solve_batch(&queries));
-            let batch_ns = batch_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let mut batch_ns = 0u64;
+            let mut result = None;
+            if !context_ready {
+                let combined_start = std::time::Instant::now();
+                let combined = state
+                    .hardware
+                    .as_mut()
+                    .ok_or(HardwareError::Unavailable)
+                    .and_then(|hardware| {
+                        hardware.load_context_and_solve_batch(
+                            group.context.n_var,
+                            &group.context.clauses,
+                            &queries,
+                        )
+                    });
+                let combined_ns = combined_start
+                    .elapsed()
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64;
+                ACTIVE_COMBINED_NS.fetch_add(combined_ns, Ordering::Relaxed);
+                match combined {
+                    Ok(results) => {
+                        ACTIVE_COMBINED_BATCHES.fetch_add(1, Ordering::Relaxed);
+                        ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
+                        context_ready = true;
+                        state.loaded_context = Some(group.context.clone());
+                        batch_ns = combined_ns;
+                        result = Some(Ok(results));
+                    }
+                    Err(_) => {
+                        ACTIVE_COMBINED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                        ACTIVE_COMBINED_FALLBACK_NS.fetch_add(
+                            combined_ns,
+                            Ordering::Relaxed,
+                        );
+                        state.loaded_context = None;
+                        let load_start = std::time::Instant::now();
+                        let loaded = state
+                            .hardware
+                            .as_mut()
+                            .ok_or(HardwareError::Unavailable)
+                            .and_then(|hardware| {
+                                hardware.load_context(
+                                    group.context.n_var,
+                                    &group.context.clauses,
+                                )
+                            });
+                        context_load_ns = load_start
+                            .elapsed()
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64;
+                        ACTIVE_CONTEXT_LOAD_NS.fetch_add(context_load_ns, Ordering::Relaxed);
+                        if loaded.is_err() {
+                            ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                            start = end;
+                            continue;
+                        }
+                        ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
+                        context_ready = true;
+                        state.loaded_context = Some(group.context.clone());
+                    }
+                }
+            }
+            let result = match result {
+                Some(result) => result,
+                None => {
+                    let batch_start = std::time::Instant::now();
+                    let result = state
+                        .hardware
+                        .as_mut()
+                        .ok_or(HardwareError::Unavailable)
+                        .and_then(|hardware| hardware.solve_batch(&queries));
+                    batch_ns = batch_start
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64;
+                    result
+                }
+            };
             ACTIVE_BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
             if result.is_ok() {
                 if let Some(hardware) = state.hardware.as_ref() {
@@ -1902,7 +2058,7 @@ pub fn flush_and_report() {
         let hw_ns = PAIRED_HW_NS.load(Ordering::Relaxed);
         let service_ratio = cpu_ns as f64 / hw_ns.max(1) as f64;
         eprintln!(
-            "inductor-cdcl: paired selector frame >= {}, assumptions <= {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, filtered {}, queries {}, batches {}, CPU/HW agree {}, mismatch {}, HW unknown {}, HW-faster batches {}, CPU-reference {:.3} ms, FPGA service {:.3} ms, service ratio {:.3}x, init {:.3} ms, context loads {} / {:.3} ms, errors {}, CSV {}",
+            "inductor-cdcl: paired selector frame >= {}, assumptions <= {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, filtered {}, queries {}, batches {}, CPU/HW agree {}, mismatch {}, HW unknown {}, HW-faster batches {}, CPU-reference {:.3} ms, FPGA service {:.3} ms, service ratio {:.3}x, init {:.3} ms, context loads {} / {:.3} ms, combined ok/fallback {}/{} / {:.3} ms, errors {}, CSV {}",
             paired_min_frame(),
             paired_max_assumptions(),
             ACTIVE_PASSES.load(Ordering::Relaxed),
@@ -1923,6 +2079,9 @@ pub fn flush_and_report() {
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOADS.load(Ordering::Relaxed),
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_COMBINED_BATCHES.load(Ordering::Relaxed),
+            ACTIVE_COMBINED_FALLBACKS.load(Ordering::Relaxed),
+            ACTIVE_COMBINED_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_ERROR.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_PAIRED_CSV")
                 .unwrap_or_else(|_| "disabled".to_string()),
@@ -1932,7 +2091,8 @@ pub fn flush_and_report() {
             let preflight_ns = PAIRED_PREFLIGHT_NS.load(Ordering::Relaxed);
             let hybrid_service_ns = preflight_ns.saturating_add(hw_ns);
             let hybrid_with_load_ns = hybrid_service_ns
-                .saturating_add(ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed));
+                .saturating_add(ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed))
+                .saturating_add(ACTIVE_COMBINED_FALLBACK_NS.load(Ordering::Relaxed));
             eprintln!(
                 "inductor-cdcl: paired preflight conflicts {}, candidates {}, conclusive {}, selected {}, preflight total/clone/solve {:.3}/{:.3}/{:.3} ms, all-candidate CPU baseline {:.3} ms, projected hybrid service {:.3} ms ({:.3}x), with context load {:.3} ms ({:.3}x)",
                 conflict_limit,
@@ -1954,7 +2114,7 @@ pub fn flush_and_report() {
             flush_comparison_writer();
         }
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init/wait {:.3}/{:.3} ms, load {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -1965,6 +2125,8 @@ pub fn flush_and_report() {
             ACTIVE_OFFERED.load(Ordering::Relaxed),
             ACTIVE_BATCHES.load(Ordering::Relaxed),
             ACTIVE_CONTEXT_LOADS.load(Ordering::Relaxed),
+            ACTIVE_COMBINED_BATCHES.load(Ordering::Relaxed),
+            ACTIVE_COMBINED_FALLBACKS.load(Ordering::Relaxed),
             ACTIVE_HW_SAT.load(Ordering::Relaxed),
             ACTIVE_HW_UNSAT.load(Ordering::Relaxed),
             ACTIVE_UNKNOWN.load(Ordering::Relaxed),
@@ -1984,6 +2146,7 @@ pub fn flush_and_report() {
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_STATE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_COMBINED_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_UNSAT_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
@@ -2048,6 +2211,7 @@ pub fn flush_and_report() {
                 cpu_ns as f64
                     / hw_ns
                         .saturating_add(ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed))
+                        .saturating_add(ACTIVE_COMBINED_FALLBACK_NS.load(Ordering::Relaxed))
                         .max(1) as f64,
                 std::env::var("INDUCTOR_CDCL_ACTIVE_COMPARE_CSV")
                     .unwrap_or_else(|_| "disabled".to_string()),
@@ -2092,6 +2256,24 @@ mod tests {
             pack_clauses(&[1], 1, &[ResidentClause::new(0, 0, LitVec::from([outside]))]),
             Err(HardwareError::InvalidContext),
         );
+    }
+
+    #[test]
+    fn combined_request_has_exact_context_and_batch_boundaries() {
+        let a = Lit::new(Var::from(0), true);
+        let clauses = [ResidentClause::new(0, 2, LitVec::from([a]))];
+        let mut query = IncrementalQuery::new(2, LitVec::from([a]));
+        query.domain = vec![Var::from(0)];
+        let queries = [query];
+        let context = pack_clauses(&[1, 1], 1, &clauses).unwrap();
+        let (batch, response_capacity) = pack_batch_request(&queries).unwrap();
+        let (combined, combined_capacity) =
+            pack_load_context_and_batch_request(1, &clauses, &queries).unwrap();
+
+        assert_eq!(combined[0] as usize, context.len());
+        assert_eq!(&combined[1..1 + context.len()], context.as_slice());
+        assert_eq!(&combined[1 + context.len()..], batch.as_slice());
+        assert_eq!(combined_capacity, response_capacity);
     }
 
     #[test]
