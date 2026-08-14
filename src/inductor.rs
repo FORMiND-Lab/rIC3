@@ -780,7 +780,15 @@ pub struct Timer(Option<Instant>);
 impl Timer {
     #[inline(always)]
     pub fn start() -> Self {
-        Timer(enabled().then(Instant::now))
+        // Selective core offload learns from exact CPU BCP time even when a
+        // trace file is not being written. This opt-in path pays the clock
+        // reads intentionally; normal runs retain their zero-cost timestamps.
+        static SELECT_TIMING: OnceLock<bool> = OnceLock::new();
+        let timing = enabled()
+            || *SELECT_TIMING.get_or_init(|| {
+                std::env::var("INDUCTOR_CORE_SELECTIVE").is_ok()
+            });
+        Timer(timing.then(Instant::now))
     }
 
     #[inline(always)]

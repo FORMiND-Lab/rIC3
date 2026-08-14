@@ -1,6 +1,10 @@
 use crate::{
-    gipsat::TransysSolver,
-    ic3::{IC3, frame::FrameLemma, mic::MicType},
+    gipsat::{IncrementalQuery, IncrementalResult, TransysSolver},
+    ic3::{
+        frame::{Frame, FrameLemma},
+        mic::MicType,
+        IC3,
+    },
     transys::TransysIf,
 };
 use logicrs::{LitOrdVec, LitVec, satif::Satif};
@@ -11,22 +15,86 @@ impl IC3 {
     pub fn propagate(&mut self, from: Option<usize>) -> bool {
         let level = self.level();
         let from = from.unwrap_or(self.frame.early).max(1);
+        // Prepare the whole propagation pass before mutating any frame. SAT
+        // models are safe to speculate this far ahead because every model is
+        // checked again against the live solver immediately before use; a
+        // lemma learned by an earlier frame can only reject a stale model and
+        // trigger CPU fallback.
+        let active_enabled = crate::accel::cdcl_host::active_enabled();
+        let mut work: Vec<(usize, Frame, Vec<IncrementalQuery>)> = Vec::new();
         for frame_idx in from..level {
             let mut frame = self.frame[frame_idx].clone();
             frame.sort_by_key(|x| x.len());
+            let active_queries = if active_enabled {
+                frame
+                    .iter()
+                    .map(|lemma| {
+                        self.solvers[frame_idx]
+                            .incremental_inductive_query(lemma, true, vec![])
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            work.push((frame_idx, frame, active_queries));
+        }
+        let active_results = if active_enabled {
+            let mut requests = Vec::new();
+            for (frame_idx, _, queries) in &work {
+                let solver = &self.solvers[*frame_idx].dcs;
+                for query in queries {
+                    requests.push((solver, query.clone()));
+                }
+            }
+            crate::accel::cdcl_host::solve_active_batch(requests)
+        } else {
+            Vec::new()
+        };
+
+        let mut result_offset = 0usize;
+        for (frame_idx, frame, active_queries) in work {
+            let frame_result_offset = result_offset;
+            result_offset += active_queries.len();
             let _op =
                 crate::inductor::macro_scope(inductor_trace::Phase::Push, frame_idx + 1);
-            for mut lemma in frame {
+            for (lemma_index, mut lemma) in frame.into_iter().enumerate() {
                 if self.frame[frame_idx].iter().all(|l| l.ne(&lemma)) {
                     continue;
                 }
                 for ctp in 0..3 {
-                    if self
-                        .blocked(frame_idx + 1, &lemma)
-                        .in_phase(inductor_trace::Phase::Push)
-                        .with_act_order(false)
-                        .check()
-                    {
+                    let active_sat = if ctp == 0 {
+                        match active_results.get(frame_result_offset + lemma_index) {
+                            Some(IncrementalResult::Sat { model }) => {
+                                let validation_start = Instant::now();
+                                let accepted = self.solvers[frame_idx]
+                                    .install_incremental_sat_model(
+                                        &active_queries[lemma_index],
+                                        model,
+                                    );
+                                crate::accel::cdcl_host::note_active_sat_model(
+                                    accepted,
+                                    validation_start.elapsed().as_nanos() as u64,
+                                );
+                                accepted
+                            }
+                            Some(_) => {
+                                crate::accel::cdcl_host::note_active_cpu_fallback();
+                                false
+                            }
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+                    let blocked = if active_sat {
+                        false
+                    } else {
+                        self.blocked(frame_idx + 1, &lemma)
+                            .in_phase(inductor_trace::Phase::Push)
+                            .with_act_order(false)
+                            .check()
+                    };
+                    if blocked {
                         let core = self.solvers[frame_idx]
                             .inductive_core()
                             .unwrap_or(lemma.as_litvec().clone());

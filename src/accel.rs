@@ -11,6 +11,9 @@
 //! path on real runs without depending on the card being quick -- at a 6.7 us
 //! round trip against a 7.3 us median query, it will not be for small ones.
 
+pub mod cdcl;
+pub mod cdcl_host;
+
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -73,8 +76,6 @@ unsafe extern "C" {
         cap: u32,
         out_len: *mut u32,
     ) -> i32;
-    fn ind_accel_verdict_batch(flat: *const u32, n_word: u64, n_query: u32, level: u32,
-                               out: *mut u8) -> i32;
     fn ind_accel_last_call(dom: *mut u32, n: *mut u32);
     fn ind_accel_down(con_flat: *const u32, n_con_word: u32, assump: *const u32,
                       n_assump: u32, level: u32, out_core: *mut u32, cap: u32,
@@ -145,7 +146,9 @@ pub fn flush_batch() {
         flat.extend_from_slice(cube);
     }
     let mut out = vec![0u8; q.len()];
-    let rc = if cfg!(feature = "never") { 0 } else { -1 };
+    // The legacy batch ABI cannot carry a per-query decision domain, so it is
+    // deliberately disabled rather than hidden behind an undeclared cfg.
+    let rc: i32 = -1;
     let _ = (&flat, &mut out);
     // Throughput only. The shadow comparison does not survive batching and the
     // first run of it said so: 34 defects against zero on the same benchmark
@@ -280,6 +283,9 @@ pub fn init(path: &str, n_var: u32, flat: &[u32]) -> Result<(), String> {
             -3 => "the packer rejected the netlist".to_string(),
             -4 => "the kernel reported an error loading it".to_string(),
             -5 => "the netlist's literal pool is larger than the kernel holds".to_string(),
+            -6 => format!(
+                "the watched kernel holds at most 16384 variables (netlist has {n_var}); CPU fallback required"
+            ),
             _ => format!("load failed (code {r})"),
         });
     }
@@ -462,11 +468,10 @@ fn layout_ok() -> bool {
 
 /// The unsat core for a query, or None if the card did not derive one.
 ///
-/// This is the only call whose result IC3 acts on. `down()` turns the core
-/// into the generalized lemma, so a verdict bit was never usable however fast
-/// it came back. Sound to use directly: the card holds a subset of the
-/// solver's clauses, and a subset of assumptions that conflicts against fewer
-/// clauses conflicts against more.
+/// `down()` turns the returned literals into a candidate generalized lemma, so
+/// a verdict bit was never usable however fast it came back. IC3 does not trust
+/// this result directly: the exact frame solver validates the candidate under
+/// the same query constraints before adoption.
 /// The clauses this query carries, replacing the last query's.
 ///
 /// `down()` asks with `!cube` under `strengthen`; the card holding a subset of
@@ -569,6 +574,8 @@ pub fn down(con_flat: &[u32], assump: &[u32], level: u32, out: &mut Vec<u32>) ->
     out.truncate(n as usize);
     if n > 0 {
         CORE_GOT.fetch_add(1, Ordering::Relaxed);
+        CORE_IN.fetch_add(assump.len() as u64, Ordering::Relaxed);
+        CORE_OUT.fetch_add(n as u64, Ordering::Relaxed);
     }
     Some(n as usize)
 }
@@ -666,9 +673,241 @@ pub fn core_gain() -> usize {
     })
 }
 
+/// Whether to bypass CPU validation of a card-proposed core.
+///
+/// Off by default. A gate-resident VCK5000 run on Problem04_label27 produced a
+/// 212-to-5 literal core which changed a real SAT result into UNSAT. Until the
+/// hardware path has a stronger proof boundary, every proposed core is only a
+/// candidate and must be rechecked by BCP in a clone of the exact frame solver.
+/// This switch is retained solely to reproduce old research measurements.
+pub fn unchecked_core() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INDUCTOR_CORE_UNCHECKED").is_ok())
+}
+
 pub fn core_offload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("INDUCTOR_CORE").is_ok())
+}
+
+/// Whether core offload is restricted to queries which look profitable.
+///
+/// The card is an UNSAT/core co-processor, not a replacement SAT solver: a
+/// satisfiable query pays the round trip and still has to run on the CPU. The
+/// selector therefore learns, separately for coarse cube-length buckets, how
+/// often CPU `down()` queries are UNSAT and how much time their BCP consumes.
+/// A query is sent only after its bucket has enough observations and clears
+/// all three gates: long cube, high UNSAT probability, expensive CPU BCP.
+///
+/// This is deliberately a second switch. `INDUCTOR_CORE=1` retains the old
+/// ask-every-query experiment; adding `INDUCTOR_CORE_SELECTIVE=1` enables the
+/// policy, so old measurements remain reproducible.
+pub fn selective_core_offload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INDUCTOR_CORE_SELECTIVE").is_ok())
+}
+
+const CORE_SELECT_BUCKETS: usize = 5;
+
+#[derive(Clone, Copy, Debug)]
+struct CoreSelectConfig {
+    min_cube: usize,
+    warmup: u64,
+    min_unsat_pct: u64,
+    min_bcp_ns: u64,
+    card_warmup: u64,
+    min_card_hit_pct: u64,
+    reprobe_every: u64,
+}
+
+impl CoreSelectConfig {
+    fn from_env() -> Self {
+        fn value<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        Self {
+            min_cube: value("INDUCTOR_SELECT_MIN_CUBE", 8),
+            warmup: value("INDUCTOR_SELECT_WARMUP", 16),
+            min_unsat_pct: value::<u64>("INDUCTOR_SELECT_MIN_UNSAT_PCT", 25).min(100),
+            min_bcp_ns: value("INDUCTOR_SELECT_MIN_BCP_NS", 50_000),
+            card_warmup: value("INDUCTOR_SELECT_CARD_WARMUP", 2),
+            min_card_hit_pct: value::<u64>("INDUCTOR_SELECT_MIN_CARD_HIT_PCT", 1).min(100),
+            reprobe_every: value("INDUCTOR_SELECT_REPROBE_EVERY", 4096),
+        }
+    }
+}
+
+fn core_select_config() -> &'static CoreSelectConfig {
+    static CONFIG: std::sync::OnceLock<CoreSelectConfig> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(CoreSelectConfig::from_env)
+}
+
+/// Cube-length buckets: 0-3, 4-7, 8-15, 16-31, and 32+ literals.
+#[inline]
+fn core_select_bucket(len: usize) -> usize {
+    match len {
+        0..=3 => 0,
+        4..=7 => 1,
+        8..=15 => 2,
+        16..=31 => 3,
+        _ => 4,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoreSelectDecision {
+    Selected,
+    Short,
+    Warmup,
+    LowUnsat,
+    CheapBcp,
+    LowCardHit,
+}
+
+fn core_select_decision(
+    cfg: CoreSelectConfig,
+    cube_len: usize,
+    seen: u64,
+    unsat: u64,
+    bcp_ns: u64,
+    card_seen: u64,
+    card_hit: u64,
+) -> CoreSelectDecision {
+    if cube_len < cfg.min_cube {
+        return CoreSelectDecision::Short;
+    }
+    // With a zero warm-up, a non-zero learned threshold still needs one real
+    // observation. Setting all thresholds to zero intentionally restores
+    // ask-every-eligible-query behaviour.
+    if seen < cfg.warmup
+        || (seen == 0 && (cfg.min_unsat_pct != 0 || cfg.min_bcp_ns != 0))
+    {
+        return CoreSelectDecision::Warmup;
+    }
+    if unsat.saturating_mul(100) < seen.saturating_mul(cfg.min_unsat_pct) {
+        return CoreSelectDecision::LowUnsat;
+    }
+    if bcp_ns < seen.saturating_mul(cfg.min_bcp_ns) {
+        return CoreSelectDecision::CheapBcp;
+    }
+    // CPU UNSAT is only a proxy for the event that saves work: propagation on
+    // the weaker card clause set returning a core. Explore enough real card
+    // queries to measure that event, then require an actual hit rate.
+    if card_seen < cfg.card_warmup {
+        return CoreSelectDecision::Selected;
+    }
+    if card_hit.saturating_mul(100)
+        < card_seen.saturating_mul(cfg.min_card_hit_pct)
+    {
+        return CoreSelectDecision::LowCardHit;
+    }
+    CoreSelectDecision::Selected
+}
+
+static CORE_CPU_SEEN: [AtomicU64; CORE_SELECT_BUCKETS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
+];
+static CORE_CPU_UNSAT: [AtomicU64; CORE_SELECT_BUCKETS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
+];
+static CORE_CPU_BCP_NS: [AtomicU64; CORE_SELECT_BUCKETS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
+];
+static CORE_CARD_SEEN: [AtomicU64; CORE_SELECT_BUCKETS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
+];
+static CORE_CARD_HIT: [AtomicU64; CORE_SELECT_BUCKETS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
+];
+static CORE_CARD_REJECTED: [AtomicU64; CORE_SELECT_BUCKETS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
+];
+
+pub static CORE_SELECT_OFFERED: AtomicU64 = AtomicU64::new(0);
+pub static CORE_SELECT_SELECTED: AtomicU64 = AtomicU64::new(0);
+pub static CORE_SELECT_SHORT: AtomicU64 = AtomicU64::new(0);
+pub static CORE_SELECT_WARMUP: AtomicU64 = AtomicU64::new(0);
+pub static CORE_SELECT_LOW_UNSAT: AtomicU64 = AtomicU64::new(0);
+pub static CORE_SELECT_CHEAP_BCP: AtomicU64 = AtomicU64::new(0);
+pub static CORE_SELECT_LOW_CARD_HIT: AtomicU64 = AtomicU64::new(0);
+
+/// Decide whether this `down()` query should be offered to the card.
+///
+/// Callers already check `core_offload()` and `ready()`. Returning true when
+/// selection is disabled preserves the original full-offload path.
+pub fn select_core_query(cube_len: usize) -> bool {
+    if !selective_core_offload() {
+        return true;
+    }
+    CORE_SELECT_OFFERED.fetch_add(1, Ordering::Relaxed);
+    let bucket = core_select_bucket(cube_len);
+    let cfg = *core_select_config();
+    let mut decision = core_select_decision(
+        cfg,
+        cube_len,
+        CORE_CPU_SEEN[bucket].load(Ordering::Relaxed),
+        CORE_CPU_UNSAT[bucket].load(Ordering::Relaxed),
+        CORE_CPU_BCP_NS[bucket].load(Ordering::Relaxed),
+        CORE_CARD_SEEN[bucket].load(Ordering::Relaxed),
+        CORE_CARD_HIT[bucket].load(Ordering::Relaxed),
+    );
+    // A cumulative hit rate deliberately damps noise, but can otherwise get
+    // stuck after a cold phase. Keep one low-rate exploration stream so a
+    // later frame with better card-resolvable conflicts can recover.
+    if decision == CoreSelectDecision::LowCardHit && cfg.reprobe_every != 0 {
+        let rejected = CORE_CARD_REJECTED[bucket].fetch_add(1, Ordering::Relaxed) + 1;
+        if rejected.is_multiple_of(cfg.reprobe_every) {
+            decision = CoreSelectDecision::Selected;
+        }
+    }
+    let counter = match decision {
+        CoreSelectDecision::Selected => &CORE_SELECT_SELECTED,
+        CoreSelectDecision::Short => &CORE_SELECT_SHORT,
+        CoreSelectDecision::Warmup => &CORE_SELECT_WARMUP,
+        CoreSelectDecision::LowUnsat => &CORE_SELECT_LOW_UNSAT,
+        CoreSelectDecision::CheapBcp => &CORE_SELECT_CHEAP_BCP,
+        CoreSelectDecision::LowCardHit => &CORE_SELECT_LOW_CARD_HIT,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    decision == CoreSelectDecision::Selected
+}
+
+/// Feed one CPU `down()` result back into the selector's online model.
+///
+/// Card hits return before the CPU solver runs and therefore do not have a CPU
+/// BCP measurement. Misses and rejected queries do, and keep the model
+/// adapting as the frame and lemma database evolve.
+pub fn observe_core_query(cube_len: usize, unsat: bool, bcp_ns: u32) {
+    if !selective_core_offload() {
+        return;
+    }
+    let bucket = core_select_bucket(cube_len);
+    CORE_CPU_SEEN[bucket].fetch_add(1, Ordering::Relaxed);
+    if unsat {
+        CORE_CPU_UNSAT[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+    CORE_CPU_BCP_NS[bucket].fetch_add(bcp_ns as u64, Ordering::Relaxed);
+}
+
+/// Record whether an actually selected card query returned an UNSAT core.
+pub fn observe_card_core_query(cube_len: usize, hit: bool) {
+    if !selective_core_offload() {
+        return;
+    }
+    let bucket = core_select_bucket(cube_len);
+    CORE_CARD_SEEN[bucket].fetch_add(1, Ordering::Relaxed);
+    if hit {
+        CORE_CARD_HIT[bucket].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub static CORE_USED: AtomicU64 = AtomicU64::new(0);
@@ -676,6 +915,8 @@ pub static CORE_ASKED: AtomicU64 = AtomicU64::new(0);
 pub static CORE_GOT: AtomicU64 = AtomicU64::new(0);
 pub static CORE_IN: AtomicU64 = AtomicU64::new(0);
 pub static CORE_OUT: AtomicU64 = AtomicU64::new(0);
+pub static CORE_VALIDATED: AtomicU64 = AtomicU64::new(0);
+pub static CORE_VALIDATION_FAILED: AtomicU64 = AtomicU64::new(0);
 
 pub fn stats() -> AccelStats {
     if !layout_ok() {
@@ -689,6 +930,7 @@ pub fn stats() -> AccelStats {
 }
 
 pub fn report() {
+    cdcl_host::flush_and_report();
     if !ready() {
         return;
     }
@@ -809,6 +1051,53 @@ pub fn report() {
                     CORE_IN.load(O::Relaxed) as f64 / CORE_OUT.load(O::Relaxed) as f64
                 } else { 0.0 }
             );
+            if !unchecked_core() {
+                eprintln!(
+                    "inductor: card-core CPU validation passed {}, failed {}",
+                    CORE_VALIDATED.load(O::Relaxed),
+                    CORE_VALIDATION_FAILED.load(O::Relaxed),
+                );
+            }
+        }
+        if selective_core_offload() {
+            let offered = CORE_SELECT_OFFERED.load(O::Relaxed);
+            let selected = CORE_SELECT_SELECTED.load(O::Relaxed);
+            let seen: u64 = CORE_CPU_SEEN.iter().map(|v| v.load(O::Relaxed)).sum();
+            let unsat: u64 = CORE_CPU_UNSAT.iter().map(|v| v.load(O::Relaxed)).sum();
+            let bcp_ns: u64 = CORE_CPU_BCP_NS.iter().map(|v| v.load(O::Relaxed)).sum();
+            let card_seen: u64 = CORE_CARD_SEEN.iter().map(|v| v.load(O::Relaxed)).sum();
+            let card_hit: u64 = CORE_CARD_HIT.iter().map(|v| v.load(O::Relaxed)).sum();
+            let cfg = core_select_config();
+            eprintln!(
+                "inductor: selective core offered {}, selected {} ({:.1}%); rejected short {}, warm-up {}, low-UNSAT {}, cheap-BCP {}, low-card-hit {}",
+                offered,
+                selected,
+                if offered > 0 { 100.0 * selected as f64 / offered as f64 } else { 0.0 },
+                CORE_SELECT_SHORT.load(O::Relaxed),
+                CORE_SELECT_WARMUP.load(O::Relaxed),
+                CORE_SELECT_LOW_UNSAT.load(O::Relaxed),
+                CORE_SELECT_CHEAP_BCP.load(O::Relaxed),
+                CORE_SELECT_LOW_CARD_HIT.load(O::Relaxed),
+            );
+            eprintln!(
+                "inductor: selective calibration {} CPU queries, {:.1}% UNSAT, mean BCP {:.1} us; thresholds cube >= {}, bucket warm-up {}, UNSAT >= {}%, BCP >= {:.1} us",
+                seen,
+                if seen > 0 { 100.0 * unsat as f64 / seen as f64 } else { 0.0 },
+                if seen > 0 { bcp_ns as f64 / seen as f64 / 1000.0 } else { 0.0 },
+                cfg.min_cube,
+                cfg.warmup,
+                cfg.min_unsat_pct,
+                cfg.min_bcp_ns as f64 / 1000.0,
+            );
+            eprintln!(
+                "inductor: selective card calibration {} probes, {} cores ({:.2}%); thresholds card warm-up {}, hit >= {}%, reprobe every {} rejects",
+                card_seen,
+                card_hit,
+                if card_seen > 0 { 100.0 * card_hit as f64 / card_seen as f64 } else { 0.0 },
+                cfg.card_warmup,
+                cfg.min_card_hit_pct,
+                cfg.reprobe_every,
+            );
         }
         let rf = REINDEX_FULL.load(O::Relaxed);
         if rf > 0 {
@@ -853,4 +1142,56 @@ pub fn report() {
         s.lemma_visits,
         s.lemma_blocked
     );
+}
+
+#[cfg(test)]
+mod core_select_tests {
+    use super::{CoreSelectConfig, CoreSelectDecision, core_select_bucket, core_select_decision};
+
+    fn cfg() -> CoreSelectConfig {
+        CoreSelectConfig {
+            min_cube: 8,
+            warmup: 4,
+            min_unsat_pct: 25,
+            min_bcp_ns: 50_000,
+            card_warmup: 2,
+            min_card_hit_pct: 1,
+            reprobe_every: 128,
+        }
+    }
+
+    #[test]
+    fn cube_length_buckets_cover_boundaries() {
+        assert_eq!(core_select_bucket(3), 0);
+        assert_eq!(core_select_bucket(4), 1);
+        assert_eq!(core_select_bucket(8), 2);
+        assert_eq!(core_select_bucket(16), 3);
+        assert_eq!(core_select_bucket(32), 4);
+        assert_eq!(core_select_bucket(10_000), 4);
+    }
+
+    #[test]
+    fn selector_applies_all_three_profitability_gates() {
+        assert_eq!(core_select_decision(cfg(), 7, 100, 100, 99_000_000, 2, 2), CoreSelectDecision::Short);
+        assert_eq!(core_select_decision(cfg(), 8, 3, 3, 3_000_000, 2, 2), CoreSelectDecision::Warmup);
+        assert_eq!(core_select_decision(cfg(), 8, 4, 0, 4_000_000, 2, 2), CoreSelectDecision::LowUnsat);
+        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 199_999, 2, 2), CoreSelectDecision::CheapBcp);
+        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 200_000, 0, 0), CoreSelectDecision::Selected);
+        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 200_000, 2, 0), CoreSelectDecision::LowCardHit);
+        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 200_000, 100, 1), CoreSelectDecision::Selected);
+    }
+
+    #[test]
+    fn zero_thresholds_can_reproduce_unconditional_selection() {
+        let all = CoreSelectConfig {
+            min_cube: 0,
+            warmup: 0,
+            min_unsat_pct: 0,
+            min_bcp_ns: 0,
+            card_warmup: 0,
+            min_card_hit_pct: 0,
+            reprobe_every: 0,
+        };
+        assert_eq!(core_select_decision(all, 0, 0, 0, 0, 0, 0), CoreSelectDecision::Selected);
+    }
 }

@@ -3,7 +3,7 @@
 	url = https://github.com/gipsyh/aig-rs.git
 [submodule "deps/giputils"]
 	path = deps/giputils
-	url = https://github.com/gipsyh/giputils.git
+	url = https://github.com/FORMiND-Lab/giputils.git
 [submodule "deps/cadical-rs"]
 	path = deps/cadical-rs
 	url = https://github.com/gipsyh/cadical-rs.git

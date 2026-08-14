@@ -3,6 +3,7 @@ mod cdb;
 mod domain;
 mod eq;
 mod propagate;
+mod query;
 mod search;
 mod simplify;
 mod statistic;
@@ -25,6 +26,11 @@ use rand::RngExt;
 use rand::{SeedableRng, rngs::SmallRng};
 use simplify::Simplify;
 pub use statistic::SolverStatistic;
+pub use query::{
+    BatchDecodeError, IncrementalCdcl, IncrementalQuery, IncrementalResult, QueryBudget,
+    decode_batch_results, pack_batch, solve_on_cpu_after_hardware_unknown,
+    solve_with_cpu_fallback,
+};
 use std::iter::empty;
 use std::time::Instant;
 pub use ts::*;
@@ -75,6 +81,14 @@ pub struct DagCnfSolver {
 
     assump: LitVec,
     constraint: Vec<LitVec>,
+    /// Exact transition CNF copied at construction. Keeping an owned copy is
+    /// also important because `dc` is a non-owning pointer used by GipSAT.
+    resident_trans: Vec<LitVec>,
+    /// Exact permanent IC3 clauses as supplied through `Satif::add_clause`.
+    /// ClauseDB may simplify a lemma into a level-zero assignment and no
+    /// longer retain its original record, so the accelerator boundary keeps
+    /// this semantic log instead of reconstructing clauses from the trail.
+    resident_lemmas: Vec<LitVec>,
 
     statistic: SolverStatistic,
 }
@@ -98,8 +112,35 @@ impl DagCnfSolver {
         NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Snapshot the persistent formula a full-search accelerator may retain.
+    /// CPU learnts are deliberately omitted: transition clauses and IC3 frame
+    /// lemmas define the query semantics, while both solvers may learn their
+    /// own redundant clauses independently. Temporary constraints stay in the
+    /// per-query payload.
+    pub fn incremental_resident_snapshot(&self) -> (u32, u32, Vec<LitVec>) {
+        let (n_var, frame, mut trans, lemmas) = self.incremental_resident_partition();
+        trans.extend(lemmas);
+        (n_var, frame, trans)
+    }
+
+    /// Split the immutable transition relation from the frame-specific lemma
+    /// log. A batched accelerator can keep the former resident and attach the
+    /// latter to each query, avoiding a context reload every time IC3 grows a
+    /// frame while preserving the exact formula seen by GipSAT.
+    pub fn incremental_resident_partition(
+        &self,
+    ) -> (u32, u32, Vec<LitVec>, Vec<LitVec>) {
+        (
+            self.num_var() as u32,
+            self.accel_level,
+            self.resident_trans.clone(),
+            self.resident_lemmas.clone(),
+        )
+    }
+
     pub fn new(dc: &DagCnf) -> Self {
         let constrain_act = Var::CONST;
+        let resident_trans = dc.clause().cloned().collect();
         let mut solver = Self {
             dc: Gptr::new(dc),
             cdb: Default::default(),
@@ -122,6 +163,8 @@ impl DagCnfSolver {
             constrain_act,
             assump: Default::default(),
             constraint: Default::default(),
+            resident_trans,
+            resident_lemmas: Default::default(),
             statistic: Default::default(),
             trivial_unsat: false,
             accel_id: Self::fresh_accel_id(),
@@ -354,11 +397,71 @@ impl DagCnfSolver {
             .fetch_add(probe_db.ns() as u64, std::sync::atomic::Ordering::Relaxed);
         self.probe.t_setup_ns = probe_setup.ns();
 
+        // GipSAT performs unrestricted level-zero propagation before its
+        // local decision-domain search. Preserve that exact boundary for the
+        // shadow query: the current HLS P1 propagator otherwise treats an
+        // unassigned out-of-domain literal as a blocker and can miss a root
+        // value already established by the CPU's full propagation.
+        let shadow_root: LitVec = if crate::accel::cdcl_host::shadow_enabled() {
+            self.trail
+                .iter()
+                .filter(|lit| self.level[lit.var()] == 0 && lit.var() != self.constrain_act)
+                .copied()
+                .collect()
+        } else {
+            LitVec::new()
+        };
+
         let probe_search = crate::inductor::Timer::start();
         let res = self.search_with_restart(assump, limit);
         // Core extraction happens inside the search loop, so subtract it out to
         // leave `t_search` as decide/BCP/conflict-analysis only.
         self.probe.t_search_ns = probe_search.ns().saturating_sub(self.probe.t_core_ns);
+
+        // Full-CDCL shadow mode batches real GipSAT inquiries that share an
+        // identical resident transition/frame snapshot. It runs after the CPU
+        // answer, so it cannot affect IC3 while the new proof boundary is
+        // being validated on real workloads.
+        if crate::accel::cdcl_host::shadow_enabled() {
+            let mut domain: Vec<Var> = (0..self.domain.len())
+                .map(|i| self.domain[i])
+                .filter(|var| *var != self.constrain_act)
+                .collect();
+            let mut constraints = self.constraint.clone();
+            for lit in shadow_root {
+                constraints.push(LitVec::from([lit]));
+                if !domain.contains(&lit.var()) {
+                    domain.push(lit.var());
+                }
+            }
+            // Correctness baseline: solve the complete resident CNF. The P1
+            // scan propagator's approximation of GipSAT's watcher-dependent
+            // local-domain semantics is still experimental and can be enabled
+            // explicitly for diagnosis.
+            if std::env::var_os("INDUCTOR_CDCL_SHADOW_LOCAL_DOMAIN").is_none() {
+                domain = (0..self.num_var()).map(Var::from).collect();
+            }
+            // The card is a short-query accelerator: synchronous lanes must
+            // not let one CDCL long tail stall the other results in a round.
+            // UNKNOWN is only profiling here and is a proof-safe CPU retry in
+            // active mode. Zero can still be selected explicitly for an
+            // unrestricted diagnostic run.
+            let conflict_budget = crate::accel::cdcl_host::shadow_conflict_budget();
+            let query = IncrementalQuery {
+                frame: self.accel_level,
+                assumptions: self.assump.clone(),
+                constraints,
+                domain,
+                budget: QueryBudget {
+                    conflicts: conflict_budget,
+                    ..QueryBudget::default()
+                },
+                // Keep the first semantic audit independent of any possible
+                // cross-query learnt-clause contamination in the P1 engine.
+                keep_learnts: false,
+            };
+            crate::accel::cdcl_host::queue_shadow(self, query, res);
+        }
 
         // Shadow, checked as an implication rather than an equality.
         //
@@ -476,6 +579,68 @@ impl DagCnfSolver {
         self.solve_with_param(assumps, constraint, empty::<Var>(), Some(limit))
     }
 
+    /// Return true only when setup plus assumption propagation proves UNSAT.
+    ///
+    /// This follows the ordinary solve path through temporary-constraint
+    /// installation, domain construction and simplification, then asserts the
+    /// assumptions one decision level at a time exactly as `search()` does.
+    /// It deliberately stops after BCP: no branching, conflict analysis,
+    /// learning or restart. The selective FPGA path runs it on a clone, so a
+    /// rejected hardware core cannot perturb the live incremental solver.
+    pub fn conflicts_by_propagation(
+        &mut self,
+        assump: &[Lit],
+        constraint: Vec<LitVec>,
+    ) -> bool {
+        self.assump = assump.into();
+        self.constraint = constraint.clone();
+        if self.trivial_unsat {
+            return true;
+        }
+        if self.propagate() != CREF_NONE {
+            return true;
+        }
+
+        let mut activated;
+        let assump = if constraint.is_empty() {
+            assert!(self.new_round(assump.iter().map(|l| l.var()), vec![], true));
+            assump
+        } else {
+            activated = LitVec::new();
+            activated.push(self.constrain_act.lit());
+            activated.extend_from_slice(assump);
+            let constraint_lits: Vec<Lit> = constraint.iter().flatten().copied().collect();
+            if !self.new_round(
+                assump
+                    .iter()
+                    .chain(constraint_lits.iter())
+                    .map(|l| l.var()),
+                constraint,
+                true,
+            ) {
+                return true;
+            }
+            &activated
+        };
+
+        self.clean_learnt(true);
+        self.simplify();
+        for &a in assump {
+            match self.value.v(a) {
+                Lbool::TRUE => self.new_level(),
+                Lbool::FALSE => return true,
+                _ => {
+                    self.new_level();
+                    self.assign(a, CREF_NONE);
+                }
+            }
+            if self.propagate() != CREF_NONE {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn solve_with_domain(
         &mut self,
         assumps: &[Lit],
@@ -586,6 +751,7 @@ impl Satif for DagCnfSolver {
 
     fn add_clause(&mut self, clause: &[Lit]) {
         self.reset();
+        self.resident_lemmas.push(LitVec::from(clause));
         for l in clause.iter() {
             self.add_domain(l.var(), true);
         }
@@ -623,5 +789,38 @@ impl Satif for DagCnfSolver {
     #[inline]
     fn flip_to_none(&mut self, var: Var) -> bool {
         self.flip_to_none_inner(var)
+    }
+}
+
+#[cfg(test)]
+mod propagation_validation_tests {
+    use super::DagCnfSolver;
+    use logicrs::satif::Satif;
+    use logicrs::{DagCnf, LitVec};
+
+    #[test]
+    fn exact_bcp_validator_accepts_only_propagation_conflicts() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+
+        let mut implication = DagCnfSolver::new(&dc);
+        implication.add_clause(&[!a, b]);
+        assert!(implication.clone().conflicts_by_propagation(&[a, !b], vec![]));
+        assert!(!implication.clone().conflicts_by_propagation(&[a, b], vec![]));
+        assert!(implication.clone().conflicts_by_propagation(
+            &[a],
+            vec![LitVec::from([!a])],
+        ));
+
+        // Globally UNSAT but with no unit propagation at level zero. A
+        // validator that branches would prove this; the FPGA proof boundary
+        // must return false because BCP alone did not.
+        let mut needs_search = DagCnfSolver::new(&dc);
+        needs_search.add_clause(&[a, b]);
+        needs_search.add_clause(&[a, !b]);
+        needs_search.add_clause(&[!a, b]);
+        needs_search.add_clause(&[!a, !b]);
+        assert!(!needs_search.conflicts_by_propagation(&[], vec![]));
     }
 }

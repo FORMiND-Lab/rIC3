@@ -1,5 +1,5 @@
 use crate::{
-    gipsat::{DagCnfSolver, SolverStatistic},
+    gipsat::{DagCnfSolver, IncrementalQuery, QueryBudget, SolverStatistic},
     transys::{TransysCtx, TransysIf},
 };
 use giputils::ptr::Grc;
@@ -64,6 +64,54 @@ impl TransysSolver {
 
     pub fn inductive(&mut self, cube: &[Lit], strengthen: bool) -> bool {
         self.inductive_with_constrain(cube, strengthen, vec![])
+    }
+
+    /// Build the exact full-domain inquiry used by `inductive_with_constrain`
+    /// without mutating GipSAT. IC3 uses this to batch independent push checks
+    /// before deciding which answers can safely bypass CPU search.
+    pub fn incremental_inductive_query(
+        &self,
+        cube: &[Lit],
+        strengthen: bool,
+        mut constraint: Vec<LitVec>,
+    ) -> IncrementalQuery {
+        if strengthen {
+            constraint.push(LitVec::from_iter(cube.iter().map(|lit| !*lit)));
+        }
+        IncrementalQuery {
+            frame: self.dcs.accel_level,
+            assumptions: self.ts.lits_next(cube),
+            constraints: constraint,
+            domain: (0..self.dcs.num_var()).map(Var::from).collect(),
+            budget: QueryBudget {
+                conflicts: crate::accel::cdcl_host::active_conflict_budget(),
+                ..QueryBudget::default()
+            },
+            keep_learnts: false,
+        }
+    }
+
+    pub fn install_incremental_sat_model(
+        &mut self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        self.dcs.install_incremental_sat_model(query, model)
+    }
+
+    /// Check relative induction using setup and BCP only.
+    pub fn inductive_by_propagation(
+        &mut self,
+        cube: &[Lit],
+        strengthen: bool,
+        mut constraint: Vec<LitVec>,
+    ) -> bool {
+        self.relind = LitVec::from(cube);
+        let assump = self.ts.lits_next(cube);
+        if strengthen {
+            constraint.push(LitVec::from_iter(cube.iter().map(|l| !*l)));
+        }
+        self.dcs.conflicts_by_propagation(&assump, constraint)
     }
 
     pub fn inductive_core(&mut self) -> Option<LitVec> {

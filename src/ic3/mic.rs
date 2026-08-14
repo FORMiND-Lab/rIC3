@@ -80,14 +80,16 @@ impl IC3 {
             // next-state assumptions that conflicts -- which is exactly what
             // `inductive_core()` reconstructs and what becomes the lemma.
             //
-            // Sound to use directly. The card holds a subset of this solver's
-            // clauses and none of the per-query constraints, including the
-            // `strengthen` clause, so it is strictly weaker: a conflict it
-            // derives is a conflict here. A core that subsumes the initial
-            // states is handed back rather than repaired, since
-            // `inductive_core` has its own handling for that and duplicating
-            // it here would be a second implementation of a subtle rule.
-            if crate::accel::core_offload() && crate::accel::ready() {
+            // Treat it as a candidate, not a proof boundary. The intended
+            // invariant is that the card holds a subset of this frame's
+            // clauses and is therefore weaker, but a real gate-bitstream run
+            // violated it and changed an unsafe result into safe. Candidate
+            // cores are rechecked below by this exact frame solver, with the
+            // same strengthen and per-query constraints, before IC3 sees one.
+            if crate::accel::core_offload()
+                && crate::accel::ready()
+                && crate::accel::select_core_query(cube.len())
+            {
                 // The lemmas the frame has gained are not visible to the card
                 // until its occurrence index is rebuilt, and that used to happen
                 // in the shadow block. Gating the shadow took it with it, and
@@ -136,7 +138,7 @@ impl IC3 {
                 // back out itself, so the drop below is only for the
                 // bitstreams that predate the fused mode.
                 let got_core = if crate::accel::have_down() {
-                    crate::accel::down(&flat, &raw, lvl, &mut got).is_some()
+                    matches!(crate::accel::down(&flat, &raw, lvl, &mut got), Some(n) if n > 0)
                 } else {
                     crate::accel::set_constraint(&flat);
                     let r = crate::accel::core(&raw, lvl, &mut got).is_some();
@@ -153,8 +155,8 @@ impl IC3 {
                     }
                     // Only when the card actually generalized something.
                     //
-                    // A core equal to the cube is sound and IC3 will take it,
-                    // but it is a lemma no stronger than what was asked about,
+                    // A core equal to the cube generalizes nothing, and taking
+                    // it is no better than asking the exact solver directly,
                     // and taking it skips the solver's own `down`, which would
                     // have returned a smaller one. Measured on
                     // Problem03_label51, 8,153 such cores went in at 2.00
@@ -167,26 +169,66 @@ impl IC3 {
                     // remove to be worth believing. 0 restores the old
                     // behaviour of taking every core.
                     let gain = cube.len().saturating_sub(ans.len());
-                    if !ans.is_empty()
+                    let worth_checking = !ans.is_empty()
                         && gain >= crate::accel::core_gain()
-                        && !self.tsctx.cube_subsume_init(&ans)
-                    {
-                        crate::accel::CORE_USED
+                        && !self.tsctx.cube_subsume_init(&ans);
+                    if worth_checking {
+                        // Validate on a clone and stop before decisions. The
+                        // live solver must not inherit watcher movement,
+                        // learnt clauses or heuristic state from a rejected
+                        // hardware candidate; and a validation query which
+                        // needs search can be harder than the original cube.
+                        let validated = if crate::accel::unchecked_core() {
+                            true
+                        } else {
+                            let mut verifier = self.solvers[frame - 1].clone();
+                            verifier.inductive_by_propagation(
+                                &ans,
+                                true,
+                                constraint.to_vec(),
+                            )
+                        };
+                        if validated {
+                            if !crate::accel::unchecked_core() {
+                                crate::accel::CORE_VALIDATED.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            crate::accel::CORE_USED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::accel::observe_card_core_query(cube.len(), true);
+                            return Some(ans);
+                        }
+                        crate::accel::CORE_VALIDATION_FAILED.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    } else {
+                        crate::accel::CORE_THIN
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Some(ans);
                     }
-                    crate::accel::CORE_THIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // The selector learns the probability of a *usable* core, not
+                // merely a hardware conflict. An invalid or non-generalizing
+                // core saves no CPU work and must make future offload less
+                // likely just like a card miss.
+                crate::accel::observe_card_core_query(cube.len(), false);
             }
 
-            if self
+            let blocked = self
                 .blocked(frame, &cube)
                 .in_phase(inductor_trace::Phase::Gen)
                 .with_act_order(false)
                 .with_strengthen()
                 .with_constraint(constraint)
-                .check()
-            {
+                .check();
+            crate::accel::observe_core_query(
+                cube.len(),
+                blocked,
+                self.solvers[frame - 1].dcs.probe.t_bcp_ns,
+            );
+            if blocked {
                 return Some(self.solvers[frame - 1].inductive_core().unwrap());
             }
             let mut ret = false;
