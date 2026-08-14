@@ -20,12 +20,13 @@ impl IC3 {
         // checked again against the live solver immediately before use; a
         // lemma learned by an earlier frame can only reject a stale model and
         // trigger CPU fallback.
-        let active_enabled = crate::accel::cdcl_host::active_enabled();
+        let propagation_batch_enabled =
+            crate::accel::cdcl_host::propagation_batch_enabled();
         let mut work: Vec<(usize, Frame, Vec<IncrementalQuery>)> = Vec::new();
         for frame_idx in from..level {
             let mut frame = self.frame[frame_idx].clone();
             frame.sort_by_key(|x| x.len());
-            let active_queries = if active_enabled {
+            let active_queries = if propagation_batch_enabled {
                 frame
                     .iter()
                     .map(|lemma| {
@@ -38,7 +39,7 @@ impl IC3 {
             };
             work.push((frame_idx, frame, active_queries));
         }
-        let active_results = if active_enabled {
+        let active_results = if propagation_batch_enabled {
             let mut requests = Vec::new();
             for (frame_idx, _, queries) in &work {
                 let solver = &self.solvers[*frame_idx].dcs;

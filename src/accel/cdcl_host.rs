@@ -14,6 +14,7 @@ use crate::gipsat::decode_batch_results;
 use logicrs::LitVec;
 #[cfg(has_cdcl_accel)]
 use std::ffi::CString;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(has_cdcl_accel)]
@@ -393,6 +394,15 @@ struct ActiveState {
     loaded_context: Option<ShadowContext>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PairedCpuWork {
+    status: u32,
+    elapsed_ns: u64,
+    decisions: u64,
+    conflicts: u64,
+    propagations: u64,
+}
+
 static SHADOW_STATE: std::sync::OnceLock<std::sync::Mutex<ShadowState>> =
     std::sync::OnceLock::new();
 static ACTIVE_STATE: std::sync::OnceLock<std::sync::Mutex<ActiveState>> =
@@ -437,6 +447,18 @@ static ACTIVE_HW_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_PROPAGATIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_LEARNTS: AtomicU64 = AtomicU64::new(0);
+static PAIRED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
+static PAIRED_QUERIES: AtomicU64 = AtomicU64::new(0);
+static PAIRED_FILTERED: AtomicU64 = AtomicU64::new(0);
+static PAIRED_AGREE: AtomicU64 = AtomicU64::new(0);
+static PAIRED_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static PAIRED_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+static PAIRED_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static PAIRED_HW_NS: AtomicU64 = AtomicU64::new(0);
+static PAIRED_HW_FASTER_BATCHES: AtomicU64 = AtomicU64::new(0);
+static PAIRED_WRITER: std::sync::OnceLock<
+    Option<std::sync::Mutex<BufWriter<std::fs::File>>>,
+> = std::sync::OnceLock::new();
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_ZERO_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CONFLICT_0: AtomicU64 = AtomicU64::new(0);
@@ -656,6 +678,34 @@ fn active_min_batch_size() -> usize {
     })
 }
 
+fn paired_min_frame() -> u32 {
+    static FRAME: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FRAME.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_PAIRED_MIN_FRAME")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn paired_max_assumptions() -> usize {
+    static ASSUMPTIONS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ASSUMPTIONS.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_PAIRED_MAX_ASSUMPTIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    })
+}
+
+/// Optional measurement-only filter. It lets experiments test whether an
+/// observable query class packs into profitable FPGA batches without changing
+/// the result used by IC3. Production active mode intentionally ignores it.
+fn paired_query_selected(query: &IncrementalQuery) -> bool {
+    query.frame >= paired_min_frame()
+        && query.assumptions.len() <= paired_max_assumptions()
+}
+
 fn pair_scheduler_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -789,6 +839,183 @@ fn dump_mismatch_dimacs(context: &ShadowContext, query: &IncrementalQuery) {
     }
 }
 
+fn result_status(result: &IncrementalResult) -> u32 {
+    match result {
+        IncrementalResult::Sat { .. } => Status::Sat as u32,
+        IncrementalResult::Unsat { .. } => Status::Unsat as u32,
+        IncrementalResult::Unknown(_) => Status::Unknown as u32,
+    }
+}
+
+fn measure_paired_cpu(
+    requests: &[(&DagCnfSolver, IncrementalQuery)],
+) -> Vec<PairedCpuWork> {
+    requests
+        .iter()
+        .map(|(solver, query)| {
+            if !paired_query_selected(query) {
+                return PairedCpuWork::default();
+            }
+            // Clone before starting the timer: the comparison is the work of
+            // one independent GipSAT inquiry, not the cost of manufacturing a
+            // profiling copy. Remove FPGA-only budgets for the exact CPU run.
+            let mut cpu: DagCnfSolver = (**solver).clone();
+            let mut cpu_query = query.clone();
+            cpu_query.budget.decisions = 0;
+            cpu_query.budget.conflicts = 0;
+            let start = std::time::Instant::now();
+            let result = cpu.solve_incremental(&cpu_query);
+            let elapsed_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            PairedCpuWork {
+                status: result_status(&result),
+                elapsed_ns,
+                decisions: u64::from(cpu.probe.n_decide),
+                conflicts: u64::from(cpu.probe.n_conflict),
+                propagations: u64::from(cpu.probe.n_prop),
+            }
+        })
+        .collect()
+}
+
+fn paired_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
+    PAIRED_WRITER
+        .get_or_init(|| {
+            let path = std::env::var_os("INDUCTOR_CDCL_PAIRED_CSV")?;
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!(
+                        "inductor-cdcl: cannot create paired CSV {}: {error}",
+                        std::path::Path::new(&path).display(),
+                    );
+                    return None;
+                }
+            };
+            let mut writer = BufWriter::new(file);
+            if writeln!(
+                writer,
+                "pass_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\thw_status\thw_reason\thw_decisions\thw_conflicts\thw_propagations\thw_learnts\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_vars\tcontext_clauses\tcontext_literals\tbatch_cpu_ns\tbatch_hw_ns\tcontext_load_ns\tinit_ns"
+            )
+            .is_err()
+            {
+                return None;
+            }
+            Some(std::sync::Mutex::new(writer))
+        })
+        .as_ref()
+}
+
+fn record_paired_batch(
+    pass_id: u64,
+    context: &ShadowContext,
+    pending: &[(usize, IncrementalQuery)],
+    queries: &[IncrementalQuery],
+    cpu: &[PairedCpuWork],
+    hardware: &[HardwareWork],
+    context_load_ns: u64,
+    batch_hw_ns: u64,
+) {
+    if pending.len() != queries.len() || queries.len() != hardware.len() {
+        return;
+    }
+    let batch_id = PAIRED_BATCH_ID.fetch_add(1, Ordering::Relaxed) + 1;
+    let batch_cpu_ns = pending.iter().fold(0u64, |total, (index, _)| {
+        total.saturating_add(cpu.get(*index).map_or(0, |work| work.elapsed_ns))
+    });
+    PAIRED_QUERIES.fetch_add(queries.len() as u64, Ordering::Relaxed);
+    PAIRED_CPU_NS.fetch_add(batch_cpu_ns, Ordering::Relaxed);
+    PAIRED_HW_NS.fetch_add(batch_hw_ns, Ordering::Relaxed);
+    if batch_hw_ns < batch_cpu_ns {
+        PAIRED_HW_FASTER_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+    for ((index, _), work) in pending.iter().zip(hardware) {
+        let Some(cpu_work) = cpu.get(*index) else {
+            continue;
+        };
+        if work.status == Status::Unknown as u32 {
+            PAIRED_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+        } else if work.status == cpu_work.status {
+            PAIRED_AGREE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PAIRED_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let Some(writer) = paired_writer() else {
+        return;
+    };
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
+    let context_literals = context
+        .clauses
+        .iter()
+        .map(|clause| clause.literals.len() as u64)
+        .sum::<u64>();
+    let init_ns = ACTIVE_INIT_NS.load(Ordering::Relaxed);
+    for (position, (((index, _), query), work)) in pending
+        .iter()
+        .zip(queries)
+        .zip(hardware)
+        .enumerate()
+    {
+        let Some(cpu_work) = cpu.get(*index) else {
+            continue;
+        };
+        let constraint_literals = query
+            .constraints
+            .iter()
+            .map(|clause| clause.len() as u64)
+            .sum::<u64>();
+        let _ = writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            pass_id,
+            batch_id,
+            queries.len(),
+            position,
+            index,
+            query.frame,
+            cpu_work.status,
+            cpu_work.elapsed_ns,
+            cpu_work.decisions,
+            cpu_work.conflicts,
+            cpu_work.propagations,
+            work.status,
+            work.reason,
+            work.decisions,
+            work.conflicts,
+            work.propagations,
+            work.learnt_clauses,
+            query.assumptions.len(),
+            query.constraints.len(),
+            constraint_literals,
+            query.domain.len(),
+            query_request_words(query).unwrap_or(0),
+            context.n_var,
+            context.clauses.len(),
+            context_literals,
+            batch_cpu_ns,
+            batch_hw_ns,
+            context_load_ns,
+            init_ns,
+        );
+    }
+}
+
+fn flush_paired_writer() {
+    if let Some(writer) = paired_writer()
+        && let Ok(mut writer) = writer.lock()
+    {
+        let _ = writer.flush();
+    }
+}
+
 /// `INDUCTOR_CDCL_SHADOW=<xclbin>` enables correctness-only batching after CPU
 /// answers. It is mutually exclusive with the older propagation-only xclbin.
 pub fn shadow_enabled() -> bool {
@@ -802,8 +1029,25 @@ pub fn shadow_enabled() -> bool {
 /// singleton XRT bridge twice.
 pub fn active_enabled() -> bool {
     std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some()
+        && std::env::var_os("INDUCTOR_CDCL_PAIRED").is_none()
         && std::env::var_os("INDUCTOR_CDCL_SHADOW").is_none()
         && std::env::var_os("INDUCTOR_ACCEL").is_none()
+}
+
+/// Run the same independent propagation inquiries on a cloned GipSAT state
+/// and on the FPGA, but return UNKNOWN to IC3 so the ordinary CPU path remains
+/// authoritative. This is a measurement mode, not an alternative proof path.
+pub fn paired_enabled() -> bool {
+    std::env::var_os("INDUCTOR_CDCL_PAIRED").is_some()
+        && std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_none()
+        && std::env::var_os("INDUCTOR_CDCL_SHADOW").is_none()
+        && std::env::var_os("INDUCTOR_ACCEL").is_none()
+}
+
+/// Whether IC3 should prepare one speculative propagation batch. Active mode
+/// may consume validated answers; paired mode deliberately never does.
+pub fn propagation_batch_enabled() -> bool {
+    active_enabled() || paired_enabled()
 }
 
 fn shadow_state() -> &'static std::sync::Mutex<ShadowState> {
@@ -823,6 +1067,7 @@ fn active_state() -> &'static std::sync::Mutex<ActiveState> {
     ACTIVE_STATE.get_or_init(|| {
         let start = std::time::Instant::now();
         let hardware = std::env::var("INDUCTOR_CDCL_ACTIVE")
+            .or_else(|_| std::env::var("INDUCTOR_CDCL_PAIRED"))
             .ok()
             .and_then(|path| HardwareCdcl::open(&path).ok());
         ACTIVE_INIT_NS.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -930,19 +1175,33 @@ pub fn solve_active_batch(
 ) -> Vec<IncrementalResult> {
     let unknown = IncrementalResult::Unknown(super::cdcl::UnknownReason::BackendError);
     let mut output = vec![unknown.clone(); requests.len()];
-    if requests.is_empty() || !active_enabled() {
+    if requests.is_empty() || !propagation_batch_enabled() {
         return output;
     }
-    ACTIVE_PASSES.fetch_add(1, Ordering::Relaxed);
+    let paired = paired_enabled();
+    let selected_count = if paired {
+        requests
+            .iter()
+            .filter(|(_, query)| paired_query_selected(query))
+            .count()
+    } else {
+        requests.len()
+    };
+    let pass_id = ACTIVE_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
     ACTIVE_MAX_READY.fetch_max(requests.len() as u64, Ordering::Relaxed);
     ACTIVE_CANDIDATES.fetch_add(requests.len() as u64, Ordering::Relaxed);
-    if requests.len() < active_min_batch_size() {
+    PAIRED_FILTERED.fetch_add(
+        requests.len().saturating_sub(selected_count) as u64,
+        Ordering::Relaxed,
+    );
+    if selected_count < active_min_batch_size() {
         ACTIVE_SKIPPED_PASSES.fetch_add(1, Ordering::Relaxed);
-        ACTIVE_SKIPPED_SMALL_BATCH.fetch_add(requests.len() as u64, Ordering::Relaxed);
+        ACTIVE_SKIPPED_SMALL_BATCH.fetch_add(selected_count as u64, Ordering::Relaxed);
         return output;
     }
     ACTIVE_OFFERED_PASSES.fetch_add(1, Ordering::Relaxed);
-    ACTIVE_OFFERED.fetch_add(requests.len() as u64, Ordering::Relaxed);
+    ACTIVE_OFFERED.fetch_add(selected_count as u64, Ordering::Relaxed);
+    let paired_cpu = paired.then(|| measure_paired_cpu(&requests));
 
     struct Group {
         context: ShadowContext,
@@ -950,6 +1209,9 @@ pub fn solve_active_batch(
     }
     let mut groups: Vec<Group> = Vec::new();
     for (index, (solver, query)) in requests.into_iter().enumerate() {
+        if paired && !paired_query_selected(&query) {
+            continue;
+        }
         let (context, query, _) = prepare_batched_query(solver, query, true);
         let fits = query_request_words(&query)
             .and_then(|words| words.checked_add(4))
@@ -974,6 +1236,7 @@ pub fn solve_active_batch(
         return output;
     };
     for mut group in groups {
+        let mut context_load_ns = 0u64;
         if pair_scheduler_enabled() {
             schedule_query_pairs(&mut group.pending, |(_, query)| query);
         }
@@ -986,19 +1249,13 @@ pub fn solve_active_batch(
                 .and_then(|hardware| {
                     hardware.load_context(group.context.n_var, &group.context.clauses)
                 });
+            context_load_ns = load_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            ACTIVE_CONTEXT_LOAD_NS.fetch_add(context_load_ns, Ordering::Relaxed);
             if loaded.is_err() {
-                ACTIVE_CONTEXT_LOAD_NS.fetch_add(
-                    load_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
                 ACTIVE_ERROR.fetch_add(group.pending.len() as u64, Ordering::Relaxed);
                 state.loaded_context = None;
                 continue;
             }
-            ACTIVE_CONTEXT_LOAD_NS.fetch_add(
-                load_start.elapsed().as_nanos() as u64,
-                Ordering::Relaxed,
-            );
             ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
             state.loaded_context = Some(group.context.clone());
         }
@@ -1036,10 +1293,8 @@ pub fn solve_active_batch(
                 .as_mut()
                 .ok_or(HardwareError::Unavailable)
                 .and_then(|hardware| hardware.solve_batch(&queries));
-            ACTIVE_BATCH_NS.fetch_add(
-                batch_start.elapsed().as_nanos() as u64,
-                Ordering::Relaxed,
-            );
+            let batch_ns = batch_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            ACTIVE_BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
             if result.is_ok() {
                 if let Some(hardware) = state.hardware.as_ref() {
                     profile_hardware_batch(&queries, &hardware.last_batch_records);
@@ -1059,6 +1314,18 @@ pub fn solve_active_batch(
                         hardware.last_batch_work.learnt_clauses,
                         Ordering::Relaxed,
                     );
+                    if let Some(cpu) = paired_cpu.as_ref() {
+                        record_paired_batch(
+                            pass_id,
+                            &group.context,
+                            &group.pending[start..end],
+                            &queries,
+                            cpu,
+                            &hardware.last_batch_records,
+                            std::mem::take(&mut context_load_ns),
+                            batch_ns,
+                        );
+                    }
                 }
             }
             match result {
@@ -1087,6 +1354,9 @@ pub fn solve_active_batch(
             }
             start = end;
         }
+    }
+    if paired_cpu.is_some() {
+        output.fill(unknown);
     }
     output
 }
@@ -1211,7 +1481,38 @@ pub fn flush_and_report() {
             SHADOW_ERROR.load(Ordering::Relaxed),
         );
     }
-    if active_enabled() {
+    if paired_enabled() {
+        flush_paired_writer();
+        let cpu_ns = PAIRED_CPU_NS.load(Ordering::Relaxed);
+        let hw_ns = PAIRED_HW_NS.load(Ordering::Relaxed);
+        let service_ratio = cpu_ns as f64 / hw_ns.max(1) as f64;
+        eprintln!(
+            "inductor-cdcl: paired selector frame >= {}, assumptions <= {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, filtered {}, queries {}, batches {}, CPU/HW agree {}, mismatch {}, HW unknown {}, HW-faster batches {}, CPU-reference {:.3} ms, FPGA service {:.3} ms, service ratio {:.3}x, init {:.3} ms, context loads {} / {:.3} ms, errors {}, CSV {}",
+            paired_min_frame(),
+            paired_max_assumptions(),
+            ACTIVE_PASSES.load(Ordering::Relaxed),
+            ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
+            ACTIVE_OFFERED_PASSES.load(Ordering::Relaxed),
+            ACTIVE_MAX_READY.load(Ordering::Relaxed),
+            ACTIVE_CANDIDATES.load(Ordering::Relaxed),
+            PAIRED_FILTERED.load(Ordering::Relaxed),
+            PAIRED_QUERIES.load(Ordering::Relaxed),
+            PAIRED_BATCH_ID.load(Ordering::Relaxed),
+            PAIRED_AGREE.load(Ordering::Relaxed),
+            PAIRED_MISMATCH.load(Ordering::Relaxed),
+            PAIRED_UNKNOWN.load(Ordering::Relaxed),
+            PAIRED_HW_FASTER_BATCHES.load(Ordering::Relaxed),
+            cpu_ns as f64 / 1_000_000.0,
+            hw_ns as f64 / 1_000_000.0,
+            service_ratio,
+            ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_CONTEXT_LOADS.load(Ordering::Relaxed),
+            ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_ERROR.load(Ordering::Relaxed),
+            std::env::var("INDUCTOR_CDCL_PAIRED_CSV")
+                .unwrap_or_else(|_| "disabled".to_string()),
+        );
+    } else if active_enabled() {
         eprintln!(
             "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init {:.3} ms, load {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
