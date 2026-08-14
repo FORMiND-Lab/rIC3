@@ -39,15 +39,50 @@ impl IC3 {
             };
             work.push((frame_idx, frame, active_queries));
         }
+        let n_queries = work
+            .iter()
+            .map(|(_, _, queries)| queries.len())
+            .sum::<usize>();
+        let mut preflight_selected = vec![true; n_queries];
+        if crate::accel::cdcl_host::active_preflight_should_run(n_queries) {
+            let mut query_index = 0usize;
+            for (frame_idx, _, queries) in &work {
+                for query in queries {
+                    preflight_selected[query_index] =
+                        crate::accel::cdcl_host::active_preflight_select(
+                            &mut self.solvers[*frame_idx].dcs,
+                            query,
+                        );
+                    query_index += 1;
+                }
+            }
+        }
         let active_results = if propagation_batch_enabled {
             let mut requests = Vec::new();
+            let mut request_indices = Vec::new();
+            let mut query_index = 0usize;
             for (frame_idx, _, queries) in &work {
                 let solver = &self.solvers[*frame_idx].dcs;
                 for query in queries {
-                    requests.push((solver, query.clone()));
+                    if preflight_selected[query_index] {
+                        requests.push((solver, query.clone()));
+                        request_indices.push(query_index);
+                    }
+                    query_index += 1;
                 }
             }
-            crate::accel::cdcl_host::solve_active_batch(requests)
+            let selected_results =
+                crate::accel::cdcl_host::solve_active_batch(requests);
+            let mut results = vec![
+                IncrementalResult::Unknown(
+                    crate::accel::cdcl::UnknownReason::BackendError,
+                );
+                n_queries
+            ];
+            for (index, result) in request_indices.into_iter().zip(selected_results) {
+                results[index] = result;
+            }
+            results
         } else {
             Vec::new()
         };

@@ -56,9 +56,14 @@ impl DagCnfSolver {
         &mut self,
         assumption: &[Lit],
         limit: Option<usize>,
+        conflict_limit: Option<u32>,
+        retain_learnts: bool,
     ) -> Option<bool> {
         let mut restarts = 0;
         loop {
+            if conflict_limit.is_some_and(|limit| self.probe.n_conflict >= limit) {
+                return None;
+            }
             if let Some(limit) = limit
                 && restarts >= limit as u32
             {
@@ -74,8 +79,15 @@ impl DagCnfSolver {
                 }
             }
             let rest_base = luby(2.0, restarts);
-            match self.search(assumption, Some(rest_base * 100.0)) {
+            let restart_conflicts = rest_base * 100.0;
+            let search_conflicts = conflict_limit.map_or(restart_conflicts, |limit| {
+                restart_conflicts.min(limit.saturating_sub(self.probe.n_conflict) as f64)
+            });
+            match self.search(assumption, Some(search_conflicts), retain_learnts) {
                 None => {
+                    if conflict_limit.is_some_and(|limit| self.probe.n_conflict >= limit) {
+                        return None;
+                    }
                     restarts += 1;
                     if restarts % 10 == 0 {
                         debug!(
@@ -89,7 +101,12 @@ impl DagCnfSolver {
         }
     }
 
-    pub fn search(&mut self, assumption: &[Lit], noc: Option<f64>) -> Option<bool> {
+    pub fn search(
+        &mut self,
+        assumption: &[Lit],
+        noc: Option<f64>,
+        retain_learnts: bool,
+    ) -> Option<bool> {
         let mut num_conflict = 0.0_f64;
         'ml: loop {
             // BCP alone, separated from the decide and analyse it shares
@@ -113,7 +130,9 @@ impl DagCnfSolver {
                     debug_assert!(btl == 0);
                     self.assign(learnt[0], CREF_NONE);
                 } else {
-                    let kind = if learnt.iter().any(|l| self.constrain_act == l.var()) {
+                    let kind = if !retain_learnts
+                        || learnt.iter().any(|l| self.constrain_act == l.var())
+                    {
                         ClauseKind::Temporary
                     } else {
                         ClauseKind::Learnt

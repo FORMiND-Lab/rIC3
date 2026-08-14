@@ -312,6 +312,18 @@ impl DagCnfSolver {
         domain: impl Iterator<Item = Var>,
         limit: Option<usize>,
     ) -> Option<bool> {
+        self.solve_with_limits(assump, constraint, domain, limit, None, true)
+    }
+
+    fn solve_with_limits(
+        &mut self,
+        assump: &[Lit],
+        constraint: Vec<LitVec>,
+        domain: impl Iterator<Item = Var>,
+        restart_limit: Option<usize>,
+        conflict_limit: Option<u32>,
+        retain_learnts: bool,
+    ) -> Option<bool> {
         self.assump = assump.into();
         self.constraint = constraint.clone();
         if self.trivial_unsat {
@@ -413,7 +425,12 @@ impl DagCnfSolver {
         };
 
         let probe_search = crate::inductor::Timer::start();
-        let res = self.search_with_restart(assump, limit);
+        let res = self.search_with_restart(
+            assump,
+            restart_limit,
+            conflict_limit,
+            retain_learnts,
+        );
         // Core extraction happens inside the search loop, so subtract it out to
         // leave `t_search` as decide/BCP/conflict-analysis only.
         self.probe.t_search_ns = probe_search.ns().saturating_sub(self.probe.t_core_ns);

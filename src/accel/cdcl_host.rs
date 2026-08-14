@@ -403,6 +403,19 @@ struct PairedCpuWork {
     propagations: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PairedPreflightWork {
+    status: u32,
+    reason: u32,
+    elapsed_ns: u64,
+    clone_ns: u64,
+    solve_ns: u64,
+    decisions: u64,
+    conflicts: u64,
+    propagations: u64,
+    selected: bool,
+}
+
 static SHADOW_STATE: std::sync::OnceLock<std::sync::Mutex<ShadowState>> =
     std::sync::OnceLock::new();
 static ACTIVE_STATE: std::sync::OnceLock<std::sync::Mutex<ActiveState>> =
@@ -447,6 +460,12 @@ static ACTIVE_HW_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_PROPAGATIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_LEARNTS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_CONCLUSIVE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_SELECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_STATIC_FILTERED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PREFLIGHT_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
 static PAIRED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PAIRED_FILTERED: AtomicU64 = AtomicU64::new(0);
@@ -454,8 +473,15 @@ static PAIRED_AGREE: AtomicU64 = AtomicU64::new(0);
 static PAIRED_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static PAIRED_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static PAIRED_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static PAIRED_BASELINE_CPU_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_HW_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_HW_FASTER_BATCHES: AtomicU64 = AtomicU64::new(0);
+static PAIRED_PREFLIGHT_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static PAIRED_PREFLIGHT_CONCLUSIVE: AtomicU64 = AtomicU64::new(0);
+static PAIRED_PREFLIGHT_SELECTED: AtomicU64 = AtomicU64::new(0);
+static PAIRED_PREFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
+static PAIRED_PREFLIGHT_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+static PAIRED_PREFLIGHT_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_WRITER: std::sync::OnceLock<
     Option<std::sync::Mutex<BufWriter<std::fs::File>>>,
 > = std::sync::OnceLock::new();
@@ -698,10 +724,80 @@ fn paired_max_assumptions() -> usize {
     })
 }
 
+fn paired_preflight_conflicts() -> Option<u32> {
+    static CONFLICTS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CONFLICTS.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_PAIRED_PREFLIGHT_CONFLICTS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
+pub fn active_preflight_conflicts() -> Option<u32> {
+    static CONFLICTS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CONFLICTS.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_PREFLIGHT_CONFLICTS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
+fn active_preflight_max_assumptions() -> usize {
+    static ASSUMPTIONS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ASSUMPTIONS.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_PREFLIGHT_MAX_ASSUMPTIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    })
+}
+
+/// Avoid paying even the bounded CPU classification cost when the raw
+/// propagation pass cannot satisfy the hardware minimum batch threshold.
+pub fn active_preflight_should_run(n_candidates: usize) -> bool {
+    active_enabled()
+        && active_preflight_conflicts().is_some()
+        && n_candidates >= active_min_batch_size()
+}
+
+/// Return true only for a query that exhausted the live bounded GipSAT
+/// preflight. Conclusive or malformed inquiries remain on the ordinary CPU
+/// path. The result is a scheduling hint; it never proves SAT or UNSAT.
+pub fn active_preflight_select(
+    solver: &mut DagCnfSolver,
+    query: &IncrementalQuery,
+) -> bool {
+    let Some(conflict_limit) = active_preflight_conflicts() else {
+        return true;
+    };
+    if query.assumptions.len() > active_preflight_max_assumptions() {
+        ACTIVE_PREFLIGHT_STATIC_FILTERED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let start = std::time::Instant::now();
+    let result = solver.classify_incremental_preflight(query, conflict_limit);
+    let elapsed_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let selected = matches!(
+        result,
+        IncrementalResult::Unknown(UnknownReason::ConflictBudget)
+    );
+    ACTIVE_PREFLIGHT_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_PREFLIGHT_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+    ACTIVE_PREFLIGHT_CONFLICTS.fetch_add(u64::from(solver.probe.n_conflict), Ordering::Relaxed);
+    if selected {
+        ACTIVE_PREFLIGHT_SELECTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_PREFLIGHT_CONCLUSIVE.fetch_add(1, Ordering::Relaxed);
+    }
+    selected
+}
+
 /// Optional measurement-only filter. It lets experiments test whether an
 /// observable query class packs into profitable FPGA batches without changing
 /// the result used by IC3. Production active mode intentionally ignores it.
-fn paired_query_selected(query: &IncrementalQuery) -> bool {
+fn paired_static_selected(query: &IncrementalQuery) -> bool {
     query.frame >= paired_min_frame()
         && query.assumptions.len() <= paired_max_assumptions()
 }
@@ -719,6 +815,30 @@ fn pair_scheduler_enabled() -> bool {
             // caller order by default; keep sorting as an explicit research
             // switch while a history-aware scheduler is developed.
             .unwrap_or(false)
+    })
+}
+
+fn active_resident_lemmas() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_RESIDENT_LEMMAS")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
+fn query_lemma_word_limit() -> usize {
+    static WORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORDS.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_QUERY_LEMMA_MAX_WORDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, KERNEL_MAX_REQUEST_WORDS))
+            // Repeating frame lemmas is attractive only while several
+            // inquiries still fit in one DMA command. `fifo.btor` reached
+            // ~15k words/query and 1,210 batches; keeping at least eight-query
+            // packing as the default crossover reduced that to 38 batches.
+            .unwrap_or(KERNEL_MAX_REQUEST_WORDS / 8)
     })
 }
 
@@ -779,7 +899,10 @@ fn prepare_batched_query(
         query.constraints.extend(lemmas.iter().cloned());
         let fits = query_request_words(&query)
             .and_then(|words| words.checked_add(4))
-            .is_some_and(|words| words <= KERNEL_MAX_REQUEST_WORDS);
+            .is_some_and(|words| {
+                words <= KERNEL_MAX_REQUEST_WORDS
+                    && words <= query_lemma_word_limit()
+            });
         if fits {
             let clauses = trans
                 .into_iter()
@@ -847,13 +970,77 @@ fn result_status(result: &IncrementalResult) -> u32 {
     }
 }
 
+fn result_reason(result: &IncrementalResult) -> u32 {
+    match result {
+        IncrementalResult::Unknown(reason) => *reason as u32,
+        IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => 0,
+    }
+}
+
+fn measure_paired_preflight(
+    requests: &[(&DagCnfSolver, IncrementalQuery)],
+) -> Option<Vec<PairedPreflightWork>> {
+    let conflict_limit = paired_preflight_conflicts()?;
+    let work: Vec<_> = requests
+        .iter()
+        .map(|(solver, query)| {
+            if !paired_static_selected(query) {
+                return PairedPreflightWork::default();
+            }
+            // Include cloning in the selector cost. Production may eventually
+            // run a resumable preflight on the live solver, so this is the
+            // conservative proof-neutral measurement rather than a claimed
+            // implementation overhead.
+            let start = std::time::Instant::now();
+            let mut cpu: DagCnfSolver = (**solver).clone();
+            let clone_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let solve_start = std::time::Instant::now();
+            let result = cpu.solve_incremental_preflight(query, conflict_limit);
+            let solve_ns = solve_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let elapsed_ns = clone_ns.saturating_add(solve_ns);
+            PairedPreflightWork {
+                status: result_status(&result),
+                reason: result_reason(&result),
+                elapsed_ns,
+                clone_ns,
+                solve_ns,
+                decisions: u64::from(cpu.probe.n_decide),
+                conflicts: u64::from(cpu.probe.n_conflict),
+                propagations: u64::from(cpu.probe.n_prop),
+                selected: matches!(
+                    result,
+                    IncrementalResult::Unknown(UnknownReason::ConflictBudget)
+                ),
+            }
+        })
+        .collect();
+    let eligible = work.iter().filter(|item| item.status != 0).count() as u64;
+    let selected = work.iter().filter(|item| item.selected).count() as u64;
+    PAIRED_PREFLIGHT_CANDIDATES.fetch_add(eligible, Ordering::Relaxed);
+    PAIRED_PREFLIGHT_CONCLUSIVE.fetch_add(eligible.saturating_sub(selected), Ordering::Relaxed);
+    PAIRED_PREFLIGHT_SELECTED.fetch_add(selected, Ordering::Relaxed);
+    PAIRED_PREFLIGHT_NS.fetch_add(
+        work.iter().map(|item| item.elapsed_ns).sum(),
+        Ordering::Relaxed,
+    );
+    PAIRED_PREFLIGHT_CLONE_NS.fetch_add(
+        work.iter().map(|item| item.clone_ns).sum(),
+        Ordering::Relaxed,
+    );
+    PAIRED_PREFLIGHT_SOLVE_NS.fetch_add(
+        work.iter().map(|item| item.solve_ns).sum(),
+        Ordering::Relaxed,
+    );
+    Some(work)
+}
+
 fn measure_paired_cpu(
     requests: &[(&DagCnfSolver, IncrementalQuery)],
 ) -> Vec<PairedCpuWork> {
     requests
         .iter()
         .map(|(solver, query)| {
-            if !paired_query_selected(query) {
+            if !paired_static_selected(query) {
                 return PairedCpuWork::default();
             }
             // Clone before starting the timer: the comparison is the work of
@@ -899,7 +1086,7 @@ fn paired_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>
             let mut writer = BufWriter::new(file);
             if writeln!(
                 writer,
-                "pass_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\thw_status\thw_reason\thw_decisions\thw_conflicts\thw_propagations\thw_learnts\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_vars\tcontext_clauses\tcontext_literals\tbatch_cpu_ns\tbatch_hw_ns\tcontext_load_ns\tinit_ns"
+                "pass_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\thw_status\thw_reason\thw_decisions\thw_conflicts\thw_propagations\thw_learnts\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_vars\tcontext_clauses\tcontext_literals\tbatch_cpu_ns\tbatch_hw_ns\tcontext_load_ns\tinit_ns\tpreflight_selected\tpreflight_status\tpreflight_reason\tpreflight_ns\tpreflight_clone_ns\tpreflight_solve_ns\tpreflight_decisions\tpreflight_conflicts\tpreflight_propagations"
             )
             .is_err()
             {
@@ -916,6 +1103,7 @@ fn record_paired_batch(
     pending: &[(usize, IncrementalQuery)],
     queries: &[IncrementalQuery],
     cpu: &[PairedCpuWork],
+    preflight: Option<&[PairedPreflightWork]>,
     hardware: &[HardwareWork],
     context_load_ns: u64,
     batch_hw_ns: u64,
@@ -967,6 +1155,10 @@ fn record_paired_batch(
         let Some(cpu_work) = cpu.get(*index) else {
             continue;
         };
+        let preflight_work = preflight
+            .and_then(|work| work.get(*index))
+            .copied()
+            .unwrap_or_default();
         let constraint_literals = query
             .constraints
             .iter()
@@ -974,7 +1166,7 @@ fn record_paired_batch(
             .sum::<u64>();
         let _ = writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             pass_id,
             batch_id,
             queries.len(),
@@ -1004,6 +1196,15 @@ fn record_paired_batch(
             batch_hw_ns,
             context_load_ns,
             init_ns,
+            u8::from(preflight_work.selected),
+            preflight_work.status,
+            preflight_work.reason,
+            preflight_work.elapsed_ns,
+            preflight_work.clone_ns,
+            preflight_work.solve_ns,
+            preflight_work.decisions,
+            preflight_work.conflicts,
+            preflight_work.propagations,
         );
     }
 }
@@ -1179,14 +1380,21 @@ pub fn solve_active_batch(
         return output;
     }
     let paired = paired_enabled();
-    let selected_count = if paired {
-        requests
-            .iter()
-            .filter(|(_, query)| paired_query_selected(query))
-            .count()
-    } else {
-        requests.len()
-    };
+    let paired_preflight = paired
+        .then(|| measure_paired_preflight(&requests))
+        .flatten();
+    let selected: Vec<bool> = requests
+        .iter()
+        .enumerate()
+        .map(|(index, (_, query))| {
+            !paired
+                || paired_static_selected(query)
+                    && paired_preflight
+                        .as_ref()
+                        .is_none_or(|work| work[index].selected)
+        })
+        .collect();
+    let selected_count = selected.iter().filter(|selected| **selected).count();
     let pass_id = ACTIVE_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
     ACTIVE_MAX_READY.fetch_max(requests.len() as u64, Ordering::Relaxed);
     ACTIVE_CANDIDATES.fetch_add(requests.len() as u64, Ordering::Relaxed);
@@ -1202,17 +1410,25 @@ pub fn solve_active_batch(
     ACTIVE_OFFERED_PASSES.fetch_add(1, Ordering::Relaxed);
     ACTIVE_OFFERED.fetch_add(selected_count as u64, Ordering::Relaxed);
     let paired_cpu = paired.then(|| measure_paired_cpu(&requests));
+    if let Some(cpu) = paired_cpu.as_ref() {
+        PAIRED_BASELINE_CPU_NS.fetch_add(
+            cpu.iter().map(|work| work.elapsed_ns).sum(),
+            Ordering::Relaxed,
+        );
+    }
 
     struct Group {
         context: ShadowContext,
         pending: Vec<(usize, IncrementalQuery)>,
     }
     let mut groups: Vec<Group> = Vec::new();
+    let prefer_query_lemmas = !active_resident_lemmas();
     for (index, (solver, query)) in requests.into_iter().enumerate() {
-        if paired && !paired_query_selected(&query) {
+        if !selected[index] {
             continue;
         }
-        let (context, query, _) = prepare_batched_query(solver, query, true);
+        let (context, query, _) =
+            prepare_batched_query(solver, query, prefer_query_lemmas);
         let fits = query_request_words(&query)
             .and_then(|words| words.checked_add(4))
             .is_some_and(|words| words <= KERNEL_MAX_REQUEST_WORDS);
@@ -1321,6 +1537,7 @@ pub fn solve_active_batch(
                             &group.pending[start..end],
                             &queries,
                             cpu,
+                            paired_preflight.as_deref(),
                             &hardware.last_batch_records,
                             std::mem::take(&mut context_load_ns),
                             batch_ns,
@@ -1512,6 +1729,28 @@ pub fn flush_and_report() {
             std::env::var("INDUCTOR_CDCL_PAIRED_CSV")
                 .unwrap_or_else(|_| "disabled".to_string()),
         );
+        if let Some(conflict_limit) = paired_preflight_conflicts() {
+            let baseline_ns = PAIRED_BASELINE_CPU_NS.load(Ordering::Relaxed);
+            let preflight_ns = PAIRED_PREFLIGHT_NS.load(Ordering::Relaxed);
+            let hybrid_service_ns = preflight_ns.saturating_add(hw_ns);
+            let hybrid_with_load_ns = hybrid_service_ns
+                .saturating_add(ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed));
+            eprintln!(
+                "inductor-cdcl: paired preflight conflicts {}, candidates {}, conclusive {}, selected {}, preflight total/clone/solve {:.3}/{:.3}/{:.3} ms, all-candidate CPU baseline {:.3} ms, projected hybrid service {:.3} ms ({:.3}x), with context load {:.3} ms ({:.3}x)",
+                conflict_limit,
+                PAIRED_PREFLIGHT_CANDIDATES.load(Ordering::Relaxed),
+                PAIRED_PREFLIGHT_CONCLUSIVE.load(Ordering::Relaxed),
+                PAIRED_PREFLIGHT_SELECTED.load(Ordering::Relaxed),
+                preflight_ns as f64 / 1_000_000.0,
+                PAIRED_PREFLIGHT_CLONE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                PAIRED_PREFLIGHT_SOLVE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                baseline_ns as f64 / 1_000_000.0,
+                hybrid_service_ns as f64 / 1_000_000.0,
+                baseline_ns as f64 / hybrid_service_ns.max(1) as f64,
+                hybrid_with_load_ns as f64 / 1_000_000.0,
+                baseline_ns as f64 / hybrid_with_load_ns.max(1) as f64,
+            );
+        }
     } else if active_enabled() {
         eprintln!(
             "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init {:.3} ms, load {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
@@ -1547,6 +1786,21 @@ pub fn flush_and_report() {
             ACTIVE_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_UNSAT_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         );
+        if let Some(conflict_limit) = active_preflight_conflicts() {
+            let candidates = ACTIVE_PREFLIGHT_CANDIDATES.load(Ordering::Relaxed);
+            eprintln!(
+                "inductor-cdcl: active preflight conflicts {}, max assumptions {}, static-filtered {}, candidates {}, conclusive {}, selected {}, service {:.3} ms, mean conflicts/query {:.2}",
+                conflict_limit,
+                active_preflight_max_assumptions(),
+                ACTIVE_PREFLIGHT_STATIC_FILTERED.load(Ordering::Relaxed),
+                candidates,
+                ACTIVE_PREFLIGHT_CONCLUSIVE.load(Ordering::Relaxed),
+                ACTIVE_PREFLIGHT_SELECTED.load(Ordering::Relaxed),
+                ACTIVE_PREFLIGHT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                ACTIVE_PREFLIGHT_CONFLICTS.load(Ordering::Relaxed) as f64
+                    / candidates.max(1) as f64,
+            );
+        }
     }
     if profile_enabled() {
         print_profile();
@@ -1699,6 +1953,36 @@ mod tests {
             .clauses
             .iter()
             .any(|clause| clause.literals.as_slice() == [!a, b]));
+    }
+
+    #[test]
+    fn oversized_query_lemma_expansion_uses_resident_frame_context() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let c = dc.new_var().lit();
+        let extra: Vec<_> = (0..query_lemma_word_limit() / 5 + 1)
+            .map(|_| dc.new_var().lit())
+            .collect();
+        let mut solver = DagCnfSolver::new(&dc);
+        solver.accel_level = 5;
+        for d in extra {
+            solver.add_clause(&[a, b, c, d]);
+        }
+
+        let query = IncrementalQuery::new(5, LitVec::new());
+        let (context, unchanged, used) =
+            prepare_batched_query(&solver, query.clone(), true);
+        assert!(!used);
+        assert_eq!(unchanged.frame, query.frame);
+        assert_eq!(unchanged.assumptions, query.assumptions);
+        assert_eq!(unchanged.constraints, query.constraints);
+        assert_eq!(unchanged.domain, query.domain);
+        assert!(context
+            .clauses
+            .iter()
+            .all(|clause| clause.lo == 5 && clause.hi == 5));
+        assert!(context.clauses.len() > query_lemma_word_limit() / 5);
     }
 
     #[test]

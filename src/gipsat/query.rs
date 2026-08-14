@@ -212,6 +212,64 @@ pub trait IncrementalCdcl {
 }
 
 impl DagCnfSolver {
+    /// Run an exact GipSAT inquiry until it completes or reaches a small
+    /// conflict limit. The proof-neutral profiler invokes this on a clone;
+    /// active dispatch may invoke it on the live solver and then reset the
+    /// query state. A conclusive result has ordinary CPU semantics; hitting
+    /// the limit returns `UNKNOWN/ConflictBudget`.
+    pub fn solve_incremental_preflight(
+        &mut self,
+        query: &IncrementalQuery,
+        conflict_limit: u32,
+    ) -> IncrementalResult {
+        if query.frame != self.accel_level {
+            return IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::FrameMiss);
+        }
+        if conflict_limit == 0 {
+            return IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::ConflictBudget);
+        }
+        let result = self.solve_with_limits(
+            &query.assumptions,
+            query.constraints.clone(),
+            query.domain.iter().copied(),
+            None,
+            Some(conflict_limit),
+            false,
+        );
+        match result {
+            Some(true) => IncrementalResult::Sat {
+                model: self.sat_value_iter().copied().collect(),
+            },
+            Some(false) => IncrementalResult::Unsat {
+                core: query
+                    .assumptions
+                    .iter()
+                    .filter(|lit| self.unsat_core.has(**lit))
+                    .copied()
+                    .collect(),
+                used_constraints: !query.constraints.is_empty()
+                    && self.unsat_core.has(self.constrain_act.lit()),
+            },
+            None => IncrementalResult::Unknown(
+                crate::accel::cdcl::UnknownReason::ConflictBudget,
+            ),
+        }
+    }
+
+    /// Classify a live inquiry and restore the solver to a clean query
+    /// boundary. Preflight learnts are deliberately temporary, so neither
+    /// they nor assumptions and temporary constraints leak into later FPGA
+    /// validation or CPU fallback.
+    pub fn classify_incremental_preflight(
+        &mut self,
+        query: &IncrementalQuery,
+        conflict_limit: u32,
+    ) -> IncrementalResult {
+        let result = self.solve_incremental_preflight(query, conflict_limit);
+        self.reset();
+        result
+    }
+
     /// Check a hardware SAT model against the exact, current CPU formula.
     ///
     /// This is intentionally stricter than checking the sparse values GipSAT
@@ -498,6 +556,45 @@ mod tests {
         assert!(batch.valid_for(&words));
         assert!(matches!(
             solver.solve_incremental(&constrained),
+            IncrementalResult::Unsat { .. }
+        ));
+    }
+
+    #[test]
+    fn cpu_preflight_stops_at_the_conflict_limit() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let solver = DagCnfSolver::new(&dc);
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = (0..solver.num_var()).map(Var::from).collect();
+        query.constraints = vec![
+            LitVec::from([a, b]),
+            LitVec::from([!a, b]),
+            LitVec::from([a, !b]),
+            LitVec::from([!a, !b]),
+        ];
+
+        let mut preflight = solver.clone();
+        assert_eq!(
+            preflight.solve_incremental_preflight(&query, 1),
+            IncrementalResult::Unknown(UnknownReason::ConflictBudget),
+        );
+        let mut exact = solver.clone();
+        assert!(matches!(
+            exact.solve_incremental(&query),
+            IncrementalResult::Unsat { .. }
+        ));
+
+        let mut live = solver.clone();
+        let learnts_before = live.cdb.num_learnt();
+        assert_eq!(
+            live.classify_incremental_preflight(&query, 1),
+            IncrementalResult::Unknown(UnknownReason::ConflictBudget),
+        );
+        assert_eq!(live.cdb.num_learnt(), learnts_before);
+        assert!(matches!(
+            live.solve_incremental(&query),
             IncrementalResult::Unsat { .. }
         ));
     }
