@@ -1796,7 +1796,10 @@ pub fn solve_active_batch(
                         batch_ns = combined_ns;
                         result = Some(Ok(results));
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        eprintln!(
+                            "inductor-cdcl: combined load/run failed: {error}"
+                        );
                         ACTIVE_COMBINED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                         ACTIVE_COMBINED_FALLBACK_NS.fetch_add(
                             combined_ns,
@@ -1819,7 +1822,10 @@ pub fn solve_active_batch(
                             .as_nanos()
                             .min(u64::MAX as u128) as u64;
                         ACTIVE_CONTEXT_LOAD_NS.fetch_add(context_load_ns, Ordering::Relaxed);
-                        if loaded.is_err() {
+                        if let Err(error) = loaded {
+                            eprintln!(
+                                "inductor-cdcl: fallback context load failed: {error}"
+                            );
                             ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
                             start = end;
                             continue;
