@@ -916,18 +916,42 @@ fn active_sample_min_cpu_ns() -> u64 {
     })
 }
 
+fn representative_sample_positions(n_candidates: usize, n_sample: usize) -> Vec<usize> {
+    let n_sample = n_sample.min(n_candidates);
+    if n_sample == 0 {
+        return Vec::new();
+    }
+    // Midpoints of equal-width strata cover the entire frame instead of
+    // measuring only its first (often unusually hard) inquiries. u128 keeps
+    // the arithmetic defined even for an adversarially large host vector.
+    (0..n_sample)
+        .map(|sample| {
+            (((2u128 * sample as u128 + 1) * n_candidates as u128)
+                / (2u128 * n_sample as u128)) as usize
+        })
+        .collect()
+}
+
 fn sample_keeps_fpga(
-    sample_ns: u64,
-    n_sample: usize,
+    sample_solve_ns: &[u64],
     n_remaining: usize,
     min_batch: usize,
     min_cpu_ns: u64,
     all_conclusive: bool,
 ) -> bool {
+    let mut distribution = sample_solve_ns.to_vec();
+    distribution.sort_unstable();
+    // The lower median is deliberately conservative for an even sample. One
+    // expensive outlier must not route a frame whose typical inquiry is cheap.
+    let Some(representative_ns) = distribution
+        .get(distribution.len().saturating_sub(1) / 2)
+        .copied()
+    else {
+        return false;
+    };
     all_conclusive
-        && n_sample != 0
         && n_remaining >= min_batch
-        && sample_ns / n_sample as u64 >= min_cpu_ns
+        && representative_ns >= min_cpu_ns
 }
 
 /// Avoid paying even the bounded CPU classification cost when the raw
@@ -977,11 +1001,14 @@ pub fn active_preflight_classify(
 }
 
 /// Finish a small number of budget-exhausted inquiries exactly on GipSAT
-/// clones and use their mean restart cost to route the rest of this frame.
+/// clones and use a representative restart cost to route the rest of this
+/// frame.
 /// Cloning keeps the sample from changing live phase/activity and therefore
 /// changing the cost it is trying to predict. Sampled answers are retained as
-/// trusted CPU results rather than discarded. This is opt-in while the
-/// crossover is validated across models.
+/// trusted CPU results rather than discarded. Samples are spread across the
+/// frame and the lower median rejects a batch dominated by cheap inquiries
+/// even if one prefix inquiry is an expensive outlier. This is opt-in while
+/// the crossover is validated across models.
 pub fn active_sample_select(
     solver: &DagCnfSolver,
     queries: &[IncrementalQuery],
@@ -1011,11 +1038,16 @@ pub fn active_sample_select(
     }
 
     let n_sample = requested.min(candidates.len());
+    let sample_positions = representative_sample_positions(candidates.len(), n_sample);
+    let mut sampled = vec![false; candidates.len()];
     let mut sample_ns = 0u64;
     let mut sample_clone_ns = 0u64;
     let mut sample_solve_ns = 0u64;
+    let mut sample_solve_distribution = Vec::with_capacity(n_sample);
     let mut all_conclusive = true;
-    for &index in &candidates[..n_sample] {
+    for position in sample_positions {
+        sampled[position] = true;
+        let index = candidates[position];
         let start = std::time::Instant::now();
         let mut sample_solver = solver.clone();
         let clone_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -1025,6 +1057,7 @@ pub fn active_sample_select(
         sample_clone_ns = sample_clone_ns.saturating_add(clone_ns);
         sample_solve_ns = sample_solve_ns.saturating_add(solve_ns);
         sample_ns = sample_ns.saturating_add(clone_ns.saturating_add(solve_ns));
+        sample_solve_distribution.push(solve_ns);
         decisions[index] = match result {
             IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
                 ActivePreflight::Conclusive(result)
@@ -1040,10 +1073,13 @@ pub fn active_sample_select(
     ACTIVE_SAMPLE_CLONE_NS.fetch_add(sample_clone_ns, Ordering::Relaxed);
     ACTIVE_SAMPLE_SOLVE_NS.fetch_add(sample_solve_ns, Ordering::Relaxed);
 
-    let remaining = &candidates[n_sample..];
+    let remaining: Vec<usize> = candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, index)| (!sampled[position]).then_some(index))
+        .collect();
     if sample_keeps_fpga(
-        sample_solve_ns,
-        n_sample,
+        &sample_solve_distribution,
         remaining.len(),
         active_min_batch_size(),
         active_sample_min_cpu_ns(),
@@ -1054,7 +1090,7 @@ pub fn active_sample_select(
     } else {
         ACTIVE_SAMPLE_CPU_BATCHES.fetch_add(1, Ordering::Relaxed);
         ACTIVE_SAMPLE_CPU_REJECTED.fetch_add(remaining.len() as u64, Ordering::Relaxed);
-        for &index in remaining {
+        for index in remaining {
             decisions[index] = ActivePreflight::CpuFallback;
         }
     }
@@ -2238,11 +2274,27 @@ mod tests {
 
     #[test]
     fn cpu_sample_requires_cost_and_a_remaining_hardware_batch() {
-        assert!(sample_keeps_fpga(600_000, 2, 16, 8, 200_000, true));
-        assert!(!sample_keeps_fpga(300_000, 2, 16, 8, 200_000, true));
-        assert!(!sample_keeps_fpga(600_000, 2, 7, 8, 200_000, true));
-        assert!(!sample_keeps_fpga(0, 0, 16, 8, 200_000, true));
-        assert!(!sample_keeps_fpga(600_000, 2, 16, 8, 200_000, false));
+        assert_eq!(representative_sample_positions(10, 1), vec![5]);
+        assert_eq!(representative_sample_positions(10, 3), vec![1, 5, 8]);
+        assert_eq!(representative_sample_positions(3, 8), vec![0, 1, 2]);
+        assert!(sample_keeps_fpga(
+            &[250_000, 300_000, 900_000], 16, 8, 200_000, true
+        ));
+        assert!(!sample_keeps_fpga(
+            &[50_000, 100_000, 900_000], 16, 8, 200_000, true
+        ));
+        // With an even sample the lower median prevents one expensive half
+        // from routing a frame whose other half is cheap.
+        assert!(!sample_keeps_fpga(
+            &[150_000, 600_000], 16, 8, 200_000, true
+        ));
+        assert!(!sample_keeps_fpga(
+            &[250_000, 300_000], 7, 8, 200_000, true
+        ));
+        assert!(!sample_keeps_fpga(&[], 16, 8, 200_000, true));
+        assert!(!sample_keeps_fpga(
+            &[250_000, 300_000], 16, 8, 200_000, false
+        ));
     }
 
     #[test]
