@@ -22,8 +22,11 @@ pub const KEEP_LEARNTS: u32 = 1 << 2;
 pub const WANT_STAGE_PROFILE: u32 = 1 << 3;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
-pub const STAGE_PROFILE_VERSION: u32 = 1;
-pub const STAGE_PROFILE_COUNTERS: usize = 9;
+pub const STAGE_PROFILE_VERSION: u32 = 2;
+pub const STAGE_PROFILE_STAGE_COUNTERS: usize = 9;
+pub const STAGE_PROFILE_WORK_COUNTERS: usize = 8;
+pub const STAGE_PROFILE_COUNTERS: usize =
+    STAGE_PROFILE_STAGE_COUNTERS + STAGE_PROFILE_WORK_COUNTERS;
 pub const STAGE_PROFILE_WORDS: usize = 3 + 2 * STAGE_PROFILE_COUNTERS;
 
 pub const PROFILE_SETUP: usize = 0;
@@ -35,6 +38,14 @@ pub const PROFILE_LEARN: usize = 5;
 pub const PROFILE_DECIDE: usize = 6;
 pub const PROFILE_EMIT: usize = 7;
 pub const PROFILE_CLEANUP: usize = 8;
+pub const PROFILE_OCCURRENCE_UPDATES: usize = 9;
+pub const PROFILE_PARTIAL_OCCURRENCE_SCANS: usize = 10;
+pub const PROFILE_EVALUATED_LITERALS: usize = 11;
+pub const PROFILE_UNIT_CANDIDATES: usize = 12;
+pub const PROFILE_ANALYZED_LITERALS: usize = 13;
+pub const PROFILE_UNDO_OCCURRENCES: usize = 14;
+pub const PROFILE_UNDO_ASSIGNMENTS: usize = 15;
+pub const PROFILE_LEARNT_LITERALS: usize = 16;
 
 pub const QUERY_HEADER_WORDS: usize = 8;
 pub const RESPONSE_HEADER_WORDS: usize = 9;

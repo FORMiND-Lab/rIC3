@@ -5,11 +5,14 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    BatchHeader, PROFILE_ANALYZE, PROFILE_BACKTRACK, PROFILE_CLEANUP,
-    PROFILE_DECIDE, PROFILE_EMIT, PROFILE_LEARN, PROFILE_PROPAGATE,
-    PROFILE_ROOT, PROFILE_SETUP, RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS,
-    STAGE_PROFILE_MAGIC, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
-    UnknownReason, WANT_STAGE_PROFILE,
+    BatchHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
+    PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS,
+    PROFILE_LEARN, PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_UPDATES,
+    PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
+    PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES,
+    PROFILE_UNIT_CANDIDATES, RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS,
+    STAGE_PROFILE_MAGIC, STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION,
+    STAGE_PROFILE_WORDS, Status, UnknownReason, WANT_STAGE_PROFILE,
 };
 use crate::gipsat::{
     BatchDecodeError, DagCnfSolver, IncrementalCdcl, IncrementalQuery, IncrementalResult,
@@ -127,7 +130,7 @@ struct HardwareWork {
     conflicts: u64,
     propagations: u64,
     learnt_clauses: u64,
-    stage_entries: [u64; STAGE_PROFILE_COUNTERS],
+    profile_counters: [u64; STAGE_PROFILE_COUNTERS],
 }
 
 fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<HardwareWork>> {
@@ -146,7 +149,7 @@ fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<Hard
             conflicts: u64::from(header[5]),
             propagations: u64::from(header[6]),
             learnt_clauses: u64::from(header[7]),
-            stage_entries: [0; STAGE_PROFILE_COUNTERS],
+            profile_counters: [0; STAGE_PROFILE_COUNTERS],
         });
         let payload_words = usize::try_from(header[2]).ok()?
             .checked_add(usize::try_from(header[3]).ok()?)?;
@@ -192,7 +195,7 @@ fn decode_profiled_batch_wire(
             conflicts: u64::from(header[5]),
             propagations: u64::from(header[6]),
             learnt_clauses: u64::from(header[7]),
-            stage_entries: [0; STAGE_PROFILE_COUNTERS],
+            profile_counters: [0; STAGE_PROFILE_COUNTERS],
         };
         let payload_words = usize::try_from(header[2]).ok()?
             .checked_add(usize::try_from(header[3]).ok()?)?;
@@ -208,9 +211,9 @@ fn decode_profiled_batch_wire(
         {
             return None;
         }
-        for (stage, entries) in work.stage_entries.iter_mut().enumerate() {
-            let at = 3 + 2 * stage;
-            *entries = u64::from(trailer[at]) | (u64::from(trailer[at + 1]) << 32);
+        for (counter, value) in work.profile_counters.iter_mut().enumerate() {
+            let at = 3 + 2 * counter;
+            *value = u64::from(trailer[at]) | (u64::from(trailer[at + 1]) << 32);
         }
         offset += STAGE_PROFILE_WORDS;
         records.push(work);
@@ -231,8 +234,12 @@ fn sum_hardware_work(records: &[HardwareWork]) -> HardwareWork {
             total.conflicts = total.conflicts.saturating_add(work.conflicts);
             total.propagations = total.propagations.saturating_add(work.propagations);
             total.learnt_clauses = total.learnt_clauses.saturating_add(work.learnt_clauses);
-            for (sum, entries) in total.stage_entries.iter_mut().zip(work.stage_entries) {
-                *sum = sum.saturating_add(entries);
+            for (sum, value) in total
+                .profile_counters
+                .iter_mut()
+                .zip(work.profile_counters)
+            {
+                *sum = sum.saturating_add(value);
             }
             total
         })
@@ -853,10 +860,13 @@ fn profile_resident_context(n_var: u32, clauses: &[ResidentClause]) {
 fn profile_hardware_batch(queries: &[IncrementalQuery], work: &[HardwareWork]) {
     if stage_profile_enabled() && queries.len() == work.len() {
         for (batch_index, (query, work)) in queries.iter().zip(work).enumerate() {
-            let entries = &work.stage_entries;
-            let total = entries.iter().copied().fold(0u64, u64::saturating_add);
+            let counters = &work.profile_counters;
+            let total = counters[..STAGE_PROFILE_STAGE_COUNTERS]
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add);
             eprintln!(
-                "inductor-cdcl-stage: batch-index {} frame {} status {} reason {} assumptions {} constraints {} domain {} total-entries {} setup {} root {} propagate {} analyze {} backtrack {} learn {} decide {} emit {} cleanup {}",
+                "inductor-cdcl-stage: batch-index {} frame {} status {} reason {} assumptions {} constraints {} domain {} total-entries {} setup {} root {} propagate {} analyze {} backtrack {} learn {} decide {} emit {} cleanup {} occurrence-updates {} partial-occurrence-scans {} evaluated-literals {} unit-candidates {} analyzed-literals {} undo-occurrences {} undo-assignments {} learnt-literals {}",
                 batch_index,
                 query.frame,
                 work.status,
@@ -865,15 +875,23 @@ fn profile_hardware_batch(queries: &[IncrementalQuery], work: &[HardwareWork]) {
                 query.constraints.len(),
                 query.domain.len(),
                 total,
-                entries[PROFILE_SETUP],
-                entries[PROFILE_ROOT],
-                entries[PROFILE_PROPAGATE],
-                entries[PROFILE_ANALYZE],
-                entries[PROFILE_BACKTRACK],
-                entries[PROFILE_LEARN],
-                entries[PROFILE_DECIDE],
-                entries[PROFILE_EMIT],
-                entries[PROFILE_CLEANUP],
+                counters[PROFILE_SETUP],
+                counters[PROFILE_ROOT],
+                counters[PROFILE_PROPAGATE],
+                counters[PROFILE_ANALYZE],
+                counters[PROFILE_BACKTRACK],
+                counters[PROFILE_LEARN],
+                counters[PROFILE_DECIDE],
+                counters[PROFILE_EMIT],
+                counters[PROFILE_CLEANUP],
+                counters[PROFILE_OCCURRENCE_UPDATES],
+                counters[PROFILE_PARTIAL_OCCURRENCE_SCANS],
+                counters[PROFILE_EVALUATED_LITERALS],
+                counters[PROFILE_UNIT_CANDIDATES],
+                counters[PROFILE_ANALYZED_LITERALS],
+                counters[PROFILE_UNDO_OCCURRENCES],
+                counters[PROFILE_UNDO_ASSIGNMENTS],
+                counters[PROFILE_LEARNT_LITERALS],
             );
         }
     }
@@ -2511,7 +2529,7 @@ mod tests {
                     conflicts: 6,
                     propagations: 7,
                     learnt_clauses: 8,
-                    stage_entries: [0; STAGE_PROFILE_COUNTERS],
+                    profile_counters: [0; STAGE_PROFILE_COUNTERS],
                 },
                 HardwareWork {
                     status: 2,
@@ -2520,7 +2538,7 @@ mod tests {
                     conflicts: 12,
                     propagations: 13,
                     learnt_clauses: 14,
-                    stage_entries: [0; STAGE_PROFILE_COUNTERS],
+                    profile_counters: [0; STAGE_PROFILE_COUNTERS],
                 },
             ]
         );
@@ -2564,10 +2582,17 @@ mod tests {
             words.push((entries >> 32) as u32);
         }
         let (records, semantic) = decode_profiled_batch_wire(&words, 1).unwrap();
-        assert_eq!(records[0].stage_entries[PROFILE_SETUP], (1u64 << 32) | 100);
         assert_eq!(
-            records[0].stage_entries[PROFILE_CLEANUP],
-            (STAGE_PROFILE_COUNTERS as u64) << 32 | 108,
+            records[0].profile_counters[PROFILE_SETUP],
+            (1u64 << 32) | 100
+        );
+        assert_eq!(
+            records[0].profile_counters[PROFILE_CLEANUP],
+            (PROFILE_CLEANUP as u64 + 1) << 32 | 108,
+        );
+        assert_eq!(
+            records[0].profile_counters[PROFILE_LEARNT_LITERALS],
+            (STAGE_PROFILE_COUNTERS as u64) << 32 | 116,
         );
         assert_eq!(semantic[2], (RESPONSE_HEADER_WORDS + 1) as u32);
         assert_eq!(semantic.len(), 4 + RESPONSE_HEADER_WORDS + 1);
