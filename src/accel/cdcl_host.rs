@@ -8,6 +8,7 @@ use super::cdcl::{
     BatchHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
     PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS,
     PROFILE_LEARN, PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_UPDATES,
+    PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
     PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
     PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES,
     PROFILE_UNIT_CANDIDATES, RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS,
@@ -866,7 +867,7 @@ fn profile_hardware_batch(queries: &[IncrementalQuery], work: &[HardwareWork]) {
                 .copied()
                 .fold(0u64, u64::saturating_add);
             eprintln!(
-                "inductor-cdcl-stage: batch-index {} frame {} status {} reason {} assumptions {} constraints {} domain {} total-entries {} setup {} root {} propagate {} analyze {} backtrack {} learn {} decide {} emit {} cleanup {} occurrence-updates {} partial-occurrence-scans {} evaluated-literals {} unit-candidates {} analyzed-literals {} undo-occurrences {} undo-assignments {} learnt-literals {}",
+                "inductor-cdcl-stage: batch-index {} frame {} status {} reason {} assumptions {} constraints {} domain {} total-entries {} setup {} root {} propagate {} analyze {} backtrack {} learn {} decide {} emit {} cleanup {} occurrence-updates {} partial-occurrence-scans {} evaluated-literals {} unit-candidates {} analyzed-literals {} undo-occurrences {} undo-assignments {} learnt-literals {} occurrence-rounds {} occurrence-pairs {}",
                 batch_index,
                 query.frame,
                 work.status,
@@ -892,6 +893,8 @@ fn profile_hardware_batch(queries: &[IncrementalQuery], work: &[HardwareWork]) {
                 counters[PROFILE_UNDO_OCCURRENCES],
                 counters[PROFILE_UNDO_ASSIGNMENTS],
                 counters[PROFILE_LEARNT_LITERALS],
+                counters[PROFILE_OCCURRENCE_ROUNDS],
+                counters[PROFILE_OCCURRENCE_PAIRS],
             );
         }
     }
@@ -2592,7 +2595,11 @@ mod tests {
         );
         assert_eq!(
             records[0].profile_counters[PROFILE_LEARNT_LITERALS],
-            (STAGE_PROFILE_COUNTERS as u64) << 32 | 116,
+            (PROFILE_LEARNT_LITERALS as u64 + 1) << 32 | 116,
+        );
+        assert_eq!(
+            records[0].profile_counters[PROFILE_OCCURRENCE_PAIRS],
+            (PROFILE_OCCURRENCE_PAIRS as u64 + 1) << 32 | 118,
         );
         assert_eq!(semantic[2], (RESPONSE_HEADER_WORDS + 1) as u32);
         assert_eq!(semantic.len(), 4 + RESPONSE_HEADER_WORDS + 1);
