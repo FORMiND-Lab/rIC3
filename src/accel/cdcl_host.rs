@@ -711,6 +711,8 @@ static ACTIVE_SAMPLE_CPU_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLE_FPGA_RETAINED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLE_CPU_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLE_UNDERSIZED_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_CONTEXT_GROUPS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAMPLE_PLAN_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
 static PAIRED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PAIRED_FILTERED: AtomicU64 = AtomicU64::new(0);
@@ -1158,97 +1160,159 @@ pub fn active_preflight_classify(
 }
 
 /// Finish a small number of budget-exhausted inquiries exactly on GipSAT
-/// clones and use a representative restart cost to route the rest of this
-/// frame.
+/// clones and use a representative restart cost to route the rest of each
+/// context-compatible group in this propagation pass.
 /// Cloning keeps the sample from changing live phase/activity and therefore
 /// changing the cost it is trying to predict. Sampled answers are retained as
 /// trusted CPU results rather than discarded. Samples are spread across the
-/// frame and the lower median rejects a batch dominated by cheap inquiries
-/// even if one prefix inquiry is an expensive outlier. This is opt-in while
-/// the crossover is validated across models.
-pub fn active_sample_select(
-    solver: &DagCnfSolver,
-    queries: &[IncrementalQuery],
+/// compatible group and the lower median rejects a batch dominated by cheap
+/// inquiries even if one prefix inquiry is an expensive outlier. Planning is
+/// deliberately bounded by one propagation pass: carrying queries across
+/// passes would cross IC3 frame mutations and invalidate their proof context.
+pub fn active_sample_select_pass(
+    requests: &[(&DagCnfSolver, &IncrementalQuery)],
     decisions: &mut [ActivePreflight],
 ) {
     let requested = active_sample_queries();
-    if requested == 0 || queries.len() != decisions.len() {
+    if requested == 0 || requests.len() != decisions.len() {
         return;
     }
-    let candidates: Vec<usize> = decisions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, decision)| {
-            matches!(decision, ActivePreflight::Fpga).then_some(index)
-        })
-        .collect();
-    if candidates.is_empty() {
-        return;
+
+    struct SampleGroup {
+        context: ShadowContext,
+        candidates: Vec<(usize, usize)>,
     }
-    if candidates.len() < active_min_batch_size() {
-        ACTIVE_SAMPLE_UNDERSIZED_REJECTED
-            .fetch_add(candidates.len() as u64, Ordering::Relaxed);
-        for index in candidates {
-            decisions[index] = ActivePreflight::CpuFallback;
+
+    let plan_start = std::time::Instant::now();
+    let prefer_query_lemmas = !active_resident_lemmas();
+    let mut caches = Vec::new();
+    let mut groups: Vec<SampleGroup> = Vec::new();
+    for (index, ((solver, query), decision)) in
+        requests.iter().zip(decisions.iter_mut()).enumerate()
+    {
+        if !matches!(decision, ActivePreflight::Fpga) {
+            continue;
         }
-        return;
-    }
-
-    let n_sample = requested.min(candidates.len());
-    let sample_positions = representative_sample_positions(candidates.len(), n_sample);
-    let mut sampled = vec![false; candidates.len()];
-    let mut sample_ns = 0u64;
-    let mut sample_clone_ns = 0u64;
-    let mut sample_solve_ns = 0u64;
-    let mut sample_solve_distribution = Vec::with_capacity(n_sample);
-    let mut all_conclusive = true;
-    for position in sample_positions {
-        sampled[position] = true;
-        let index = candidates[position];
-        let start = std::time::Instant::now();
-        let mut sample_solver = solver.clone();
-        let clone_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let solve_start = std::time::Instant::now();
-        let result = sample_solver.classify_incremental_exact(&queries[index]);
-        let solve_ns = solve_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        sample_clone_ns = sample_clone_ns.saturating_add(clone_ns);
-        sample_solve_ns = sample_solve_ns.saturating_add(solve_ns);
-        sample_ns = sample_ns.saturating_add(clone_ns.saturating_add(solve_ns));
-        sample_solve_distribution.push(solve_ns);
-        decisions[index] = match result {
-            IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
-                ActivePreflight::Conclusive(result)
-            }
-            IncrementalResult::Unknown(_) => {
-                all_conclusive = false;
-                ActivePreflight::CpuFallback
-            }
+        let cache_index = batched_solver_cache_index(&mut caches, solver);
+        let Some((use_query_lemmas, words)) =
+            caches[cache_index].query_plan(query, prefer_query_lemmas)
+        else {
+            *decision = ActivePreflight::CpuFallback;
+            ACTIVE_SAMPLE_UNDERSIZED_REJECTED.fetch_add(1, Ordering::Relaxed);
+            continue;
         };
+        if words.checked_add(4).is_none_or(|total| total > KERNEL_MAX_REQUEST_WORDS) {
+            *decision = ActivePreflight::CpuFallback;
+            ACTIVE_SAMPLE_UNDERSIZED_REJECTED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let context = caches[cache_index].context(use_query_lemmas);
+        if let Some(group) = groups.iter_mut().find(|group| &group.context == context) {
+            group.candidates.push((index, words));
+        } else {
+            groups.push(SampleGroup {
+                context: context.clone(),
+                candidates: vec![(index, words)],
+            });
+        }
     }
-    ACTIVE_SAMPLE_QUERIES.fetch_add(n_sample as u64, Ordering::Relaxed);
-    ACTIVE_SAMPLE_NS.fetch_add(sample_ns, Ordering::Relaxed);
-    ACTIVE_SAMPLE_CLONE_NS.fetch_add(sample_clone_ns, Ordering::Relaxed);
-    ACTIVE_SAMPLE_SOLVE_NS.fetch_add(sample_solve_ns, Ordering::Relaxed);
+    ACTIVE_SAMPLE_CONTEXT_GROUPS.fetch_add(groups.len() as u64, Ordering::Relaxed);
+    ACTIVE_SAMPLE_PLAN_NS.fetch_add(
+        plan_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
 
-    let remaining: Vec<usize> = candidates
-        .into_iter()
-        .enumerate()
-        .filter_map(|(position, index)| (!sampled[position]).then_some(index))
-        .collect();
-    if sample_keeps_fpga(
-        &sample_solve_distribution,
-        remaining.len(),
-        active_min_batch_size(),
-        active_sample_min_cpu_ns(),
-        all_conclusive,
-    ) {
-        ACTIVE_SAMPLE_FPGA_BATCHES.fetch_add(1, Ordering::Relaxed);
-        ACTIVE_SAMPLE_FPGA_RETAINED.fetch_add(remaining.len() as u64, Ordering::Relaxed);
-    } else {
-        ACTIVE_SAMPLE_CPU_BATCHES.fetch_add(1, Ordering::Relaxed);
-        ACTIVE_SAMPLE_CPU_REJECTED.fetch_add(remaining.len() as u64, Ordering::Relaxed);
-        for index in remaining {
-            decisions[index] = ActivePreflight::CpuFallback;
+    for group in groups {
+        let n_sample = requested.min(group.candidates.len());
+        if group.candidates.len().saturating_sub(n_sample) < active_min_batch_size() {
+            ACTIVE_SAMPLE_UNDERSIZED_REJECTED
+                .fetch_add(group.candidates.len() as u64, Ordering::Relaxed);
+            for (index, _) in group.candidates {
+                decisions[index] = ActivePreflight::CpuFallback;
+            }
+            continue;
+        }
+
+        let sample_positions =
+            representative_sample_positions(group.candidates.len(), n_sample);
+        let mut sampled = vec![false; group.candidates.len()];
+        let mut sample_ns = 0u64;
+        let mut sample_clone_ns = 0u64;
+        let mut sample_solve_ns = 0u64;
+        let mut sample_solve_distribution = Vec::with_capacity(n_sample);
+        let mut all_conclusive = true;
+        for position in sample_positions {
+            sampled[position] = true;
+            let index = group.candidates[position].0;
+            let (solver, query) = requests[index];
+            let start = std::time::Instant::now();
+            let mut sample_solver = solver.clone();
+            let clone_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let solve_start = std::time::Instant::now();
+            let result = sample_solver.classify_incremental_exact(query);
+            let solve_ns = solve_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            sample_clone_ns = sample_clone_ns.saturating_add(clone_ns);
+            sample_solve_ns = sample_solve_ns.saturating_add(solve_ns);
+            sample_ns = sample_ns.saturating_add(clone_ns.saturating_add(solve_ns));
+            sample_solve_distribution.push(solve_ns);
+            decisions[index] = match result {
+                IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
+                    ActivePreflight::Conclusive(result)
+                }
+                IncrementalResult::Unknown(_) => {
+                    all_conclusive = false;
+                    ActivePreflight::CpuFallback
+                }
+            };
+        }
+        ACTIVE_SAMPLE_QUERIES.fetch_add(n_sample as u64, Ordering::Relaxed);
+        ACTIVE_SAMPLE_NS.fetch_add(sample_ns, Ordering::Relaxed);
+        ACTIVE_SAMPLE_CLONE_NS.fetch_add(sample_clone_ns, Ordering::Relaxed);
+        ACTIVE_SAMPLE_SOLVE_NS.fetch_add(sample_solve_ns, Ordering::Relaxed);
+
+        let remaining: Vec<(usize, usize)> = group
+            .candidates
+            .into_iter()
+            .enumerate()
+            .filter_map(|(position, candidate)| (!sampled[position]).then_some(candidate))
+            .collect();
+        if !sample_keeps_fpga(
+            &sample_solve_distribution,
+            remaining.len(),
+            active_min_batch_size(),
+            active_sample_min_cpu_ns(),
+            all_conclusive,
+        ) {
+            ACTIVE_SAMPLE_CPU_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ACTIVE_SAMPLE_CPU_REJECTED.fetch_add(remaining.len() as u64, Ordering::Relaxed);
+            for (index, _) in remaining {
+                decisions[index] = ActivePreflight::CpuFallback;
+            }
+            continue;
+        }
+
+        let query_words: Vec<_> = remaining.iter().map(|(_, words)| *words).collect();
+        let ranges = plan_full_batch_ranges(
+            &query_words,
+            active_min_batch_size(),
+            active_batch_size(),
+            KERNEL_MAX_REQUEST_WORDS,
+        );
+        let mut planned = vec![false; remaining.len()];
+        for range in &ranges {
+            planned[range.clone()].fill(true);
+        }
+        let planned_count = planned.iter().filter(|planned| **planned).count();
+        ACTIVE_SAMPLE_FPGA_BATCHES.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+        ACTIVE_SAMPLE_FPGA_RETAINED.fetch_add(planned_count as u64, Ordering::Relaxed);
+        ACTIVE_SAMPLE_UNDERSIZED_REJECTED.fetch_add(
+            remaining.len().saturating_sub(planned_count) as u64,
+            Ordering::Relaxed,
+        );
+        for ((index, _), planned) in remaining.into_iter().zip(planned) {
+            if !planned {
+                decisions[index] = ActivePreflight::CpuFallback;
+            }
         }
     }
 }
@@ -1293,11 +1357,11 @@ fn query_lemma_word_limit() -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .map(|value| value.clamp(1, KERNEL_MAX_REQUEST_WORDS))
-            // Repeating frame lemmas is attractive only while several
-            // inquiries still fit in one DMA command. `fifo.btor` reached
-            // ~15k words/query and 1,210 batches; keeping at least eight-query
-            // packing as the default crossover reduced that to 38 batches.
-            .unwrap_or(KERNEL_MAX_REQUEST_WORDS / 8)
+            // The local-lemma representation is useful only while a complete
+            // minimum-size hardware batch fits in one command. Otherwise use
+            // the exact resident-frame representation instead of satisfying
+            // the global candidate guard and then emitting tiny DMA batches.
+            .unwrap_or(KERNEL_MAX_REQUEST_WORDS / active_min_batch_size())
     })
 }
 
@@ -1340,6 +1404,181 @@ fn query_request_words(query: &IncrementalQuery) -> Option<usize> {
         .checked_add(query.assumptions.len())?
         .checked_add(constraints)?
         .checked_add(query.domain.len())
+}
+
+/// Partition one context-compatible query sequence into complete hardware
+/// batches. Every returned range satisfies the configured query-count and
+/// command-word limits. A bounded dynamic program maximizes the number of
+/// planned queries, then minimizes submission count; any queries that cannot
+/// participate in a complete batch are intentionally left for CPU fallback.
+///
+/// Ranges preserve caller order. Positions omitted between ranges correspond
+/// to a query that could not participate in a full batch without exceeding the
+/// command buffer.
+fn plan_full_batch_ranges(
+    query_words: &[usize],
+    min_batch: usize,
+    max_batch: usize,
+    max_words: usize,
+) -> Vec<std::ops::Range<usize>> {
+    if query_words.is_empty() || min_batch == 0 || min_batch > max_batch || max_words < 4 {
+        return Vec::new();
+    }
+    let n_query = query_words.len();
+    let mut covered = vec![0usize; n_query + 1];
+    let mut batches = vec![0usize; n_query + 1];
+    let mut take = vec![0usize; n_query];
+    for start in (0..n_query).rev() {
+        // Skipping this query is always a valid CPU-fallback plan.
+        covered[start] = covered[start + 1];
+        batches[start] = batches[start + 1];
+        let mut words = 4usize;
+        let limit = n_query.min(start.saturating_add(max_batch));
+        for end in start..limit {
+            let Some(next) = words.checked_add(query_words[end]) else {
+                break;
+            };
+            if next > max_words {
+                break;
+            }
+            words = next;
+            let len = end + 1 - start;
+            if len < min_batch {
+                continue;
+            }
+            let candidate_covered = len.saturating_add(covered[end + 1]);
+            let candidate_batches = 1usize.saturating_add(batches[end + 1]);
+            if candidate_covered > covered[start]
+                || candidate_covered == covered[start]
+                    && (candidate_batches < batches[start]
+                        || candidate_batches == batches[start] && len > take[start])
+            {
+                covered[start] = candidate_covered;
+                batches[start] = candidate_batches;
+                take[start] = len;
+            }
+        }
+    }
+
+    let mut ranges = Vec::with_capacity(batches[0]);
+    let mut start = 0usize;
+    while start < n_query {
+        let len = take[start];
+        if len == 0 {
+            start += 1;
+        } else {
+            ranges.push(start..start + len);
+            start += len;
+        }
+    }
+    ranges
+}
+
+/// Cache the resident partition once per live frame solver while one
+/// propagation pass is being planned. `incremental_resident_partition`
+/// returns owned clause vectors, so invoking it for every query turns a cheap
+/// compatibility check into repeated copies of the complete transition CNF.
+struct BatchedSolverContext {
+    solver_addr: usize,
+    n_var: u32,
+    frame: u32,
+    trans: Vec<logicrs::LitVec>,
+    lemmas: Vec<logicrs::LitVec>,
+    lemma_words: usize,
+    shared: Option<ShadowContext>,
+    exact: Option<ShadowContext>,
+}
+
+impl BatchedSolverContext {
+    fn new(solver: &DagCnfSolver) -> Self {
+        let (n_var, frame, trans, lemmas) = solver.incremental_resident_partition();
+        let lemma_words = lemmas.iter().fold(0usize, |total, clause| {
+            total.saturating_add(1usize.saturating_add(clause.len()))
+        });
+        Self {
+            solver_addr: std::ptr::from_ref(solver) as usize,
+            n_var,
+            frame,
+            trans,
+            lemmas,
+            lemma_words,
+            shared: None,
+            exact: None,
+        }
+    }
+
+    fn query_plan(
+        &self,
+        query: &IncrementalQuery,
+        prefer_query_lemmas: bool,
+    ) -> Option<(bool, usize)> {
+        let base_words = query_request_words(query)?;
+        let expanded_words = base_words.checked_add(self.lemma_words);
+        let use_query_lemmas = prefer_query_lemmas
+            && expanded_words
+                .and_then(|words| words.checked_add(4))
+                .is_some_and(|total| total <= KERNEL_MAX_REQUEST_WORDS)
+            && expanded_words.is_some_and(|words| words <= query_lemma_word_limit());
+        Some((
+            use_query_lemmas,
+            if use_query_lemmas {
+                // The fit checks above prove this branch has a value.
+                expanded_words.unwrap_or(base_words)
+            } else {
+                base_words
+            },
+        ))
+    }
+
+    fn prepare_query(
+        &self,
+        mut query: IncrementalQuery,
+        use_query_lemmas: bool,
+    ) -> IncrementalQuery {
+        if use_query_lemmas {
+            query.constraints.extend(self.lemmas.iter().cloned());
+        }
+        query
+    }
+
+    fn context(&mut self, use_query_lemmas: bool) -> &ShadowContext {
+        if use_query_lemmas {
+            self.shared.get_or_insert_with(|| ShadowContext {
+                n_var: self.n_var,
+                clauses: self
+                    .trans
+                    .iter()
+                    .cloned()
+                    .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+                    .collect(),
+            })
+        } else {
+            self.exact.get_or_insert_with(|| ShadowContext {
+                n_var: self.n_var,
+                clauses: self
+                    .trans
+                    .iter()
+                    .cloned()
+                    .chain(self.lemmas.iter().cloned())
+                    .map(|literals| ResidentClause::new(self.frame, self.frame, literals))
+                    .collect(),
+            })
+        }
+    }
+}
+
+fn batched_solver_cache_index(
+    caches: &mut Vec<BatchedSolverContext>,
+    solver: &DagCnfSolver,
+) -> usize {
+    let solver_addr = std::ptr::from_ref(solver) as usize;
+    caches
+        .iter()
+        .position(|cache| cache.solver_addr == solver_addr)
+        .unwrap_or_else(|| {
+            caches.push(BatchedSolverContext::new(solver));
+            caches.len() - 1
+        })
 }
 
 /// Keep the transition relation resident and encode this frame's permanent
@@ -1495,12 +1734,16 @@ fn measure_paired_preflight(
 
 fn measure_reference_cpu(
     requests: &[(&DagCnfSolver, IncrementalQuery)],
+    selected: &[bool],
     apply_paired_filter: bool,
 ) -> Vec<PairedCpuWork> {
     requests
         .iter()
-        .map(|(solver, query)| {
-            if apply_paired_filter && !paired_static_selected(query) {
+        .enumerate()
+        .map(|(index, (solver, query))| {
+            if !selected.get(index).copied().unwrap_or(false)
+                || apply_paired_filter && !paired_static_selected(query)
+            {
                 return PairedCpuWork::default();
             }
             // Clone before starting the timer: the comparison is the work of
@@ -1873,43 +2116,88 @@ pub fn solve_active_batch(
         ACTIVE_SKIPPED_SMALL_BATCH.fetch_add(selected_count as u64, Ordering::Relaxed);
         return output;
     }
+    struct Group {
+        context: ShadowContext,
+        pending: Vec<(usize, IncrementalQuery)>,
+        batches: Vec<std::ops::Range<usize>>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut caches = Vec::new();
+    let prefer_query_lemmas = !active_resident_lemmas();
+    for (index, (solver, query)) in requests.iter().enumerate() {
+        if !selected[index] {
+            continue;
+        }
+        let cache_index = batched_solver_cache_index(&mut caches, solver);
+        let Some((use_query_lemmas, query_words)) =
+            caches[cache_index].query_plan(query, prefer_query_lemmas)
+        else {
+            ACTIVE_ERROR.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if query_words
+            .checked_add(4)
+            .is_none_or(|words| words > KERNEL_MAX_REQUEST_WORDS)
+        {
+            ACTIVE_ERROR.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let query = caches[cache_index].prepare_query(query.clone(), use_query_lemmas);
+        let context = caches[cache_index].context(use_query_lemmas);
+        if let Some(group) = groups.iter_mut().find(|group| &group.context == context) {
+            group.pending.push((index, query));
+        } else {
+            groups.push(Group {
+                context: context.clone(),
+                pending: vec![(index, query)],
+                batches: Vec::new(),
+            });
+        }
+    }
+
+    let mut planned = vec![false; requests.len()];
+    let mut planned_count = 0usize;
+    for group in &mut groups {
+        if pair_scheduler_enabled() {
+            schedule_query_pairs(&mut group.pending, |(_, query)| query);
+        }
+        let query_words: Vec<_> = group
+            .pending
+            .iter()
+            .map(|(_, query)| query_request_words(query).unwrap_or(KERNEL_MAX_REQUEST_WORDS))
+            .collect();
+        group.batches = plan_full_batch_ranges(
+            &query_words,
+            active_min_batch_size(),
+            active_batch_size(),
+            KERNEL_MAX_REQUEST_WORDS,
+        );
+        let group_planned: usize = group.batches.iter().map(|range| range.len()).sum();
+        ACTIVE_SKIPPED_SMALL_BATCH.fetch_add(
+            group.pending.len().saturating_sub(group_planned) as u64,
+            Ordering::Relaxed,
+        );
+        for range in &group.batches {
+            for (index, _) in &group.pending[range.clone()] {
+                planned[*index] = true;
+            }
+        }
+        planned_count += group_planned;
+    }
+    groups.retain(|group| !group.batches.is_empty());
+    if planned_count == 0 {
+        ACTIVE_SKIPPED_PASSES.fetch_add(1, Ordering::Relaxed);
+        return output;
+    }
     ACTIVE_OFFERED_PASSES.fetch_add(1, Ordering::Relaxed);
-    ACTIVE_OFFERED.fetch_add(selected_count as u64, Ordering::Relaxed);
-    let reference_cpu = compare_cpu.then(|| measure_reference_cpu(&requests, paired));
+    ACTIVE_OFFERED.fetch_add(planned_count as u64, Ordering::Relaxed);
+    let reference_cpu =
+        compare_cpu.then(|| measure_reference_cpu(&requests, &planned, paired));
     if let Some(cpu) = reference_cpu.as_ref() {
         PAIRED_BASELINE_CPU_NS.fetch_add(
             cpu.iter().map(|work| work.elapsed_ns).sum(),
             Ordering::Relaxed,
         );
-    }
-
-    struct Group {
-        context: ShadowContext,
-        pending: Vec<(usize, IncrementalQuery)>,
-    }
-    let mut groups: Vec<Group> = Vec::new();
-    let prefer_query_lemmas = !active_resident_lemmas();
-    for (index, (solver, query)) in requests.into_iter().enumerate() {
-        if !selected[index] {
-            continue;
-        }
-        let (context, query, _) =
-            prepare_batched_query(solver, query, prefer_query_lemmas);
-        let fits = query_request_words(&query)
-            .and_then(|words| words.checked_add(4))
-            .is_some_and(|words| words <= KERNEL_MAX_REQUEST_WORDS);
-        if !fits {
-            ACTIVE_ERROR.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        if let Some(group) = groups.iter_mut().find(|group| group.context == context) {
-            group.pending.push((index, query));
-        } else {
-            groups.push(Group {
-                context,
-                pending: vec![(index, query)],
-            });
-        }
     }
 
     let state_wait_start = std::time::Instant::now();
@@ -1928,33 +2216,11 @@ pub fn solve_active_batch(
     };
     for mut group in groups {
         let mut context_load_ns = 0u64;
-        if pair_scheduler_enabled() {
-            schedule_query_pairs(&mut group.pending, |(_, query)| query);
-        }
         let mut context_ready = state.loaded_context.as_ref() == Some(&group.context);
-
-        let mut start = 0usize;
-        while start < group.pending.len() {
-            let mut words = 4usize;
-            let mut end = start;
-            while end < group.pending.len() && end - start < active_batch_size() {
-                let Some(query_words) = query_request_words(&group.pending[end].1) else {
-                    break;
-                };
-                let Some(next_words) = words.checked_add(query_words) else {
-                    break;
-                };
-                if next_words > KERNEL_MAX_REQUEST_WORDS {
-                    break;
-                }
-                words = next_words;
-                end += 1;
-            }
-            if end == start {
-                ACTIVE_ERROR.fetch_add(1, Ordering::Relaxed);
-                start += 1;
-                continue;
-            }
+        let batches = std::mem::take(&mut group.batches);
+        for range in batches {
+            let start = range.start;
+            let end = range.end;
             let queries: Vec<_> = group.pending[start..end]
                 .iter()
                 .map(|(_, query)| query.clone())
@@ -2020,7 +2286,6 @@ pub fn solve_active_batch(
                                 "inductor-cdcl: fallback context load failed: {error}"
                             );
                             ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
-                            start = end;
                             continue;
                         }
                         ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
@@ -2104,7 +2369,6 @@ pub fn solve_active_batch(
                     ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
                 }
             }
-            start = end;
         }
     }
     if paired {
@@ -2374,7 +2638,9 @@ pub fn flush_and_report() {
         let undersized = ACTIVE_SAMPLE_UNDERSIZED_REJECTED.load(Ordering::Relaxed);
         if sampled != 0 || undersized != 0 {
             eprintln!(
-                "inductor-cdcl: active CPU sample queries {}, mean total/clone/solve {:.3}/{:.3}/{:.3} us, solve threshold {:.3} us, FPGA/CPU batches {}/{}, FPGA retained {}, CPU rejected {}, undersized rejected {}",
+                "inductor-cdcl: active CPU sample compatible groups {}, planning {:.3} ms, queries {}, mean total/clone/solve {:.3}/{:.3}/{:.3} us, solve threshold {:.3} us, FPGA/CPU batches {}/{}, FPGA retained {}, CPU rejected {}, undersized rejected {}",
+                ACTIVE_SAMPLE_CONTEXT_GROUPS.load(Ordering::Relaxed),
+                ACTIVE_SAMPLE_PLAN_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
                 sampled,
                 ACTIVE_SAMPLE_NS.load(Ordering::Relaxed) as f64
                     / sampled.max(1) as f64
@@ -2452,6 +2718,29 @@ mod tests {
         assert!(!sample_keeps_fpga(
             &[250_000, 300_000], 16, 8, 200_000, false
         ));
+    }
+
+    #[test]
+    fn full_batch_planner_rebalances_and_drops_only_short_tails() {
+        assert_eq!(
+            plan_full_batch_ranges(&vec![1; 95], 32, 64, 32_768),
+            vec![0..63, 63..95]
+        );
+        assert_eq!(
+            plan_full_batch_ranges(&vec![1; 31], 32, 64, 32_768),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert_eq!(
+            plan_full_batch_ranges(&vec![1; 32], 32, 64, 32_768),
+            vec![0..32]
+        );
+        assert_eq!(
+            plan_full_batch_ranges(&[200, 10, 10], 2, 4, 100),
+            vec![1..3]
+        );
+        let capped = plan_full_batch_ranges(&vec![10; 12], 4, 8, 54);
+        assert_eq!(capped, vec![0..4, 4..8, 8..12]);
+        assert!(capped.iter().all(|range| range.len() >= 4));
     }
 
     #[test]
@@ -2654,6 +2943,15 @@ mod tests {
             .iter()
             .any(|clause| clause.as_slice() == [!a, b]));
 
+        let mut cache = BatchedSolverContext::new(&solver);
+        let (cached_uses_lemmas, cached_words) = cache.query_plan(&query, true).unwrap();
+        let cached_query = cache.prepare_query(query.clone(), cached_uses_lemmas);
+        let cached_context = cache.context(cached_uses_lemmas).clone();
+        assert!(cached_uses_lemmas);
+        assert_eq!(cached_words, query_request_words(&expanded).unwrap());
+        assert_eq!(cached_query.constraints, expanded.constraints);
+        assert_eq!(cached_context, shared);
+
         let (exact, unchanged, used) = prepare_batched_query(&solver, query.clone(), false);
         assert!(!used);
         assert_eq!(unchanged.constraints, query.constraints);
@@ -2665,6 +2963,20 @@ mod tests {
             .clauses
             .iter()
             .any(|clause| clause.literals.as_slice() == [!a, b]));
+
+        let mut later_solver = solver.clone();
+        later_solver.accel_level = 8;
+        later_solver.add_clause(&[a, !b]);
+        let mut later_query = query;
+        later_query.frame = 8;
+        let (later_shared, later_expanded, later_used) =
+            prepare_batched_query(&later_solver, later_query, true);
+        assert!(later_used);
+        assert_eq!(shared, later_shared);
+        assert!(later_expanded
+            .constraints
+            .iter()
+            .any(|clause| clause.as_slice() == [a, !b]));
     }
 
     #[test]
