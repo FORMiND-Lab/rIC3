@@ -18,6 +18,23 @@ pub const WANT_MODEL: u32 = 1 << 0;
 pub const WANT_CORE: u32 = 1 << 1;
 /// Retain bounded learnt clauses in this frame's resident context.
 pub const KEEP_LEARNTS: u32 = 1 << 2;
+/// Ask a diagnostic image to append per-stage entry counters.
+pub const WANT_STAGE_PROFILE: u32 = 1 << 3;
+
+pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
+pub const STAGE_PROFILE_VERSION: u32 = 1;
+pub const STAGE_PROFILE_COUNTERS: usize = 9;
+pub const STAGE_PROFILE_WORDS: usize = 3 + 2 * STAGE_PROFILE_COUNTERS;
+
+pub const PROFILE_SETUP: usize = 0;
+pub const PROFILE_ROOT: usize = 1;
+pub const PROFILE_PROPAGATE: usize = 2;
+pub const PROFILE_ANALYZE: usize = 3;
+pub const PROFILE_BACKTRACK: usize = 4;
+pub const PROFILE_LEARN: usize = 5;
+pub const PROFILE_DECIDE: usize = 6;
+pub const PROFILE_EMIT: usize = 7;
+pub const PROFILE_CLEANUP: usize = 8;
 
 pub const QUERY_HEADER_WORDS: usize = 8;
 pub const RESPONSE_HEADER_WORDS: usize = 9;

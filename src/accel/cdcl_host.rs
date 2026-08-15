@@ -4,7 +4,13 @@
 //! Transport or device failures become `Unknown(BackendError)` through the
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
-use super::cdcl::{BatchHeader, RESPONSE_HEADER_WORDS, Status, UnknownReason};
+use super::cdcl::{
+    BatchHeader, PROFILE_ANALYZE, PROFILE_BACKTRACK, PROFILE_CLEANUP,
+    PROFILE_DECIDE, PROFILE_EMIT, PROFILE_LEARN, PROFILE_PROPAGATE,
+    PROFILE_ROOT, PROFILE_SETUP, RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS,
+    STAGE_PROFILE_MAGIC, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
+    UnknownReason, WANT_STAGE_PROFILE,
+};
 use crate::gipsat::{
     BatchDecodeError, DagCnfSolver, IncrementalCdcl, IncrementalQuery, IncrementalResult,
     pack_batch, solve_on_cpu_after_hardware_unknown,
@@ -121,6 +127,7 @@ struct HardwareWork {
     conflicts: u64,
     propagations: u64,
     learnt_clauses: u64,
+    stage_entries: [u64; STAGE_PROFILE_COUNTERS],
 }
 
 fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<HardwareWork>> {
@@ -139,6 +146,7 @@ fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<Hard
             conflicts: u64::from(header[5]),
             propagations: u64::from(header[6]),
             learnt_clauses: u64::from(header[7]),
+            stage_entries: [0; STAGE_PROFILE_COUNTERS],
         });
         let payload_words = usize::try_from(header[2]).ok()?
             .checked_add(usize::try_from(header[3]).ok()?)?;
@@ -152,6 +160,68 @@ fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<Hard
     (offset == words.len()).then_some(records)
 }
 
+/// Validate a profiled variable-length response. The returned copy has its
+/// diagnostic trailers removed so the stable ABI-v1 semantic decoder remains
+/// unaware of profiling, while the work records retain all stage counters.
+fn decode_profiled_batch_wire(
+    words: &[u32],
+    n_queries: usize,
+) -> Option<(Vec<HardwareWork>, Vec<u32>)> {
+    let prefix = words.get(..4)?;
+    if usize::try_from(prefix[1]).ok()? != n_queries {
+        return None;
+    }
+    let result_words = usize::try_from(prefix[2]).ok()?;
+    if words.len() != 4usize.checked_add(result_words)? {
+        return None;
+    }
+    let mut records = Vec::with_capacity(n_queries);
+    let mut semantic = Vec::with_capacity(
+        words
+            .len()
+            .saturating_sub(n_queries.saturating_mul(STAGE_PROFILE_WORDS)),
+    );
+    semantic.extend_from_slice(prefix);
+    let mut offset = 4usize;
+    for _ in 0..n_queries {
+        let header = words.get(offset..offset.checked_add(RESPONSE_HEADER_WORDS)?)?;
+        let mut work = HardwareWork {
+            status: header[0],
+            reason: header[1],
+            decisions: u64::from(header[4]),
+            conflicts: u64::from(header[5]),
+            propagations: u64::from(header[6]),
+            learnt_clauses: u64::from(header[7]),
+            stage_entries: [0; STAGE_PROFILE_COUNTERS],
+        };
+        let payload_words = usize::try_from(header[2]).ok()?
+            .checked_add(usize::try_from(header[3]).ok()?)?;
+        let semantic_end = offset
+            .checked_add(RESPONSE_HEADER_WORDS)?
+            .checked_add(payload_words)?;
+        semantic.extend_from_slice(words.get(offset..semantic_end)?);
+        offset = semantic_end;
+        let trailer = words.get(offset..offset.checked_add(STAGE_PROFILE_WORDS)?)?;
+        if trailer[0] != STAGE_PROFILE_MAGIC
+            || trailer[1] != STAGE_PROFILE_VERSION
+            || usize::try_from(trailer[2]).ok()? != STAGE_PROFILE_COUNTERS
+        {
+            return None;
+        }
+        for (stage, entries) in work.stage_entries.iter_mut().enumerate() {
+            let at = 3 + 2 * stage;
+            *entries = u64::from(trailer[at]) | (u64::from(trailer[at + 1]) << 32);
+        }
+        offset += STAGE_PROFILE_WORDS;
+        records.push(work);
+    }
+    if offset != words.len() {
+        return None;
+    }
+    semantic[2] = u32::try_from(semantic.len().checked_sub(4)?).ok()?;
+    Some((records, semantic))
+}
+
 fn sum_hardware_work(records: &[HardwareWork]) -> HardwareWork {
     records
         .iter()
@@ -161,24 +231,47 @@ fn sum_hardware_work(records: &[HardwareWork]) -> HardwareWork {
             total.conflicts = total.conflicts.saturating_add(work.conflicts);
             total.propagations = total.propagations.saturating_add(work.propagations);
             total.learnt_clauses = total.learnt_clauses.saturating_add(work.learnt_clauses);
+            for (sum, entries) in total.stage_entries.iter_mut().zip(work.stage_entries) {
+                *sum = sum.saturating_add(entries);
+            }
             total
         })
 }
 
 fn pack_batch_request(
     queries: &[IncrementalQuery],
+    want_stage_profile: bool,
 ) -> Result<(Vec<u32>, usize), HardwareError> {
     let result_words = queries
         .iter()
         .try_fold(0usize, |total, query| {
+            let record = RESPONSE_HEADER_WORDS
+                .checked_add(query.domain.len().max(query.assumptions.len()))?
+                .checked_add(if want_stage_profile {
+                    STAGE_PROFILE_WORDS
+                } else {
+                    0
+                })?;
             total.checked_add(
-                RESPONSE_HEADER_WORDS + query.domain.len().max(query.assumptions.len()),
+                record,
             )
         })
         .ok_or(HardwareError::Capacity)?;
     let result_words_u32 =
         u32::try_from(result_words).map_err(|_| HardwareError::Capacity)?;
-    let (batch, payload) = pack_batch(queries, result_words_u32);
+    let (batch, mut payload) = pack_batch(queries, result_words_u32);
+    if want_stage_profile {
+        let mut offset = 0usize;
+        for query in queries {
+            payload[offset + 2] |= WANT_STAGE_PROFILE;
+            offset = offset
+                .checked_add(query_request_words(query).ok_or(HardwareError::Capacity)?)
+                .ok_or(HardwareError::Capacity)?;
+        }
+        if offset != payload.len() {
+            return Err(HardwareError::InvalidContext);
+        }
+    }
     let mut request = Vec::with_capacity(4 + payload.len());
     let BatchHeader {
         version,
@@ -198,11 +291,12 @@ fn pack_load_context_and_batch_request(
     n_var: u32,
     clauses: &[ResidentClause],
     queries: &[IncrementalQuery],
+    want_stage_profile: bool,
 ) -> Result<(Vec<u32>, usize), HardwareError> {
     let n_clause = u32::try_from(clauses.len()).map_err(|_| HardwareError::Capacity)?;
     let context = pack_clauses(&[n_var, n_clause], n_var, clauses)?;
     let context_words = u32::try_from(context.len()).map_err(|_| HardwareError::Capacity)?;
-    let (batch, response_capacity) = pack_batch_request(queries)?;
+    let (batch, response_capacity) = pack_batch_request(queries, want_stage_profile)?;
     let capacity = 1usize
         .checked_add(context.len())
         .and_then(|words| words.checked_add(batch.len()))
@@ -219,6 +313,7 @@ pub struct HardwareCdcl {
     n_var: u32,
     last_batch_work: HardwareWork,
     last_batch_records: Vec<HardwareWork>,
+    stage_profile: bool,
 }
 
 impl HardwareCdcl {
@@ -244,6 +339,7 @@ impl HardwareCdcl {
                 n_var: 0,
                 last_batch_work: HardwareWork::default(),
                 last_batch_records: Vec::new(),
+                stage_profile: stage_profile_enabled(),
             })
         }
         #[cfg(not(has_cdcl_accel))]
@@ -338,7 +434,7 @@ impl HardwareCdcl {
         if self.n_var == 0 {
             return Err(HardwareError::InvalidContext);
         }
-        let (request, response_capacity) = pack_batch_request(queries)?;
+        let (request, response_capacity) = pack_batch_request(queries, self.stage_profile)?;
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
         #[cfg(has_cdcl_accel)]
@@ -386,7 +482,9 @@ impl HardwareCdcl {
         self.last_batch_work = HardwareWork::default();
         self.last_batch_records.clear();
         let (request, response_capacity) =
-            pack_load_context_and_batch_request(n_var, clauses, queries)?;
+            pack_load_context_and_batch_request(
+                n_var, clauses, queries, self.stage_profile,
+            )?;
         profile_resident_context(n_var, clauses);
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
@@ -431,9 +529,16 @@ impl HardwareCdcl {
         queries: &[IncrementalQuery],
         response: &[u32],
     ) -> Result<Vec<IncrementalResult>, HardwareError> {
-        let results = decode_batch_results(queries, response).map_err(HardwareError::Decode)?;
-        self.last_batch_records = decode_batch_work_records(response, queries.len())
-            .ok_or(HardwareError::Decode(BatchDecodeError::InvalidResultShape))?;
+        let results = if self.stage_profile {
+            let (records, semantic) = decode_profiled_batch_wire(response, queries.len())
+                .ok_or(HardwareError::Decode(BatchDecodeError::InvalidResultShape))?;
+            self.last_batch_records = records;
+            decode_batch_results(queries, &semantic).map_err(HardwareError::Decode)?
+        } else {
+            self.last_batch_records = decode_batch_work_records(response, queries.len())
+                .ok_or(HardwareError::Decode(BatchDecodeError::InvalidResultShape))?;
+            decode_batch_results(queries, response).map_err(HardwareError::Decode)?
+        };
         self.last_batch_work = sum_hardware_work(&self.last_batch_records);
         Ok(results)
     }
@@ -680,6 +785,11 @@ fn profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("INDUCTOR_CDCL_PROFILE").is_ok())
 }
 
+fn stage_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("INDUCTOR_CDCL_STAGE_PROFILE").is_ok())
+}
+
 fn profile_every_batch() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("INDUCTOR_CDCL_PROFILE_EVERY_BATCH").is_ok())
@@ -741,6 +851,32 @@ fn profile_resident_context(n_var: u32, clauses: &[ResidentClause]) {
 /// opt-in sizing probe for low-budget/lightweight lanes; it has no scheduling
 /// or proof effect.
 fn profile_hardware_batch(queries: &[IncrementalQuery], work: &[HardwareWork]) {
+    if stage_profile_enabled() && queries.len() == work.len() {
+        for (batch_index, (query, work)) in queries.iter().zip(work).enumerate() {
+            let entries = &work.stage_entries;
+            let total = entries.iter().copied().fold(0u64, u64::saturating_add);
+            eprintln!(
+                "inductor-cdcl-stage: batch-index {} frame {} status {} reason {} assumptions {} constraints {} domain {} total-entries {} setup {} root {} propagate {} analyze {} backtrack {} learn {} decide {} emit {} cleanup {}",
+                batch_index,
+                query.frame,
+                work.status,
+                work.reason,
+                query.assumptions.len(),
+                query.constraints.len(),
+                query.domain.len(),
+                total,
+                entries[PROFILE_SETUP],
+                entries[PROFILE_ROOT],
+                entries[PROFILE_PROPAGATE],
+                entries[PROFILE_ANALYZE],
+                entries[PROFILE_BACKTRACK],
+                entries[PROFILE_LEARN],
+                entries[PROFILE_DECIDE],
+                entries[PROFILE_EMIT],
+                entries[PROFILE_CLEANUP],
+            );
+        }
+    }
     if !profile_enabled() || queries.len() != work.len() {
         return;
     }
@@ -2324,10 +2460,13 @@ mod tests {
         query.domain = vec![Var::from(0)];
         let queries = [query];
         let context = pack_clauses(&[1, 1], 1, &clauses).unwrap();
-        let (batch, response_capacity) = pack_batch_request(&queries).unwrap();
+        let (batch, response_capacity) = pack_batch_request(&queries, false).unwrap();
+        let (profile_batch, profile_capacity) = pack_batch_request(&queries, true).unwrap();
         let (combined, combined_capacity) =
-            pack_load_context_and_batch_request(1, &clauses, &queries).unwrap();
+            pack_load_context_and_batch_request(1, &clauses, &queries, false).unwrap();
 
+        assert_eq!(profile_batch[4 + 2] & WANT_STAGE_PROFILE, WANT_STAGE_PROFILE);
+        assert_eq!(profile_capacity, response_capacity + STAGE_PROFILE_WORDS);
         assert_eq!(combined[0] as usize, context.len());
         assert_eq!(&combined[1..1 + context.len()], context.as_slice());
         assert_eq!(&combined[1 + context.len()..], batch.as_slice());
@@ -2372,6 +2511,7 @@ mod tests {
                     conflicts: 6,
                     propagations: 7,
                     learnt_clauses: 8,
+                    stage_entries: [0; STAGE_PROFILE_COUNTERS],
                 },
                 HardwareWork {
                     status: 2,
@@ -2380,6 +2520,7 @@ mod tests {
                     conflicts: 12,
                     propagations: 13,
                     learnt_clauses: 14,
+                    stage_entries: [0; STAGE_PROFILE_COUNTERS],
                 },
             ]
         );
@@ -2394,6 +2535,44 @@ mod tests {
             }
         );
         assert_eq!(decode_batch_work_records(&words[..22], 2), None);
+    }
+
+    #[test]
+    fn stage_profile_trailer_is_validated_and_stripped() {
+        let mut words = vec![
+            super::super::cdcl::ABI_VERSION,
+            1,
+            (RESPONSE_HEADER_WORDS + 1 + STAGE_PROFILE_WORDS) as u32,
+            0,
+            Status::Sat as u32,
+            0,
+            1,
+            0,
+            2,
+            3,
+            4,
+            5,
+            0,
+            42,
+            STAGE_PROFILE_MAGIC,
+            STAGE_PROFILE_VERSION,
+            STAGE_PROFILE_COUNTERS as u32,
+        ];
+        for stage in 0..STAGE_PROFILE_COUNTERS {
+            let entries = (stage as u64 + 1) << 32 | (100 + stage as u64);
+            words.push(entries as u32);
+            words.push((entries >> 32) as u32);
+        }
+        let (records, semantic) = decode_profiled_batch_wire(&words, 1).unwrap();
+        assert_eq!(records[0].stage_entries[PROFILE_SETUP], (1u64 << 32) | 100);
+        assert_eq!(
+            records[0].stage_entries[PROFILE_CLEANUP],
+            (STAGE_PROFILE_COUNTERS as u64) << 32 | 108,
+        );
+        assert_eq!(semantic[2], (RESPONSE_HEADER_WORDS + 1) as u32);
+        assert_eq!(semantic.len(), 4 + RESPONSE_HEADER_WORDS + 1);
+        words[14] ^= 1;
+        assert_eq!(decode_profiled_batch_wire(&words, 1), None);
     }
 
     #[test]
