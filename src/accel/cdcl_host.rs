@@ -773,6 +773,21 @@ static ACTIVE_PUSH_PREFETCH_USED_BY_LEN: [AtomicU64; 5] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
+static ACTIVE_MIC_BATCH_WAVES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_QUERIES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_SAT: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_UNSAT: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_SAT_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_UNSAT_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_INVALIDATED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_ECON_PROBES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_ECON_OFFLOADS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_ECON_REJECTS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_ECON_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_ECON_HW_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_ECON_HW_VALID: AtomicBool = AtomicBool::new(false);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -2100,6 +2115,42 @@ pub fn push_prefetch_enabled() -> bool {
         })
 }
 
+/// Speculate over the first inductiveness check for several literal-drop
+/// candidates from the same MIC cube. This is deliberately opt-in while the
+/// proof-path effect is measured: all answers still cross the live GipSAT
+/// model/core validation boundary before they can affect generalization.
+pub fn mic_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        active_enabled()
+            && std::env::var("INDUCTOR_CDCL_MIC_BATCH")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
+pub fn mic_batch_min_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_BATCH_MIN")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, DEFAULT_SHADOW_BATCH_SIZE)
+    })
+}
+
+pub fn mic_batch_window() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_BATCH_WINDOW")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SHADOW_BATCH_SIZE)
+            .clamp(1, DEFAULT_SHADOW_BATCH_SIZE)
+    })
+}
+
 /// Whether IC3 should speculate over the currently queued proof obligations.
 /// Every consumed answer is checked again against the live frame.
 pub fn block_batch_enabled() -> bool {
@@ -2230,6 +2281,17 @@ fn flush_batch_locked(state: &mut ShadowState, batch_index: usize) {
 pub fn solve_active_batch(
     requests: Vec<(&DagCnfSolver, IncrementalQuery)>,
 ) -> Vec<IncrementalResult> {
+    solve_active_batch_with_min(requests, active_min_batch_size())
+}
+
+/// Variant used by an explicitly enabled producer whose independent wave has
+/// a different measured crossover from propagation. Context partitioning and
+/// command-size planning still enforce this minimum for every device batch.
+pub fn solve_active_batch_with_min(
+    requests: Vec<(&DagCnfSolver, IncrementalQuery)>,
+    min_batch_size: usize,
+) -> Vec<IncrementalResult> {
+    let min_batch_size = min_batch_size.clamp(1, DEFAULT_SHADOW_BATCH_SIZE);
     let unknown = IncrementalResult::Unknown(super::cdcl::UnknownReason::BackendError);
     let mut output = vec![unknown.clone(); requests.len()];
     if requests.is_empty() || !(active_enabled() || paired_enabled()) {
@@ -2259,7 +2321,7 @@ pub fn solve_active_batch(
         requests.len().saturating_sub(selected_count) as u64,
         Ordering::Relaxed,
     );
-    if selected_count < active_min_batch_size() {
+    if selected_count < min_batch_size {
         ACTIVE_SKIPPED_PASSES.fetch_add(1, Ordering::Relaxed);
         ACTIVE_SKIPPED_SMALL_BATCH.fetch_add(selected_count as u64, Ordering::Relaxed);
         return output;
@@ -2316,7 +2378,7 @@ pub fn solve_active_batch(
             .collect();
         group.batches = plan_full_batch_ranges(
             &query_words,
-            active_min_batch_size(),
+            min_batch_size,
             active_batch_size(),
             KERNEL_MAX_REQUEST_WORDS,
         );
@@ -2582,6 +2644,65 @@ pub fn note_active_unsat_core(
 
 pub fn note_active_cpu_fallback() {
     ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_mic_wave(results: &[IncrementalResult]) {
+    ACTIVE_MIC_BATCH_WAVES.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_MIC_BATCH_QUERIES.fetch_add(results.len() as u64, Ordering::Relaxed);
+    for result in results {
+        match result {
+            IncrementalResult::Sat { .. } => {
+                ACTIVE_MIC_BATCH_SAT.fetch_add(1, Ordering::Relaxed);
+            }
+            IncrementalResult::Unsat { .. } => {
+                ACTIVE_MIC_BATCH_UNSAT.fetch_add(1, Ordering::Relaxed);
+            }
+            IncrementalResult::Unknown(_) => {
+                ACTIVE_MIC_BATCH_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub fn note_active_mic_consumed(unsat: bool, accepted: bool) {
+    if accepted {
+        if unsat {
+            ACTIVE_MIC_BATCH_UNSAT_USED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ACTIVE_MIC_BATCH_SAT_USED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        ACTIVE_MIC_BATCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_active_mic_invalidated(count: usize) {
+    if count == 0 {
+        return;
+    }
+    ACTIVE_MIC_BATCH_INVALIDATED.fetch_add(count as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_mic_batch_economics(
+    projected_cpu_ns: u64,
+    projected_hardware_ns: Option<u64>,
+    probe: bool,
+    selected: bool,
+) {
+    ACTIVE_MIC_BATCH_ECON_CPU_NS.store(projected_cpu_ns, Ordering::Relaxed);
+    ACTIVE_MIC_BATCH_ECON_HW_NS.store(
+        projected_hardware_ns.unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    ACTIVE_MIC_BATCH_ECON_HW_VALID
+        .store(projected_hardware_ns.is_some(), Ordering::Relaxed);
+    if probe {
+        ACTIVE_MIC_BATCH_ECON_PROBES.fetch_add(1, Ordering::Relaxed);
+    } else if selected {
+        ACTIVE_MIC_BATCH_ECON_OFFLOADS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_MIC_BATCH_ECON_REJECTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn note_active_block_cost_rejected() {
@@ -3101,6 +3222,33 @@ pub fn flush_and_report() {
             ACTIVE_PUSH_PREFETCH_EVAL_QUERIES.load(Ordering::Relaxed),
             ACTIVE_PUSH_PREFETCH_SKIPPED_LONG.load(Ordering::Relaxed),
             ACTIVE_PUSH_PREFETCH_SKIPPED_CONTEXT.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "inductor-cdcl: active MIC waves/queries {}/{}, SAT/UNSAT/UNKNOWN {}/{}/{}, used SAT/UNSAT {}/{}, rejected {}, invalidated {}",
+            ACTIVE_MIC_BATCH_WAVES.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_QUERIES.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_SAT.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_UNSAT.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_UNKNOWN.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_SAT_USED.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_UNSAT_USED.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_REJECTED.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_INVALIDATED.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "inductor-cdcl: active MIC economics probes/offloads/rejects {}/{}/{}, projected replaceable CPU/HW {:.3}/{}",
+            ACTIVE_MIC_BATCH_ECON_PROBES.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_ECON_OFFLOADS.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_ECON_REJECTS.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_ECON_CPU_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            if ACTIVE_MIC_BATCH_ECON_HW_VALID.load(Ordering::Relaxed) {
+                format!(
+                    "{:.3} ms",
+                    ACTIVE_MIC_BATCH_ECON_HW_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0
+                )
+            } else {
+                "untrained".to_string()
+            },
         );
         eprintln!(
             "inductor-cdcl: active block preflight conclusive/selected/fallback {}/{}/{}, wave reserved/taken {}/{}",

@@ -1,10 +1,14 @@
 use super::IC3;
-use crate::{ic3::IC3Config, transys::TransysIf};
+use crate::{
+    gipsat::{IncrementalQuery, IncrementalResult},
+    ic3::IC3Config,
+    transys::TransysIf,
+};
 use giputils::hash::GHashSet;
 use log::trace;
 use logicrs::{Lit, LitOrdVec, LitVec, satif::Satif};
 use rand::{RngExt, seq::SliceRandom};
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DropVarParameter {
@@ -35,6 +39,226 @@ pub enum MicType {
     DropVar(DropVarParameter),
 }
 
+struct MicDropPrefetch {
+    candidate_index: usize,
+    query: IncrementalQuery,
+    result: IncrementalResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MicBatchRoute {
+    Reject,
+    Probe,
+    Offload,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MicHardwareSample {
+    service_per_query_ns: u64,
+    unsat_percent: u64,
+}
+
+#[derive(Default)]
+pub(super) struct MicBatchPolicy {
+    cpu_samples_ns: VecDeque<u64>,
+    hardware_samples: VecDeque<MicHardwareSample>,
+    cpu_since_probe: usize,
+}
+
+impl MicBatchPolicy {
+    fn economics_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_BATCH_ECONOMICS")
+                .ok()
+                .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        })
+    }
+
+    fn cpu_window() -> usize {
+        use std::sync::OnceLock;
+        static WINDOW: OnceLock<usize> = OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_BATCH_CPU_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(128)
+                .clamp(8, 4096)
+        })
+    }
+
+    fn min_cpu_samples() -> usize {
+        use std::sync::OnceLock;
+        static SAMPLES: OnceLock<usize> = OnceLock::new();
+        *SAMPLES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_BATCH_CPU_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8)
+                .clamp(1, Self::cpu_window())
+        })
+    }
+
+    fn hardware_window() -> usize {
+        use std::sync::OnceLock;
+        static WINDOW: OnceLock<usize> = OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_BATCH_HW_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8)
+                .clamp(1, 64)
+        })
+    }
+
+    fn min_hardware_samples() -> usize {
+        use std::sync::OnceLock;
+        static SAMPLES: OnceLock<usize> = OnceLock::new();
+        *SAMPLES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_BATCH_HW_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2)
+                .clamp(1, Self::hardware_window())
+        })
+    }
+
+    fn speedup_percent() -> u64 {
+        use std::sync::OnceLock;
+        static PERCENT: OnceLock<u64> = OnceLock::new();
+        *PERCENT.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_BATCH_SPEEDUP_PCT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(125)
+                .clamp(100, 10_000)
+        })
+    }
+
+    fn reprobe_cpu_queries() -> usize {
+        use std::sync::OnceLock;
+        static QUERIES: OnceLock<usize> = OnceLock::new();
+        *QUERIES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_BATCH_REPROBE_CPU_QUERIES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(65_536)
+                .clamp(1, 1 << 24)
+        })
+    }
+
+    fn lower_median(values: impl Iterator<Item = u64>) -> Option<u64> {
+        let mut values: Vec<_> = values.collect();
+        values.sort_unstable();
+        values.get(values.len().saturating_sub(1) / 2).copied()
+    }
+
+    fn route(&self, queries: usize) -> (MicBatchRoute, u64, Option<u64>) {
+        if !Self::economics_enabled() {
+            return (MicBatchRoute::Offload, 0, None);
+        }
+        self.route_at(
+            queries,
+            Self::min_cpu_samples(),
+            Self::min_hardware_samples(),
+            Self::reprobe_cpu_queries(),
+            Self::speedup_percent(),
+        )
+    }
+
+    fn route_at(
+        &self,
+        queries: usize,
+        min_cpu_samples: usize,
+        min_hardware_samples: usize,
+        reprobe_cpu_queries: usize,
+        speedup_percent: u64,
+    ) -> (MicBatchRoute, u64, Option<u64>) {
+        let Some(cpu_per_query_ns) = (self.cpu_samples_ns.len() >= min_cpu_samples)
+            .then(|| Self::lower_median(self.cpu_samples_ns.iter().copied()))
+            .flatten()
+        else {
+            return (MicBatchRoute::Reject, 0, None);
+        };
+        if self.hardware_samples.len() < min_hardware_samples {
+            return (
+                MicBatchRoute::Probe,
+                cpu_per_query_ns.saturating_mul(queries as u64),
+                None,
+            );
+        }
+        let Some(service_per_query_ns) =
+            Self::lower_median(self.hardware_samples.iter().map(|sample| {
+                sample.service_per_query_ns
+            }))
+        else {
+            return (
+                MicBatchRoute::Probe,
+                cpu_per_query_ns.saturating_mul(queries as u64),
+                None,
+            );
+        };
+        let unsat_percent = Self::lower_median(
+            self.hardware_samples
+                .iter()
+                .map(|sample| sample.unsat_percent),
+        )
+        .unwrap_or(0);
+        // Only an UNSAT answer can currently replace the native MIC query.
+        // Using all FPGA UNSAT answers as potentially useful is deliberately
+        // optimistic; invalidated answers make the real crossover stricter.
+        let projected_cpu_ns = cpu_per_query_ns
+            .saturating_mul(queries as u64)
+            .saturating_mul(unsat_percent)
+            / 100;
+        let projected_hardware_ns = service_per_query_ns.saturating_mul(queries as u64);
+        if projected_cpu_ns.saturating_mul(100)
+            >= projected_hardware_ns.saturating_mul(speedup_percent)
+        {
+            (
+                MicBatchRoute::Offload,
+                projected_cpu_ns,
+                Some(projected_hardware_ns),
+            )
+        } else if self.cpu_since_probe >= reprobe_cpu_queries {
+            (
+                MicBatchRoute::Probe,
+                projected_cpu_ns,
+                Some(projected_hardware_ns),
+            )
+        } else {
+            (
+                MicBatchRoute::Reject,
+                projected_cpu_ns,
+                Some(projected_hardware_ns),
+            )
+        }
+    }
+
+    fn note_cpu(&mut self, elapsed_ns: u64) {
+        if self.cpu_samples_ns.len() == Self::cpu_window() {
+            self.cpu_samples_ns.pop_front();
+        }
+        self.cpu_samples_ns.push_back(elapsed_ns);
+        self.cpu_since_probe = self.cpu_since_probe.saturating_add(1);
+    }
+
+    fn note_hardware(&mut self, queries: u64, service_ns: u64, unsat: u64) {
+        self.cpu_since_probe = 0;
+        if queries == 0 || service_ns == 0 {
+            return;
+        }
+        if self.hardware_samples.len() == Self::hardware_window() {
+            self.hardware_samples.pop_front();
+        }
+        self.hardware_samples.push_back(MicHardwareSample {
+            service_per_query_ns: service_ns.div_ceil(queries),
+            unsat_percent: unsat.min(queries).saturating_mul(100) / queries,
+        });
+    }
+}
+
 impl MicType {
     pub fn from_config(cfg: &IC3Config) -> Self {
         let p = if cfg.ctg {
@@ -51,6 +275,140 @@ impl MicType {
 }
 
 impl IC3 {
+    fn launch_mic_drop_wave(
+        &mut self,
+        frame: usize,
+        cube: &LitVec,
+        keep: &GHashSet<Lit>,
+        constraint: &[LitVec],
+        parameter_level: usize,
+        start: usize,
+    ) -> Vec<MicDropPrefetch> {
+        if !crate::accel::cdcl_host::mic_batch_enabled() {
+            return Vec::new();
+        }
+        let window = crate::accel::cdcl_host::mic_batch_window();
+        let mut candidates = Vec::new();
+        for candidate_index in start..cube.len() {
+            if keep.contains(&cube[candidate_index]) {
+                continue;
+            }
+            let mut removed_cube = cube.clone();
+            removed_cube.remove(candidate_index);
+            let query = self.solvers[frame - 1].incremental_inductive_query(
+                &removed_cube,
+                true,
+                if parameter_level == 0 {
+                    constraint.to_vec()
+                } else {
+                    Vec::new()
+                },
+            );
+            candidates.push((candidate_index, query));
+            if candidates.len() == window {
+                break;
+            }
+        }
+        let min_batch = crate::accel::cdcl_host::mic_batch_min_size();
+        if candidates.len() < min_batch {
+            return Vec::new();
+        }
+
+        let (route, projected_cpu_ns, projected_hardware_ns) =
+            self.mic_batch_policy.route(candidates.len());
+        crate::accel::cdcl_host::note_active_mic_batch_economics(
+            projected_cpu_ns,
+            projected_hardware_ns,
+            route == MicBatchRoute::Probe,
+            route == MicBatchRoute::Offload,
+        );
+        if route == MicBatchRoute::Reject {
+            return Vec::new();
+        }
+
+        let owned_solver = self.solvers[frame - 1].dcs.clone();
+        let requests = candidates
+            .iter()
+            .map(|(_, query)| (&owned_solver, query.clone()))
+            .collect();
+        let service_before = crate::accel::cdcl_host::active_batch_service_snapshot();
+        let results = crate::accel::cdcl_host::solve_active_batch_with_min(requests, min_batch);
+        let service_after = crate::accel::cdcl_host::active_batch_service_snapshot();
+        let hardware_unsat = results
+            .iter()
+            .filter(|result| matches!(result, IncrementalResult::Unsat { .. }))
+            .count() as u64;
+        self.mic_batch_policy.note_hardware(
+            service_after.1.saturating_sub(service_before.1),
+            service_after.2.saturating_sub(service_before.2),
+            hardware_unsat,
+        );
+        crate::accel::cdcl_host::note_active_mic_wave(&results);
+        if route == MicBatchRoute::Probe {
+            // Calibration must be proof-neutral. Even a valid core can send
+            // IC3 down a different and much longer path, so a probe measures
+            // service/yield only and never exposes its answers to MIC.
+            crate::accel::cdcl_host::note_active_mic_invalidated(results.len());
+            return Vec::new();
+        }
+        candidates
+            .into_iter()
+            .zip(results)
+            .map(|((candidate_index, query), result)| MicDropPrefetch {
+                candidate_index,
+                query,
+                result,
+            })
+            .collect()
+    }
+
+    fn consume_mic_drop_result(
+        &mut self,
+        frame: usize,
+        cube: &LitVec,
+        prefetched: &MicDropPrefetch,
+    ) -> Option<bool> {
+        match &prefetched.result {
+            IncrementalResult::Sat { .. } => {
+                // `down`/`ctg_down` feed the satisfying assignment into
+                // model-sensitive cube shrinking and predecessor lifting.
+                // The generic active-model importer is sufficient for a
+                // boolean blocked/not-blocked answer, but it has not proved
+                // equivalence to GipSAT's native model state for those later
+                // operations. Keep the complete FPGA SAT result observable,
+                // then rerun this inquiry on the live solver until that
+                // stronger state-transfer invariant has its own validator.
+                crate::accel::cdcl_host::note_active_cpu_fallback();
+                crate::accel::cdcl_host::note_active_mic_consumed(false, false);
+                None
+            }
+            IncrementalResult::Unsat { core, .. } => {
+                let validation_start = Instant::now();
+                let cpu_core_len = self.solvers[frame - 1].validate_incremental_unsat_core(
+                    cube,
+                    &prefetched.query,
+                    core,
+                );
+                crate::accel::cdcl_host::note_active_unsat_core(
+                    cpu_core_len.is_some(),
+                    prefetched.query.assumptions.len(),
+                    core.len(),
+                    cpu_core_len.unwrap_or(0),
+                    validation_start.elapsed().as_nanos() as u64,
+                );
+                crate::accel::cdcl_host::note_active_mic_consumed(
+                    true,
+                    cpu_core_len.is_some(),
+                );
+                cpu_core_len.map(|_| true)
+            }
+            IncrementalResult::Unknown(_) => {
+                crate::accel::cdcl_host::note_active_cpu_fallback();
+                None
+            }
+        }
+    }
+
     fn down(
         &mut self,
         frame: usize,
@@ -59,11 +417,16 @@ impl IC3 {
         full: &LitVec,
         constraint: &[LitVec],
         cex: &mut Vec<(LitOrdVec, LitOrdVec)>,
+        mut prefetched: Option<&MicDropPrefetch>,
+        measure_cpu: bool,
     ) -> Option<LitVec> {
         let mut cube = cube.clone();
         self.statistic.num_down += 1;
         loop {
             if self.tsctx.cube_subsume_init(&cube) {
+                if prefetched.take().is_some() {
+                    crate::accel::cdcl_host::note_active_mic_invalidated(1);
+                }
                 return None;
             }
             let lemma = LitOrdVec::new(cube.clone());
@@ -71,6 +434,9 @@ impl IC3 {
                 .iter()
                 .any(|(s, t)| !lemma.subsume(s) && lemma.subsume(t))
             {
+                if prefetched.take().is_some() {
+                    crate::accel::cdcl_host::note_active_mic_invalidated(1);
+                }
                 return None;
             }
             self.statistic.num_down_sat += 1;
@@ -216,18 +582,41 @@ impl IC3 {
                 crate::accel::observe_card_core_query(cube.len(), false);
             }
 
-            let blocked = self
-                .blocked(frame, &cube)
-                .in_phase(inductor_trace::Phase::Gen)
-                .with_act_order(false)
-                .with_strengthen()
-                .with_constraint(constraint)
-                .check();
-            crate::accel::observe_core_query(
-                cube.len(),
-                blocked,
-                self.solvers[frame - 1].dcs.probe.t_bcp_ns,
-            );
+            let active_answer = prefetched
+                .take()
+                .and_then(|answer| self.consume_mic_drop_result(frame, &cube, answer));
+            let used_prefetched = active_answer.is_some();
+            let blocked = match active_answer {
+                Some(blocked) => blocked,
+                None if measure_cpu => {
+                    let cpu_start = Instant::now();
+                    let blocked = self
+                        .blocked(frame, &cube)
+                        .in_phase(inductor_trace::Phase::Gen)
+                        .with_act_order(false)
+                        .with_strengthen()
+                        .with_constraint(constraint)
+                        .check();
+                    self.mic_batch_policy.note_cpu(
+                        cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                    blocked
+                }
+                None => self
+                    .blocked(frame, &cube)
+                    .in_phase(inductor_trace::Phase::Gen)
+                    .with_act_order(false)
+                    .with_strengthen()
+                    .with_constraint(constraint)
+                    .check(),
+            };
+            if !used_prefetched {
+                crate::accel::observe_core_query(
+                    cube.len(),
+                    blocked,
+                    self.solvers[frame - 1].dcs.probe.t_bcp_ns,
+                );
+            }
             if blocked {
                 return Some(self.solvers[frame - 1].inductive_core().unwrap());
             }
@@ -274,22 +663,46 @@ impl IC3 {
         keep: &GHashSet<Lit>,
         full: &LitVec,
         parameter: DropVarParameter,
+        mut prefetched: Option<&MicDropPrefetch>,
+        measure_cpu: bool,
     ) -> Option<LitVec> {
         let mut cube = cube.clone();
         self.statistic.num_down += 1;
         let mut ctg = 0;
         loop {
             if self.tsctx.cube_subsume_init(&cube) {
+                if prefetched.take().is_some() {
+                    crate::accel::cdcl_host::note_active_mic_invalidated(1);
+                }
                 return None;
             }
             self.statistic.num_down_sat += 1;
-            if self
-                .blocked(frame, &cube)
-                .in_phase(inductor_trace::Phase::Gen)
-                .with_act_order(false)
-                .with_strengthen()
-                .check()
-            {
+            let active_answer = prefetched
+                .take()
+                .and_then(|answer| self.consume_mic_drop_result(frame, &cube, answer));
+            let blocked = match active_answer {
+                Some(blocked) => blocked,
+                None if measure_cpu => {
+                    let cpu_start = Instant::now();
+                    let blocked = self
+                        .blocked(frame, &cube)
+                        .in_phase(inductor_trace::Phase::Gen)
+                        .with_act_order(false)
+                        .with_strengthen()
+                        .check();
+                    self.mic_batch_policy.note_cpu(
+                        cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                    blocked
+                }
+                None => self
+                    .blocked(frame, &cube)
+                    .in_phase(inductor_trace::Phase::Gen)
+                    .with_act_order(false)
+                    .with_strengthen()
+                    .check(),
+            };
+            if blocked {
                 return Some(self.solvers[frame - 1].inductive_core().unwrap());
             }
             for lit in cube.iter() {
@@ -392,6 +805,12 @@ impl IC3 {
             cube.sort_by_key(|x| parent.contains(x));
         }
         let mut keep = GHashSet::new();
+        // Cache this once per MIC.  The default CPU path must not repeatedly
+        // inspect the environment, clone the parent cube, time queries, or
+        // maintain experimental telemetry when the opt-in experiment is off.
+        let mic_batch_enabled = crate::accel::cdcl_host::mic_batch_enabled();
+        let mut prefetched_parent: Option<LitVec> = None;
+        let mut prefetched_wave = Vec::new();
 
         // Let the card run the drop loop first.
         //
@@ -449,16 +868,56 @@ impl IC3 {
                 i += 1;
                 continue;
             }
+            if mic_batch_enabled && prefetched_parent.as_ref() != Some(&cube) {
+                crate::accel::cdcl_host::note_active_mic_invalidated(prefetched_wave.len());
+                prefetched_wave = self.launch_mic_drop_wave(
+                    frame,
+                    &cube,
+                    &keep,
+                    constraint,
+                    parameter.level,
+                    i,
+                );
+                prefetched_parent = Some(cube.clone());
+            }
             let mut removed_cube = cube.clone();
             removed_cube.remove(i);
-            let mic = if parameter.level == 0 {
-                self.down(frame, &removed_cube, &keep, &cube, constraint, &mut cex)
+            let prefetched = if mic_batch_enabled {
+                prefetched_wave
+                    .iter()
+                    .position(|entry| entry.candidate_index == i)
+                    .map(|index| prefetched_wave.swap_remove(index))
             } else {
-                self.ctg_down(frame, &removed_cube, &keep, &cube, parameter)
+                None
+            };
+            let mic = if parameter.level == 0 {
+                self.down(
+                    frame,
+                    &removed_cube,
+                    &keep,
+                    &cube,
+                    constraint,
+                    &mut cex,
+                    prefetched.as_ref(),
+                    mic_batch_enabled,
+                )
+            } else {
+                self.ctg_down(
+                    frame,
+                    &removed_cube,
+                    &keep,
+                    &cube,
+                    parameter,
+                    prefetched.as_ref(),
+                    mic_batch_enabled,
+                )
             };
             if let Some(new_cube) = mic {
                 self.statistic.mic_drop.success();
                 (cube, i) = self.handle_down_success(frame, cube, i, new_cube);
+                crate::accel::cdcl_host::note_active_mic_invalidated(prefetched_wave.len());
+                prefetched_wave.clear();
+                prefetched_parent = None;
                 if parameter.level == 0 {
                     self.solvers[frame - 1].unset_domain();
                     self.solvers[frame - 1].set_domain(
@@ -475,6 +934,7 @@ impl IC3 {
                 i += 1;
             }
         }
+        crate::accel::cdcl_host::note_active_mic_invalidated(prefetched_wave.len());
         if parameter.level == 0 {
             self.solvers[frame - 1].unset_domain();
         }
@@ -497,5 +957,70 @@ impl IC3 {
         };
         trace!("mic from {} to {} len", mic_olen, r.len());
         r
+    }
+}
+
+#[cfg(test)]
+mod mic_batch_policy_tests {
+    use super::{MicBatchPolicy, MicBatchRoute};
+
+    fn cpu_trained() -> MicBatchPolicy {
+        let mut policy = MicBatchPolicy::default();
+        for _ in 0..8 {
+            policy.cpu_samples_ns.push_back(200_000);
+        }
+        policy
+    }
+
+    #[test]
+    fn mic_batch_economics_probes_once_then_rejects_slow_hardware() {
+        let mut policy = cpu_trained();
+        assert_eq!(
+            policy.route_at(16, 8, 1, 4096, 125).0,
+            MicBatchRoute::Probe
+        );
+        policy.note_hardware(16, 4_000_000, 8);
+        let evaluation = policy.route_at(16, 8, 1, 4096, 125);
+        assert_eq!(evaluation.0, MicBatchRoute::Reject);
+        assert_eq!(evaluation.1, 1_600_000);
+        assert_eq!(evaluation.2, Some(4_000_000));
+
+        policy.cpu_since_probe = 4096;
+        assert_eq!(
+            policy.route_at(16, 8, 1, 4096, 125).0,
+            MicBatchRoute::Probe
+        );
+    }
+
+    #[test]
+    fn mic_batch_economics_counts_only_replaceable_unsat_work() {
+        let mut profitable = cpu_trained();
+        profitable.note_hardware(16, 1_000_000, 16);
+        assert_eq!(
+            profitable.route_at(16, 8, 1, 4096, 125),
+            (MicBatchRoute::Offload, 3_200_000, Some(1_000_000))
+        );
+
+        let mut mostly_sat = cpu_trained();
+        mostly_sat.note_hardware(16, 1_000_000, 1);
+        assert_eq!(
+            mostly_sat.route_at(16, 8, 1, 4096, 125).0,
+            MicBatchRoute::Reject
+        );
+    }
+
+    #[test]
+    fn mic_batch_economics_keeps_calibration_proof_neutral_until_trained() {
+        let mut policy = cpu_trained();
+        policy.note_hardware(16, 4_000_000, 8);
+        assert_eq!(
+            policy.route_at(16, 8, 2, 4096, 125).0,
+            MicBatchRoute::Probe
+        );
+        policy.note_hardware(16, 4_000_000, 8);
+        assert_eq!(
+            policy.route_at(16, 8, 2, 4096, 125).0,
+            MicBatchRoute::Reject
+        );
     }
 }
