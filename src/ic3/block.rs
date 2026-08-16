@@ -1264,14 +1264,19 @@ impl IC3 {
         Some((state, vec![inputs]))
     }
 
-    fn pred_from_incremental_model(
+    pub(super) fn pred_from_incremental_model(
         &mut self,
         query: &IncrementalQuery,
         model: &[Lit],
     ) -> Option<(LitVec, Vec<LitVec>)> {
         let full = self.full_pred_from_incremental_model(model)?;
         let full_lits = full.0.len();
-        let attempted = BlockBatchCache::model_lift_enabled() && query.constraints.is_empty();
+        // Query-local clauses select the concrete witness but are not part of
+        // predecessor lifting. Native `get_pred` likewise proves only that a
+        // state/input premise implies the next-state assumptions through the
+        // transition relation, so the independent external-model check is
+        // valid even for strengthened MIC inquiries.
+        let attempted = BlockBatchCache::model_lift_enabled();
         let start = Instant::now();
         let lifted = attempted
             .then(|| {

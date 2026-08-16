@@ -43,6 +43,15 @@ struct MicDropPrefetch {
     candidate_index: usize,
     query: IncrementalQuery,
     result: IncrementalResult,
+    proof_neutral: bool,
+}
+
+enum MicDropAnswer<'a> {
+    Blocked,
+    Sat {
+        query: &'a IncrementalQuery,
+        model: &'a LitVec,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +64,6 @@ enum MicBatchRoute {
 #[derive(Clone, Copy, Debug)]
 struct MicHardwareSample {
     service_per_query_ns: u64,
-    unsat_percent: u64,
 }
 
 #[derive(Default)]
@@ -63,6 +71,8 @@ pub(super) struct MicBatchPolicy {
     cpu_samples_ns: VecDeque<u64>,
     hardware_samples: VecDeque<MicHardwareSample>,
     cpu_since_probe: usize,
+    shadow_queries: u64,
+    shadow_replaceable: u64,
 }
 
 impl MicBatchPolicy {
@@ -119,7 +129,7 @@ impl MicBatchPolicy {
             std::env::var("INDUCTOR_CDCL_MIC_BATCH_HW_SAMPLES")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(2)
+                .unwrap_or(8)
                 .clamp(1, Self::hardware_window())
         })
     }
@@ -199,18 +209,20 @@ impl MicBatchPolicy {
                 None,
             );
         };
-        let unsat_percent = Self::lower_median(
-            self.hardware_samples
-                .iter()
-                .map(|sample| sample.unsat_percent),
-        )
-        .unwrap_or(0);
-        // Only an UNSAT answer can currently replace the native MIC query.
-        // Using all FPGA UNSAT answers as potentially useful is deliberately
-        // optimistic; invalidated answers make the real crossover stricter.
+        let replaceable_percent = self
+            .shadow_replaceable
+            .min(self.shadow_queries)
+            .saturating_mul(100)
+            .checked_div(self.shadow_queries)
+            .unwrap_or(0);
+        // Both exact SAT witnesses and CPU-reproved UNSAT cores can replace
+        // the first native MIC query. The proof-neutral shadow fraction has
+        // already charged invalidated, inconclusive and mismatching answers
+        // as zero yield. It remains optimistic for reached UNSAT answers,
+        // whose cores are subset-checked here but re-proved only on adoption.
         let projected_cpu_ns = cpu_per_query_ns
             .saturating_mul(queries as u64)
-            .saturating_mul(unsat_percent)
+            .saturating_mul(replaceable_percent)
             / 100;
         let projected_hardware_ns = service_per_query_ns.saturating_mul(queries as u64);
         if projected_cpu_ns.saturating_mul(100)
@@ -244,7 +256,7 @@ impl MicBatchPolicy {
         self.cpu_since_probe = self.cpu_since_probe.saturating_add(1);
     }
 
-    fn note_hardware(&mut self, queries: u64, service_ns: u64, unsat: u64) {
+    fn note_hardware(&mut self, queries: u64, service_ns: u64) {
         self.cpu_since_probe = 0;
         if queries == 0 || service_ns == 0 {
             return;
@@ -254,9 +266,60 @@ impl MicBatchPolicy {
         }
         self.hardware_samples.push_back(MicHardwareSample {
             service_per_query_ns: service_ns.div_ceil(queries),
-            unsat_percent: unsat.min(queries).saturating_mul(100) / queries,
         });
     }
+
+    fn note_shadow_result(&mut self, replaceable: bool) {
+        self.shadow_queries = self.shadow_queries.saturating_add(1);
+        if replaceable {
+            self.shadow_replaceable = self.shadow_replaceable.saturating_add(1);
+        }
+    }
+
+    fn note_shadow_invalidated(&mut self, count: usize) {
+        self.shadow_queries = self.shadow_queries.saturating_add(count as u64);
+    }
+}
+
+fn model_value(model: &[Lit], lit: Lit) -> Option<bool> {
+    model
+        .iter()
+        .find(|candidate| candidate.var() == lit.var())
+        .map(|candidate| candidate.polarity() == lit.polarity())
+}
+
+fn core_is_assumption_subset(query: &IncrementalQuery, core: &[Lit]) -> bool {
+    let mut unmatched: Vec<Lit> = query.assumptions.iter().copied().collect();
+    for &lit in core {
+        let Some(position) = unmatched.iter().position(|candidate| *candidate == lit) else {
+            return false;
+        };
+        unmatched.swap_remove(position);
+    }
+    true
+}
+
+/// Use a complete external SAT witness for the model-shrinking step of
+/// ordinary `down`.  GipSAT additionally calls `flip_to_none` to minimize the
+/// witness, but retaining every true cube literal is conservative and still
+/// makes progress because the strengthen clause guarantees at least one is
+/// false.  A false kept literal means this drop cannot preserve earlier MIC
+/// decisions, exactly as on the native path.
+fn shrink_down_cube_from_model(
+    cube: &LitVec,
+    keep: &GHashSet<Lit>,
+    model: &[Lit],
+) -> Option<LitVec> {
+    let mut shrunk = LitVec::new();
+    for &lit in cube.iter() {
+        match model_value(model, lit) {
+            Some(true) => shrunk.push(lit),
+            Some(false) if keep.contains(&lit) => return None,
+            Some(false) => {}
+            None => return None,
+        }
+    }
+    (shrunk.len() < cube.len()).then_some(shrunk)
 }
 
 impl MicType {
@@ -275,6 +338,43 @@ impl MicType {
 }
 
 impl IC3 {
+    fn note_mic_shadow_result(
+        &mut self,
+        frame: usize,
+        prefetched: &MicDropPrefetch,
+        cpu_blocked: bool,
+    ) {
+        debug_assert!(prefetched.proof_neutral);
+        let replaceable = match &prefetched.result {
+            IncrementalResult::Sat { model } if !cpu_blocked => self.solvers[frame - 1]
+                .validate_incremental_sat_model(&prefetched.query, model),
+            IncrementalResult::Unsat { core, .. } if cpu_blocked => {
+                core_is_assumption_subset(&prefetched.query, core)
+            }
+            _ => false,
+        };
+        self.mic_batch_policy.note_shadow_result(replaceable);
+        crate::accel::cdcl_host::note_active_mic_shadow_result(replaceable);
+    }
+
+    fn note_mic_wave_invalidated(&mut self, wave: &[MicDropPrefetch]) {
+        let shadow = wave
+            .iter()
+            .filter(|prefetched| prefetched.proof_neutral)
+            .count();
+        self.mic_batch_policy.note_shadow_invalidated(shadow);
+        crate::accel::cdcl_host::note_active_mic_shadow_invalidated(shadow);
+        crate::accel::cdcl_host::note_active_mic_invalidated(wave.len());
+    }
+
+    fn note_mic_prefetch_invalidated(&mut self, prefetched: &MicDropPrefetch) {
+        if prefetched.proof_neutral {
+            self.mic_batch_policy.note_shadow_invalidated(1);
+            crate::accel::cdcl_host::note_active_mic_shadow_invalidated(1);
+        }
+        crate::accel::cdcl_host::note_active_mic_invalidated(1);
+    }
+
     fn launch_mic_drop_wave(
         &mut self,
         frame: usize,
@@ -334,23 +434,15 @@ impl IC3 {
         let service_before = crate::accel::cdcl_host::active_batch_service_snapshot();
         let results = crate::accel::cdcl_host::solve_active_batch_with_min(requests, min_batch);
         let service_after = crate::accel::cdcl_host::active_batch_service_snapshot();
-        let hardware_unsat = results
-            .iter()
-            .filter(|result| matches!(result, IncrementalResult::Unsat { .. }))
-            .count() as u64;
         self.mic_batch_policy.note_hardware(
             service_after.1.saturating_sub(service_before.1),
             service_after.2.saturating_sub(service_before.2),
-            hardware_unsat,
         );
         crate::accel::cdcl_host::note_active_mic_wave(&results);
-        if route == MicBatchRoute::Probe {
-            // Calibration must be proof-neutral. Even a valid core can send
-            // IC3 down a different and much longer path, so a probe measures
-            // service/yield only and never exposes its answers to MIC.
-            crate::accel::cdcl_host::note_active_mic_invalidated(results.len());
-            return Vec::new();
-        }
+        // A calibration wave remains attached to the unmodified CPU path so
+        // we can observe which of its answers would actually be reached before
+        // a cube shrink invalidates the tail. Its answers are never consumed.
+        let proof_neutral = route == MicBatchRoute::Probe;
         candidates
             .into_iter()
             .zip(results)
@@ -358,29 +450,42 @@ impl IC3 {
                 candidate_index,
                 query,
                 result,
+                proof_neutral,
             })
             .collect()
     }
 
-    fn consume_mic_drop_result(
+    fn consume_mic_drop_result<'a>(
         &mut self,
         frame: usize,
         cube: &LitVec,
-        prefetched: &MicDropPrefetch,
-    ) -> Option<bool> {
+        prefetched: &'a MicDropPrefetch,
+    ) -> Option<MicDropAnswer<'a>> {
+        debug_assert!(!prefetched.proof_neutral);
         match &prefetched.result {
-            IncrementalResult::Sat { .. } => {
-                // `down`/`ctg_down` feed the satisfying assignment into
-                // model-sensitive cube shrinking and predecessor lifting.
-                // The generic active-model importer is sufficient for a
-                // boolean blocked/not-blocked answer, but it has not proved
-                // equivalence to GipSAT's native model state for those later
-                // operations. Keep the complete FPGA SAT result observable,
-                // then rerun this inquiry on the live solver until that
-                // stronger state-transfer invariant has its own validator.
-                crate::accel::cdcl_host::note_active_cpu_fallback();
-                crate::accel::cdcl_host::note_active_mic_consumed(false, false);
-                None
+            IncrementalResult::Sat { model } => {
+                // Do not import the assignment into GipSAT's mutable trail.
+                // The downstream MIC paths consume the exact witness directly
+                // and, for CTG, independently certify its predecessor through
+                // `TsLift::lift_model`.  This avoids the watcher/model-state
+                // mismatch exposed by the first importer prototype.
+                let validation_start = Instant::now();
+                let accepted = self.solvers[frame - 1]
+                    .validate_incremental_sat_model(&prefetched.query, model);
+                crate::accel::cdcl_host::note_active_sat_model(
+                    accepted,
+                    validation_start.elapsed().as_nanos() as u64,
+                );
+                if accepted {
+                    Some(MicDropAnswer::Sat {
+                        query: &prefetched.query,
+                        model,
+                    })
+                } else {
+                    crate::accel::cdcl_host::note_active_cpu_fallback();
+                    crate::accel::cdcl_host::note_active_mic_consumed(false, false);
+                    None
+                }
             }
             IncrementalResult::Unsat { core, .. } => {
                 let validation_start = Instant::now();
@@ -400,7 +505,7 @@ impl IC3 {
                     true,
                     cpu_core_len.is_some(),
                 );
-                cpu_core_len.map(|_| true)
+                cpu_core_len.map(|_| MicDropAnswer::Blocked)
             }
             IncrementalResult::Unknown(_) => {
                 crate::accel::cdcl_host::note_active_cpu_fallback();
@@ -424,8 +529,8 @@ impl IC3 {
         self.statistic.num_down += 1;
         loop {
             if self.tsctx.cube_subsume_init(&cube) {
-                if prefetched.take().is_some() {
-                    crate::accel::cdcl_host::note_active_mic_invalidated(1);
+                if let Some(prefetched) = prefetched.take() {
+                    self.note_mic_prefetch_invalidated(prefetched);
                 }
                 return None;
             }
@@ -434,8 +539,8 @@ impl IC3 {
                 .iter()
                 .any(|(s, t)| !lemma.subsume(s) && lemma.subsume(t))
             {
-                if prefetched.take().is_some() {
-                    crate::accel::cdcl_host::note_active_mic_invalidated(1);
+                if let Some(prefetched) = prefetched.take() {
+                    self.note_mic_prefetch_invalidated(prefetched);
                 }
                 return None;
             }
@@ -582,12 +687,20 @@ impl IC3 {
                 crate::accel::observe_card_core_query(cube.len(), false);
             }
 
-            let active_answer = prefetched
-                .take()
+            let offered = prefetched.take();
+            let shadow = offered.filter(|prefetched| prefetched.proof_neutral);
+            let active_answer = offered
+                .filter(|prefetched| !prefetched.proof_neutral)
                 .and_then(|answer| self.consume_mic_drop_result(frame, &cube, answer));
             let used_prefetched = active_answer.is_some();
+            let mut active_model = None;
             let blocked = match active_answer {
-                Some(blocked) => blocked,
+                Some(MicDropAnswer::Blocked) => true,
+                Some(MicDropAnswer::Sat { model, .. }) => {
+                    active_model = Some(model);
+                    crate::accel::cdcl_host::note_active_mic_consumed(false, true);
+                    false
+                }
                 None if measure_cpu => {
                     let cpu_start = Instant::now();
                     let blocked = self
@@ -610,6 +723,9 @@ impl IC3 {
                     .with_constraint(constraint)
                     .check(),
             };
+            if let Some(shadow) = shadow {
+                self.note_mic_shadow_result(frame, shadow, blocked);
+            }
             if !used_prefetched {
                 crate::accel::observe_core_query(
                     cube.len(),
@@ -619,6 +735,18 @@ impl IC3 {
             }
             if blocked {
                 return Some(self.solvers[frame - 1].inductive_core().unwrap());
+            }
+            if let Some(model) = active_model {
+                // The exact model satisfies the strengthen clause, so unless
+                // that falsified literal is protected by `keep`, retaining all
+                // true cube literals strictly shrinks the next inquiry.  This
+                // is the proof-safe external counterpart of GipSAT's more
+                // aggressive `flip_to_none` model minimization.
+                let Some(cube_new) = shrink_down_cube_from_model(&cube, keep, model) else {
+                    return None;
+                };
+                cube = cube_new;
+                continue;
             }
             let mut ret = false;
             let mut cube_new = LitVec::new();
@@ -671,17 +799,48 @@ impl IC3 {
         let mut ctg = 0;
         loop {
             if self.tsctx.cube_subsume_init(&cube) {
-                if prefetched.take().is_some() {
-                    crate::accel::cdcl_host::note_active_mic_invalidated(1);
+                if let Some(prefetched) = prefetched.take() {
+                    self.note_mic_prefetch_invalidated(prefetched);
                 }
                 return None;
             }
             self.statistic.num_down_sat += 1;
-            let active_answer = prefetched
-                .take()
+            let offered = prefetched.take();
+            let shadow = offered.filter(|prefetched| prefetched.proof_neutral);
+            let active_answer = offered
+                .filter(|prefetched| !prefetched.proof_neutral)
                 .and_then(|answer| self.consume_mic_drop_result(frame, &cube, answer));
+            let mut active_model = None;
+            let mut active_pred = None;
             let blocked = match active_answer {
-                Some(blocked) => blocked,
+                Some(MicDropAnswer::Blocked) => true,
+                Some(MicDropAnswer::Sat { query, model }) => {
+                    if let Some((pred, _inputs)) = self.pred_from_incremental_model(query, model) {
+                        active_model = Some(model);
+                        active_pred = Some(pred);
+                        crate::accel::cdcl_host::note_active_mic_consumed(false, true);
+                        false
+                    } else {
+                        // A complete clause-valid assignment should always
+                        // yield at least its full latch predecessor. Fail
+                        // closed if the transition-system view disagrees.
+                        crate::accel::cdcl_host::note_active_cpu_fallback();
+                        crate::accel::cdcl_host::note_active_mic_consumed(false, false);
+                        let cpu_start = Instant::now();
+                        let blocked = self
+                            .blocked(frame, &cube)
+                            .in_phase(inductor_trace::Phase::Gen)
+                            .with_act_order(false)
+                            .with_strengthen()
+                            .check();
+                        if measure_cpu {
+                            self.mic_batch_policy.note_cpu(
+                                cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                            );
+                        }
+                        blocked
+                    }
+                }
                 None if measure_cpu => {
                     let cpu_start = Instant::now();
                     let blocked = self
@@ -702,16 +861,23 @@ impl IC3 {
                     .with_strengthen()
                     .check(),
             };
+            if let Some(shadow) = shadow {
+                self.note_mic_shadow_result(frame, shadow, blocked);
+            }
             if blocked {
                 return Some(self.solvers[frame - 1].inductive_core().unwrap());
             }
             for lit in cube.iter() {
-                if keep.contains(lit) && !self.solvers[frame - 1].sat_value(*lit).is_some_and(|v| v)
-                {
+                let value = if let Some(model) = active_model {
+                    model_value(model, *lit)
+                } else {
+                    self.solvers[frame - 1].sat_value(*lit)
+                };
+                if keep.contains(lit) && !value.is_some_and(|value| value) {
                     return None;
                 }
             }
-            let (model, _) = self.get_pred(frame, false);
+            let model = active_pred.unwrap_or_else(|| self.get_pred(frame, false).0);
             let cex_set: GHashSet<Lit> = GHashSet::from_iter(model.iter().cloned());
             // for lit in cube.iter() {
             //     if keep.contains(lit) && !cex_set.contains(lit) {
@@ -869,7 +1035,7 @@ impl IC3 {
                 continue;
             }
             if mic_batch_enabled && prefetched_parent.as_ref() != Some(&cube) {
-                crate::accel::cdcl_host::note_active_mic_invalidated(prefetched_wave.len());
+                self.note_mic_wave_invalidated(&prefetched_wave);
                 prefetched_wave = self.launch_mic_drop_wave(
                     frame,
                     &cube,
@@ -915,7 +1081,7 @@ impl IC3 {
             if let Some(new_cube) = mic {
                 self.statistic.mic_drop.success();
                 (cube, i) = self.handle_down_success(frame, cube, i, new_cube);
-                crate::accel::cdcl_host::note_active_mic_invalidated(prefetched_wave.len());
+                self.note_mic_wave_invalidated(&prefetched_wave);
                 prefetched_wave.clear();
                 prefetched_parent = None;
                 if parameter.level == 0 {
@@ -934,7 +1100,7 @@ impl IC3 {
                 i += 1;
             }
         }
-        crate::accel::cdcl_host::note_active_mic_invalidated(prefetched_wave.len());
+        self.note_mic_wave_invalidated(&prefetched_wave);
         if parameter.level == 0 {
             self.solvers[frame - 1].unset_domain();
         }
@@ -962,7 +1128,9 @@ impl IC3 {
 
 #[cfg(test)]
 mod mic_batch_policy_tests {
-    use super::{MicBatchPolicy, MicBatchRoute};
+    use super::{MicBatchPolicy, MicBatchRoute, shrink_down_cube_from_model};
+    use giputils::hash::GHashSet;
+    use logicrs::{LitVec, Var};
 
     fn cpu_trained() -> MicBatchPolicy {
         let mut policy = MicBatchPolicy::default();
@@ -979,7 +1147,10 @@ mod mic_batch_policy_tests {
             policy.route_at(16, 8, 1, 4096, 125).0,
             MicBatchRoute::Probe
         );
-        policy.note_hardware(16, 4_000_000, 8);
+        for replaceable in [true; 8].into_iter().chain([false; 8]) {
+            policy.note_shadow_result(replaceable);
+        }
+        policy.note_hardware(16, 4_000_000);
         let evaluation = policy.route_at(16, 8, 1, 4096, 125);
         assert_eq!(evaluation.0, MicBatchRoute::Reject);
         assert_eq!(evaluation.1, 1_600_000);
@@ -993,34 +1164,80 @@ mod mic_batch_policy_tests {
     }
 
     #[test]
-    fn mic_batch_economics_counts_only_replaceable_unsat_work() {
+    fn mic_batch_economics_counts_conclusive_replaceable_work() {
         let mut profitable = cpu_trained();
-        profitable.note_hardware(16, 1_000_000, 16);
+        for _ in 0..16 {
+            profitable.note_shadow_result(true);
+        }
+        profitable.note_hardware(16, 1_000_000);
         assert_eq!(
             profitable.route_at(16, 8, 1, 4096, 125),
             (MicBatchRoute::Offload, 3_200_000, Some(1_000_000))
         );
 
-        let mut mostly_sat = cpu_trained();
-        mostly_sat.note_hardware(16, 1_000_000, 1);
+        let mut mostly_unknown = cpu_trained();
+        mostly_unknown.note_shadow_result(true);
+        for _ in 0..15 {
+            mostly_unknown.note_shadow_result(false);
+        }
+        mostly_unknown.note_hardware(16, 1_000_000);
         assert_eq!(
-            mostly_sat.route_at(16, 8, 1, 4096, 125).0,
+            mostly_unknown.route_at(16, 8, 1, 4096, 125).0,
             MicBatchRoute::Reject
+        );
+    }
+
+    #[test]
+    fn external_sat_model_shrinks_down_without_violating_keep() {
+        let a = Var::from(1).lit();
+        let b = Var::from(2).lit();
+        let c = Var::from(3).lit();
+        let cube = LitVec::from([a, b, c]);
+        let model = LitVec::from([a, !b, c]);
+
+        let keep_a = GHashSet::from_iter([a]);
+        assert_eq!(
+            shrink_down_cube_from_model(&cube, &keep_a, &model)
+                .unwrap()
+                .as_slice(),
+            &[a, c]
+        );
+
+        let keep_b = GHashSet::from_iter([b]);
+        assert!(shrink_down_cube_from_model(&cube, &keep_b, &model).is_none());
+        assert!(
+            shrink_down_cube_from_model(&cube, &GHashSet::new(), &[a, !b]).is_none()
         );
     }
 
     #[test]
     fn mic_batch_economics_keeps_calibration_proof_neutral_until_trained() {
         let mut policy = cpu_trained();
-        policy.note_hardware(16, 4_000_000, 8);
+        for replaceable in [true; 8].into_iter().chain([false; 8]) {
+            policy.note_shadow_result(replaceable);
+        }
+        policy.note_hardware(16, 4_000_000);
         assert_eq!(
             policy.route_at(16, 8, 2, 4096, 125).0,
             MicBatchRoute::Probe
         );
-        policy.note_hardware(16, 4_000_000, 8);
+        policy.note_hardware(16, 4_000_000);
         assert_eq!(
             policy.route_at(16, 8, 2, 4096, 125).0,
             MicBatchRoute::Reject
         );
+    }
+
+    #[test]
+    fn mic_batch_economics_charges_invalidated_probe_tail() {
+        let mut policy = cpu_trained();
+        policy.note_shadow_result(true);
+        policy.note_shadow_invalidated(15);
+        policy.note_hardware(16, 1_000_000);
+
+        let evaluation = policy.route_at(16, 8, 1, 4096, 125);
+        assert_eq!(evaluation.0, MicBatchRoute::Reject);
+        assert_eq!(evaluation.1, 192_000);
+        assert_eq!(evaluation.2, Some(1_000_000));
     }
 }

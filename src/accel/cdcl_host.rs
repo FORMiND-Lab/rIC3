@@ -782,6 +782,9 @@ static ACTIVE_MIC_BATCH_SAT_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_BATCH_UNSAT_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_BATCH_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_BATCH_INVALIDATED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_SHADOW_REACHED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_SHADOW_REPLACEABLE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_BATCH_SHADOW_INVALIDATED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_BATCH_ECON_PROBES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_BATCH_ECON_OFFLOADS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_BATCH_ECON_REJECTS: AtomicU64 = AtomicU64::new(0);
@@ -2277,7 +2280,9 @@ fn flush_batch_locked(state: &mut ShadowState, batch_index: usize) {
 /// as their resident contexts and the command-word limit allow. The returned
 /// order matches the input order. This function deliberately does not decide
 /// whether a result is proof-safe for IC3; callers may consume a SAT answer
-/// only through `DagCnfSolver::install_incremental_sat_model`.
+/// only after `DagCnfSolver::validate_incremental_sat_model`, either by the
+/// legacy live-trail importer or through an independently certified external
+/// predecessor/model-shrinking path.
 pub fn solve_active_batch(
     requests: Vec<(&DagCnfSolver, IncrementalQuery)>,
 ) -> Vec<IncrementalResult> {
@@ -2681,6 +2686,19 @@ pub fn note_active_mic_invalidated(count: usize) {
         return;
     }
     ACTIVE_MIC_BATCH_INVALIDATED.fetch_add(count as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_mic_shadow_result(replaceable: bool) {
+    ACTIVE_MIC_BATCH_SHADOW_REACHED.fetch_add(1, Ordering::Relaxed);
+    if replaceable {
+        ACTIVE_MIC_BATCH_SHADOW_REPLACEABLE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_active_mic_shadow_invalidated(count: usize) {
+    if count != 0 {
+        ACTIVE_MIC_BATCH_SHADOW_INVALIDATED.fetch_add(count as u64, Ordering::Relaxed);
+    }
 }
 
 pub fn note_active_mic_batch_economics(
@@ -3224,7 +3242,7 @@ pub fn flush_and_report() {
             ACTIVE_PUSH_PREFETCH_SKIPPED_CONTEXT.load(Ordering::Relaxed),
         );
         eprintln!(
-            "inductor-cdcl: active MIC waves/queries {}/{}, SAT/UNSAT/UNKNOWN {}/{}/{}, used SAT/UNSAT {}/{}, rejected {}, invalidated {}",
+            "inductor-cdcl: active MIC waves/queries {}/{}, SAT/UNSAT/UNKNOWN {}/{}/{}, used SAT/UNSAT {}/{}, rejected {}, invalidated {}, proof-neutral reached/replaceable/invalidated {}/{}/{}",
             ACTIVE_MIC_BATCH_WAVES.load(Ordering::Relaxed),
             ACTIVE_MIC_BATCH_QUERIES.load(Ordering::Relaxed),
             ACTIVE_MIC_BATCH_SAT.load(Ordering::Relaxed),
@@ -3234,6 +3252,9 @@ pub fn flush_and_report() {
             ACTIVE_MIC_BATCH_UNSAT_USED.load(Ordering::Relaxed),
             ACTIVE_MIC_BATCH_REJECTED.load(Ordering::Relaxed),
             ACTIVE_MIC_BATCH_INVALIDATED.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_SHADOW_REACHED.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_SHADOW_REPLACEABLE.load(Ordering::Relaxed),
+            ACTIVE_MIC_BATCH_SHADOW_INVALIDATED.load(Ordering::Relaxed),
         );
         eprintln!(
             "inductor-cdcl: active MIC economics probes/offloads/rejects {}/{}/{}, projected replaceable CPU/HW {:.3}/{}",
