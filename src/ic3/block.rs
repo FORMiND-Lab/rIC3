@@ -85,6 +85,9 @@ struct BlockBatchCache {
     epoch: u64,
 }
 
+const DEFAULT_BLOCK_ASYNC: bool = false;
+const DEFAULT_BLOCK_WAVEFRONT: bool = true;
+
 #[derive(Default)]
 pub(super) struct BlockAccelPolicy {
     cpu_samples_ns: VecDeque<u64>,
@@ -313,7 +316,10 @@ impl BlockAccelPolicy {
 
 #[cfg(test)]
 mod block_accel_policy_tests {
-    use super::{BlockAccelPolicy, BlockBatchCache, CachedBlockInquiry};
+    use super::{
+        BlockAccelPolicy, BlockBatchCache, CachedBlockInquiry, DEFAULT_BLOCK_ASYNC,
+        DEFAULT_BLOCK_WAVEFRONT,
+    };
     use crate::{
         accel::cdcl::UnknownReason,
         gipsat::{IncrementalQuery, IncrementalResult},
@@ -466,6 +472,32 @@ mod block_accel_policy_tests {
         )]);
         assert!(!cache.contains(2, &LitOrdVec::new(LitVec::from([a]))));
     }
+
+    #[test]
+    fn block_wave_prefers_pruning_unsat_answers() {
+        let lit = Lit::new(Var::from(0), true);
+        let sat = IncrementalResult::Sat {
+            model: LitVec::from([lit]),
+        };
+        let unsat = IncrementalResult::Unsat {
+            core: LitVec::from([lit]),
+            used_constraints: false,
+        };
+        let unknown = IncrementalResult::Unknown(UnknownReason::ConflictBudget);
+
+        assert!(!BlockBatchCache::wavefront_result_eligible(&sat, false));
+        assert!(BlockBatchCache::wavefront_result_eligible(&sat, true));
+        assert!(BlockBatchCache::wavefront_result_eligible(&unsat, false));
+        assert!(!BlockBatchCache::wavefront_result_eligible(
+            &unknown, false
+        ));
+    }
+
+    #[test]
+    fn block_wave_is_default_but_background_speculation_is_not() {
+        assert!(DEFAULT_BLOCK_WAVEFRONT);
+        assert!(!DEFAULT_BLOCK_ASYNC);
+    }
 }
 
 impl BlockBatchCache {
@@ -510,7 +542,7 @@ impl BlockBatchCache {
             std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC")
                 .ok()
                 .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-                .unwrap_or(false)
+                .unwrap_or(DEFAULT_BLOCK_ASYNC)
         })
     }
 
@@ -544,7 +576,7 @@ impl BlockBatchCache {
             std::env::var("INDUCTOR_CDCL_BLOCK_WAVEFRONT")
                 .ok()
                 .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-                .unwrap_or(false)
+                .unwrap_or(DEFAULT_BLOCK_WAVEFRONT)
         })
     }
 
@@ -558,6 +590,22 @@ impl BlockBatchCache {
                 .unwrap_or(8)
                 .clamp(1, 64)
         })
+    }
+
+    fn wavefront_include_sat() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_WAVEFRONT_SAT")
+                .ok()
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .unwrap_or(false)
+        })
+    }
+
+    fn wavefront_result_eligible(result: &IncrementalResult, include_sat: bool) -> bool {
+        matches!(result, IncrementalResult::Unsat { .. })
+            || include_sat && matches!(result, IncrementalResult::Sat { .. })
     }
 
     fn async_depth() -> usize {
@@ -846,6 +894,8 @@ impl IC3 {
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
         let mut block_wave = VecDeque::new();
+        let block_wave_enabled = crate::accel::cdcl_host::block_batch_enabled()
+            && BlockBatchCache::wavefront_enabled();
         loop {
             let mut from_wave = false;
             let mut next = None;
@@ -956,7 +1006,7 @@ impl IC3 {
                     candidates.push((po.frame, po.state.clone()));
                     wave_candidates.push(None);
                 }
-                let reserve_wave = BlockBatchCache::wavefront_enabled()
+                let reserve_wave = block_wave_enabled
                     && !BlockBatchCache::async_enabled()
                     && block_wave.is_empty();
                 for candidate in self.obligations.iter().rev() {
@@ -1157,10 +1207,9 @@ impl IC3 {
                             if reserved >= BlockBatchCache::wavefront_steps() {
                                 break;
                             }
-                            if !matches!(
-                                inquiries[index].result,
-                                IncrementalResult::Sat { .. }
-                                    | IncrementalResult::Unsat { .. }
+                            if !BlockBatchCache::wavefront_result_eligible(
+                                &inquiries[index].result,
+                                BlockBatchCache::wavefront_include_sat(),
                             ) {
                                 continue;
                             }
@@ -1325,7 +1374,7 @@ impl IC3 {
                     po.depth + 1,
                     Some(po.clone()),
                 );
-                if BlockBatchCache::wavefront_enabled() {
+                if block_wave_enabled {
                     // Breadth-first processing can make two independent paths
                     // discover the same ordered obligation before either path
                     // reaches the head of the queue. One representative is
