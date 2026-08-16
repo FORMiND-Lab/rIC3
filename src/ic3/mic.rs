@@ -971,10 +971,92 @@ impl IC3 {
             cube.sort_by_key(|x| parent.contains(x));
         }
         let mut keep = GHashSet::new();
+        // Independent MIC batches lose almost all useful tail work as soon as
+        // one early drop shrinks the cube. The full-CDCL MIC-chain command
+        // instead rebuilds every later inquiry from the device's current
+        // reduced cube. Its output is still only a candidate: one ordinary,
+        // unbudgeted live GipSAT solve proves the complete returned cube before
+        // IC3 may adopt it.
+        let mut mic_chain_answered = false;
+        let mut mic_chain_finished = false;
+        if parameter.level == 0
+            && crate::accel::cdcl_host::mic_chain_enabled()
+            && cube.len() >= crate::accel::cdcl_host::mic_chain_min_cube()
+        {
+            let pairs: Vec<_> = cube
+                .iter()
+                .map(|lit| (*lit, self.tsctx.next(*lit)))
+                .collect();
+            if let Some(chain) = crate::accel::cdcl_host::solve_active_mic_chain(
+                &self.solvers[frame - 1].dcs,
+                &pairs,
+                constraint,
+            ) {
+                mic_chain_answered = true;
+                // A complete chain may legitimately return the input cube:
+                // every attempted drop was SAT.  Prove that cube once as well
+                // so a successful complete command can replace, rather than
+                // precede, the CPU literal-by-literal traversal.
+                if (chain.complete || chain.cube.len() < cube.len())
+                    && !chain.cube.is_empty()
+                    && !self.tsctx.cube_subsume_init(&chain.cube)
+                {
+                    let verify_start = Instant::now();
+                    let blocked = self
+                        .blocked(frame, &chain.cube)
+                        .in_phase(inductor_trace::Phase::Gen)
+                        .with_act_order(false)
+                        .with_strengthen()
+                        .with_constraint(constraint)
+                        .check();
+                    let verify_ns =
+                        verify_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    let mut adopted = false;
+                    if blocked {
+                        let exact = self.solvers[frame - 1]
+                            .inductive_core()
+                            .unwrap_or_else(|| chain.cube.clone());
+                        let exact = LitVec::from_iter(
+                            cube.iter().filter(|lit| exact.contains(lit)).copied(),
+                        );
+                        if !exact.is_empty() && !self.tsctx.cube_subsume_init(&exact) {
+                            adopted = true;
+                            cube = exact;
+                            // Once an exact solve proves the result of a
+                            // complete hardware traversal, repeating every
+                            // attempted drop on the CPU cannot improve
+                            // correctness.  Partial traversals still fall
+                            // through to the ordinary loop for the remaining
+                            // minimisation work.
+                            mic_chain_finished = chain.complete;
+                            if mic_chain_finished {
+                                crate::accel::cdcl_host::note_active_mic_chain_cpu_replaced(
+                                    chain.trials,
+                                );
+                            }
+                            if !mic_chain_finished {
+                                self.solvers[frame - 1].unset_domain();
+                                self.solvers[frame - 1].set_domain(
+                                    self.tsctx
+                                        .lits_next(&cube)
+                                        .iter()
+                                        .copied()
+                                        .chain(cube.iter().copied()),
+                                );
+                            }
+                        }
+                    }
+                    crate::accel::cdcl_host::note_active_mic_chain_validation(
+                        adopted, verify_ns,
+                    );
+                }
+            }
+        }
         // Cache this once per MIC.  The default CPU path must not repeatedly
         // inspect the environment, clone the parent cube, time queries, or
         // maintain experimental telemetry when the opt-in experiment is off.
-        let mic_batch_enabled = crate::accel::cdcl_host::mic_batch_enabled();
+        let mic_batch_enabled = crate::accel::cdcl_host::mic_batch_enabled()
+            && !mic_chain_answered;
         let mut prefetched_parent: Option<LitVec> = None;
         let mut prefetched_wave = Vec::new();
 
@@ -1029,7 +1111,7 @@ impl IC3 {
         }
 
         let mut i = 0;
-        while i < cube.len() {
+        while !mic_chain_finished && i < cube.len() {
             if keep.contains(&cube[i]) {
                 i += 1;
                 continue;

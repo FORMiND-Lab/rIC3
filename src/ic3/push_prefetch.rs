@@ -118,7 +118,7 @@ struct PushBatchStat {
 #[derive(Default)]
 pub(super) struct PushPrefetchCache {
     ready: Vec<CachedPushInquiry>,
-    pending: Option<PendingPushBatch>,
+    pending: Vec<PendingPushBatch>,
     batch_stats: Vec<PushBatchStat>,
     epoch: u64,
     next_batch_id: u64,
@@ -161,6 +161,22 @@ impl PushPrefetchCache {
                 .unwrap_or(1)
                 .min(256)
         })
+    }
+
+    fn pending_depth() -> usize {
+        use std::sync::OnceLock;
+        static DEPTH: OnceLock<usize> = OnceLock::new();
+        *DEPTH.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_DEPTH")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1)
+                .clamp(1, 8)
+        })
+    }
+
+    fn at_capacity(&self, depth: usize) -> bool {
+        self.pending.len() >= depth.max(1)
     }
 
     fn retention_passes() -> u64 {
@@ -497,26 +513,30 @@ impl PushPrefetchCache {
     }
 
     fn harvest_ready(&mut self, harvested_at: u64) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(PendingPushBatch::is_finished)
-        {
-            let mut pending = self.pending.take().unwrap();
+        let mut index = 0;
+        while index < self.pending.len() {
+            if !self.pending[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let mut pending = self.pending.swap_remove(index);
             let finished = pending.finish();
             self.insert(finished, harvested_at);
         }
     }
 
     fn harvest_boundary(&mut self, harvested_at: u64) {
-        let wait = self.pending.as_ref().is_some_and(|pending| {
+        self.harvest_ready(harvested_at);
+        let wait = self.pending.iter().position(|pending| {
             Self::boundary_wait_eligible(pending.keys.len(), Self::boundary_wait_max_queries())
         });
-        if wait {
-            let mut pending = self.pending.take().unwrap();
+        if let Some(index) = wait {
+            // Preserve the diagnostic's bounded behavior with a deeper
+            // pipeline: wait for at most one eligible short job at a pass
+            // boundary, then publish any siblings that completed meanwhile.
+            let mut pending = self.pending.swap_remove(index);
             let finished = pending.finish();
             self.insert(finished, harvested_at);
-        } else {
             self.harvest_ready(harvested_at);
         }
     }
@@ -610,7 +630,7 @@ impl PushPrefetchCache {
 
     pub(super) fn busy(&mut self) -> bool {
         self.harvest_ready(self.epoch);
-        self.pending.is_some()
+        self.at_capacity(Self::pending_depth())
     }
 
     pub(super) fn start(
@@ -620,7 +640,7 @@ impl PushPrefetchCache {
         owned_requests: Vec<(usize, IncrementalQuery)>,
         prepare_ns: u64,
     ) {
-        debug_assert!(self.pending.is_none());
+        debug_assert!(!self.at_capacity(Self::pending_depth()));
         self.next_batch_id = self.next_batch_id.saturating_add(1);
         let batch_id = self.next_batch_id;
         for (_, lemma) in &keys {
@@ -635,7 +655,7 @@ impl PushPrefetchCache {
             crate::accel::cdcl_host::solve_active_batch(requests)
         });
         crate::accel::cdcl_host::note_active_push_prefetch_launch(keys.len(), prepare_ns);
-        self.pending = Some(PendingPushBatch {
+        self.pending.push(PendingPushBatch {
             batch_id,
             keys,
             handle: Some(handle),
@@ -644,7 +664,7 @@ impl PushPrefetchCache {
     }
 
     pub(super) fn finish(&mut self) {
-        if let Some(mut pending) = self.pending.take() {
+        while let Some(mut pending) = self.pending.pop() {
             let finished = pending.finish();
             self.insert(finished, self.epoch);
         }
@@ -793,23 +813,40 @@ mod tests {
         };
         let mut cache = PushPrefetchCache::default();
         cache.begin_pass();
-        cache.pending = Some(PendingPushBatch {
+        cache.pending.push(PendingPushBatch {
             batch_id: 1,
             keys: vec![(2, lemma.clone())],
             handle: Some(std::thread::spawn(move || vec![result])),
             launched_at: Instant::now(),
         });
 
-        while !cache.pending.as_ref().unwrap().is_finished() {
+        while !cache.pending[0].is_finished() {
             std::thread::yield_now();
         }
         assert!(cache.take(2, &lemma).is_none());
         cache.begin_pass();
-        assert!(cache.pending.is_none());
+        assert!(cache.pending.is_empty());
         assert!(matches!(
             cache.take(2, &lemma).map(|inquiry| inquiry.result),
             Some(IncrementalResult::Unsat { .. })
         ));
+    }
+
+    #[test]
+    fn pending_capacity_allows_a_bounded_pipeline() {
+        let mut cache = PushPrefetchCache::default();
+        assert!(!cache.at_capacity(2));
+        for batch_id in 1..=2 {
+            cache.pending.push(PendingPushBatch {
+                batch_id,
+                keys: Vec::new(),
+                handle: Some(std::thread::spawn(Vec::new)),
+                launched_at: Instant::now(),
+            });
+        }
+        assert!(cache.at_capacity(2));
+        assert!(!cache.at_capacity(3));
+        cache.finish();
     }
 
     #[test]

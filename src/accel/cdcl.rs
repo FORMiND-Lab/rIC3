@@ -51,6 +51,8 @@ pub const PROFILE_OCCURRENCE_PAIRS: usize = 18;
 
 pub const QUERY_HEADER_WORDS: usize = 8;
 pub const RESPONSE_HEADER_WORDS: usize = 9;
+pub const MIC_HEADER_WORDS: usize = 9;
+pub const MIC_RESPONSE_HEADER_WORDS: usize = 11;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +151,66 @@ pub struct QueryHeader {
     pub n_domain: u32,
     pub decision_budget: u32,
     pub conflict_budget: u32,
+}
+
+/// One device-resident dependent MIC traversal. The payload contains packed
+/// temporary constraints, full-domain variables, then current/next literal
+/// pairs. A zero `max_trials` means traverse the whole input cube.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MicHeader {
+    pub version: u32,
+    pub frame: u32,
+    pub flags: u32,
+    pub n_cube: u32,
+    pub n_constraint_words: u32,
+    pub n_domain: u32,
+    pub decision_budget: u32,
+    pub conflict_budget: u32,
+    pub max_trials: u32,
+}
+
+impl MicHeader {
+    pub fn as_words(&self) -> [u32; MIC_HEADER_WORDS] {
+        [
+            self.version,
+            self.frame,
+            self.flags,
+            self.n_cube,
+            self.n_constraint_words,
+            self.n_domain,
+            self.decision_budget,
+            self.conflict_budget,
+            self.max_trials,
+        ]
+    }
+
+    pub fn payload_words(&self) -> Option<usize> {
+        usize::try_from(self.n_constraint_words)
+            .ok()?
+            .checked_add(usize::try_from(self.n_domain).ok()?)?
+            .checked_add(usize::try_from(self.n_cube).ok()?.checked_mul(2)?)
+    }
+
+    pub fn valid_for(&self, payload: &[u32]) -> bool {
+        if self.version != ABI_VERSION
+            || self.n_cube < 2
+            || self.payload_words() != Some(payload.len())
+        {
+            return false;
+        }
+        let end = self.n_constraint_words as usize;
+        let mut p = 0usize;
+        while p < end {
+            let len = payload[p] as usize;
+            p += 1;
+            if len == 0 || p.checked_add(len).is_none_or(|next| next > end) {
+                return false;
+            }
+            p += len;
+        }
+        p == end
+    }
 }
 
 impl QueryHeader {
@@ -267,6 +329,44 @@ pub struct ResponseHeader {
     pub error: u32,
 }
 
+/// MIC completion prefix followed by exactly `n_output` current-state
+/// literals. `complete == 0` is a usable partial traversal, subject to the
+/// same exact CPU re-proof as a complete result.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MicResponseHeader {
+    pub version: u32,
+    pub n_input: u32,
+    pub n_output: u32,
+    pub trials: u32,
+    pub complete: u32,
+    pub reason: u32,
+    pub decisions: u32,
+    pub conflicts: u32,
+    pub propagations: u32,
+    pub learnt_clauses: u32,
+    pub error: u32,
+}
+
+impl MicResponseHeader {
+    pub fn from_words(words: &[u32]) -> Option<Self> {
+        let words: &[u32; MIC_RESPONSE_HEADER_WORDS] = words.try_into().ok()?;
+        Some(Self {
+            version: words[0],
+            n_input: words[1],
+            n_output: words[2],
+            trials: words[3],
+            complete: words[4],
+            reason: words[5],
+            decisions: words[6],
+            conflicts: words[7],
+            propagations: words[8],
+            learnt_clauses: words[9],
+            error: words[10],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +377,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<ResponseHeader>(), 9 * 4);
         assert_eq!(std::mem::size_of::<BatchHeader>(), 4 * 4);
         assert_eq!(std::mem::size_of::<BatchResponseHeader>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<MicHeader>(), 9 * 4);
+        assert_eq!(std::mem::size_of::<MicResponseHeader>(), 11 * 4);
 
         let header = QueryHeader {
             version: ABI_VERSION,
@@ -310,5 +412,21 @@ mod tests {
         assert!(batch.valid_for(&request_words));
         request_words.pop();
         assert!(!batch.valid_for(&request_words));
+
+        let mic = MicHeader {
+            version: ABI_VERSION,
+            frame: 3,
+            n_cube: 2,
+            n_constraint_words: 3,
+            n_domain: 4,
+            conflict_budget: 16,
+            ..MicHeader::default()
+        };
+        let mic_payload = [2, 10, 12, 0, 1, 2, 3, 10, 20, 12, 22];
+        assert_eq!(mic.payload_words(), Some(mic_payload.len()));
+        assert!(mic.valid_for(&mic_payload));
+        let mut malformed_mic = mic_payload;
+        malformed_mic[0] = 3;
+        assert!(!mic.valid_for(&malformed_mic));
     }
 }
