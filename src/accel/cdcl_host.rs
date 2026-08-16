@@ -742,6 +742,7 @@ static ACTIVE_PUSH_PREFETCH_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_REPROBES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_SKIPPED_LONG: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_SKIPPED_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_EVAL_QUERIES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_EVAL_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_SUBMITTED_BY_LEN: [AtomicU64; 5] = [
@@ -2085,16 +2086,17 @@ pub fn propagation_batch_enabled() -> bool {
 }
 
 /// Run lemma-push inquiries in the background after one pass and consume only
-/// live-validated answers in a later pass. This is opt-in until board data
-/// proves that repeated SAT witnesses repay solver cloning and shared-card
-/// contention.
+/// live-validated answers in a later pass. Active mode defaults to the measured
+/// context-local short-query policy; an explicit false value restores the
+/// synchronous propagation scheduler for A/B.
 pub fn push_prefetch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     active_enabled()
+        && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
         && *ENABLED.get_or_init(|| {
             std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH")
                 .ok()
-                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "off"))
         })
 }
 
@@ -2783,6 +2785,10 @@ pub fn note_active_push_prefetch_skipped_long(n: usize) {
     ACTIVE_PUSH_PREFETCH_SKIPPED_LONG.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+pub fn note_active_push_prefetch_skipped_context(n: usize) {
+    ACTIVE_PUSH_PREFETCH_SKIPPED_CONTEXT.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 pub fn note_active_push_prefetch_evicted(n: usize) {
     ACTIVE_PUSH_PREFETCH_EVICTED.fetch_add(n as u64, Ordering::Relaxed);
 }
@@ -3087,13 +3093,14 @@ pub fn flush_and_report() {
             push_bucket_values(&ACTIVE_PUSH_PREFETCH_USED_BY_LEN),
         );
         eprintln!(
-            "inductor-cdcl: active push prefetch adaptive admitted/suppressed/reprobes {}/{}/{}, latest used/query {}/{}, skipped-long {}",
+            "inductor-cdcl: active push prefetch adaptive admitted/suppressed/reprobes {}/{}/{}, latest used/query {}/{}, skipped long/context {}/{}",
             ACTIVE_PUSH_PREFETCH_ADMITTED.load(Ordering::Relaxed),
             ACTIVE_PUSH_PREFETCH_SUPPRESSED.load(Ordering::Relaxed),
             ACTIVE_PUSH_PREFETCH_REPROBES.load(Ordering::Relaxed),
             ACTIVE_PUSH_PREFETCH_EVAL_USED.load(Ordering::Relaxed),
             ACTIVE_PUSH_PREFETCH_EVAL_QUERIES.load(Ordering::Relaxed),
             ACTIVE_PUSH_PREFETCH_SKIPPED_LONG.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_SKIPPED_CONTEXT.load(Ordering::Relaxed),
         );
         eprintln!(
             "inductor-cdcl: active block preflight conclusive/selected/fallback {}/{}/{}, wave reserved/taken {}/{}",

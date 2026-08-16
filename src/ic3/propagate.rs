@@ -63,10 +63,24 @@ impl IC3 {
         // starts propagation at today's top frame. Prefetch that exact
         // look-ahead first; old-frame repeats are only secondary candidates.
         let max_lemma_len = super::push_prefetch::PushPrefetchCache::max_lemma_len();
+        let max_contexts = super::push_prefetch::PushPrefetchCache::max_contexts();
+        let all_frames = std::iter::once(level)
+            .chain(from..level)
+            .collect::<Vec<_>>();
+        let n_contexts = if max_contexts == 0 {
+            all_frames.len()
+        } else {
+            all_frames.len().min(max_contexts)
+        };
+        let candidate_frames = &all_frames[..n_contexts];
+        let skipped_context = all_frames[n_contexts..]
+            .iter()
+            .map(|frame_idx| self.frame[*frame_idx].len())
+            .sum::<usize>();
         let mut eligible_candidates = 0usize;
         let mut skipped_long = 0usize;
-        for frame_idx in std::iter::once(level).chain(from..level) {
-            for lemma in self.frame[frame_idx].iter() {
+        for frame_idx in candidate_frames {
+            for lemma in self.frame[*frame_idx].iter() {
                 if max_lemma_len != 0 && lemma.len() > max_lemma_len {
                     skipped_long += 1;
                 } else {
@@ -83,13 +97,15 @@ impl IC3 {
             return;
         }
         crate::accel::cdcl_host::note_active_push_prefetch_skipped_long(skipped_long);
+        crate::accel::cdcl_host::note_active_push_prefetch_skipped_context(skipped_context);
 
         let prepare_start = Instant::now();
         let mut keys = Vec::with_capacity(n_candidates);
         let mut solver_frames = Vec::new();
         let mut owned_solvers = Vec::new();
         let mut owned_requests = Vec::with_capacity(n_candidates);
-        'frames: for frame_idx in std::iter::once(level).chain(from..level) {
+        'frames: for frame_idx in candidate_frames {
+            let frame_idx = *frame_idx;
             let mut lemmas: Vec<_> = self.frame[frame_idx].iter().collect();
             lemmas.sort_by_key(|lemma| lemma.len());
             for lemma in lemmas {

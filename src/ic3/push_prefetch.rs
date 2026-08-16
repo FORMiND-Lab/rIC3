@@ -144,8 +144,20 @@ impl PushPrefetchCache {
             std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_MAX_LEMMA")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(0)
+                .unwrap_or(8)
                 .min(4096)
+        })
+    }
+
+    pub(super) fn max_contexts() -> usize {
+        use std::sync::OnceLock;
+        static MAX_CONTEXTS: OnceLock<usize> = OnceLock::new();
+        *MAX_CONTEXTS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_CONTEXTS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1)
+                .min(256)
         })
     }
 
