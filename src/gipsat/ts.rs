@@ -99,6 +99,14 @@ impl TransysSolver {
         self.dcs.install_incremental_sat_model(query, model)
     }
 
+    pub fn validate_incremental_sat_model(
+        &self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        self.dcs.validate_incremental_sat_model(query, model)
+    }
+
     /// Validate a hardware assumption core with an exact reduced GipSAT
     /// solve. Keeping the original cube in `relind` preserves the literal
     /// mapping and initial-state repair used by `inductive_core`.

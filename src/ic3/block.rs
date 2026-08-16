@@ -6,8 +6,59 @@ use crate::ic3::{
 };
 use giputils::TerminateCtrl;
 use log::{debug, info};
-use logicrs::{LitOrdVec, LitVec, satif::Satif};
+use logicrs::{Lit, LitOrdVec, LitVec, satif::Satif};
 use std::time::Instant;
+
+use crate::{
+    accel::cdcl_host::ActivePreflight,
+    gipsat::{IncrementalQuery, IncrementalResult},
+};
+
+struct CachedBlockInquiry {
+    frame: usize,
+    state: LitOrdVec,
+    query: IncrementalQuery,
+    result: IncrementalResult,
+    trusted_cpu: bool,
+}
+
+#[derive(Default)]
+struct BlockBatchCache {
+    inquiries: Vec<CachedBlockInquiry>,
+}
+
+impl BlockBatchCache {
+    fn window() -> usize {
+        use std::sync::OnceLock;
+        static WINDOW: OnceLock<usize> = OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64)
+                .clamp(1, 64)
+        })
+    }
+
+    fn min_context_vars() -> usize {
+        use std::sync::OnceLock;
+        static MIN_VARS: OnceLock<usize> = OnceLock::new();
+        *MIN_VARS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_MIN_VARS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(128)
+        })
+    }
+
+    fn take(&mut self, po: &ProofObligation) -> Option<CachedBlockInquiry> {
+        let index = self
+            .inquiries
+            .iter()
+            .position(|entry| entry.frame == po.frame && entry.state == po.state)?;
+        Some(self.inquiries.swap_remove(index))
+    }
+}
 
 pub enum BlockResult {
     Success,
@@ -18,6 +69,34 @@ pub enum BlockResult {
 }
 
 impl IC3 {
+    fn full_pred_from_incremental_model(&self, model: &[Lit]) -> Option<(LitVec, Vec<LitVec>)> {
+        let value = |lit: Lit| {
+            model
+                .iter()
+                .find(|candidate| candidate.var() == lit.var())
+                .map(|candidate| candidate.polarity())
+        };
+        let inputs = self
+            .tsctx
+            .input
+            .iter()
+            .map(|input| {
+                let lit = input.lit();
+                value(lit).map(|polarity| lit.not_if(!polarity))
+            })
+            .collect::<Option<LitVec>>()?;
+        let state = self
+            .tsctx
+            .latch
+            .iter()
+            .map(|latch| {
+                let lit = latch.lit();
+                value(lit).map(|polarity| lit.not_if(!polarity))
+            })
+            .collect::<Option<LitVec>>()?;
+        Some((state, vec![inputs]))
+    }
+
     fn push_lemma(&mut self, frame: usize, mut cube: LitVec) -> (usize, LitVec) {
         let start = Instant::now();
         let _op = crate::inductor::macro_scope(inductor_trace::Phase::Push, frame);
@@ -80,7 +159,12 @@ impl IC3 {
 
     pub fn block(&mut self, limit: Option<f64>) -> BlockResult {
         let mut noc = 0;
+        let mut block_batch = BlockBatchCache::default();
         while let Some(mut po) = self.obligations.pop(self.level()) {
+            // Remove a previously speculated answer even when this obligation
+            // is discarded by one of the cheap guards below. Otherwise stale
+            // entries would prevent the cache from naturally draining.
+            let mut cached_block = block_batch.take(&po);
             self.render_progress();
             if po.removed {
                 continue;
@@ -127,11 +211,192 @@ impl IC3 {
                 continue;
             }
             let blocked_start = Instant::now();
-            let blocked = self
-                .blocked(po.frame, &po.state)
-                .in_phase(inductor_trace::Phase::Block)
-                .with_act_order(false)
-                .check();
+
+            // The queue already contains multiple independent obligations.
+            // Snapshot at most one hardware batch before mutating frames or
+            // adding successors. Results remain candidates: a SAT model must
+            // satisfy the exact live frame when this obligation is consumed,
+            // and an UNSAT core is re-proved by exact GipSAT. New lemmas can
+            // therefore invalidate speculation but cannot make it unsound.
+            if cached_block.is_none()
+                && po.frame > 0
+                && crate::accel::cdcl_host::block_batch_enabled()
+                && self.solvers[po.frame - 1].dcs.num_var()
+                    >= BlockBatchCache::min_context_vars()
+            {
+                // A newly generated higher-priority obligation can overtake
+                // every entry in the previous snapshot. Those answers are
+                // now increasingly likely to be stale and, more importantly,
+                // must not prevent the current frontier from forming a new
+                // batch. Dropping an unconsumed candidate is always safe.
+                block_batch.inquiries.clear();
+                let mut candidates = vec![(po.frame, po.state.clone())];
+                for candidate in self.obligations.iter().rev() {
+                    if candidates.len() >= BlockBatchCache::window() {
+                        break;
+                    }
+                    if candidate.frame == 0
+                        || candidate.frame > self.level()
+                        || candidate.removed
+                        || candidates
+                            .iter()
+                            .any(|(_, state)| state == &candidate.state)
+                    {
+                        continue;
+                    }
+                    candidates.push((candidate.frame, candidate.state.clone()));
+                }
+
+                let requests: Vec<_> = candidates
+                    .iter()
+                    .map(|(frame, state)| {
+                        let solver = &self.solvers[*frame - 1];
+                        (
+                            &solver.dcs,
+                            solver.incremental_inductive_query(state, false, vec![]),
+                        )
+                    })
+                    .collect();
+                let mut decisions = vec![ActivePreflight::Fpga; requests.len()];
+                if crate::accel::cdcl_host::active_enabled() {
+                    let sample_requests: Vec<_> = requests
+                        .iter()
+                        .map(|(solver, query)| (*solver, query))
+                        .collect();
+                    crate::accel::cdcl_host::active_sample_select_pass(
+                        &sample_requests,
+                        &mut decisions,
+                    );
+                }
+
+                let mut results = vec![
+                    IncrementalResult::Unknown(
+                        crate::accel::cdcl::UnknownReason::BackendError,
+                    );
+                    requests.len()
+                ];
+                let mut trusted_cpu = vec![false; requests.len()];
+                let mut hardware_indices = Vec::new();
+                let mut hardware_requests = Vec::new();
+                for (index, decision) in decisions.into_iter().enumerate() {
+                    match decision {
+                        ActivePreflight::Fpga => {
+                            hardware_indices.push(index);
+                            hardware_requests.push((requests[index].0, requests[index].1.clone()));
+                        }
+                        ActivePreflight::Conclusive(result) => {
+                            results[index] = result;
+                            trusted_cpu[index] = true;
+                        }
+                        ActivePreflight::CpuFallback => {}
+                    }
+                }
+                for (index, result) in
+                    hardware_indices
+                        .into_iter()
+                        .zip(crate::accel::cdcl_host::solve_active_batch(
+                            hardware_requests,
+                        ))
+                {
+                    results[index] = result;
+                }
+                block_batch.inquiries = candidates
+                    .into_iter()
+                    .zip(requests.into_iter().map(|(_, query)| query))
+                    .zip(results.into_iter().zip(trusted_cpu))
+                    .map(
+                        |(((frame, state), query), (result, trusted_cpu))| CachedBlockInquiry {
+                            frame,
+                            state,
+                            query,
+                            result,
+                            trusted_cpu,
+                        },
+                    )
+                    .collect();
+                cached_block = block_batch.take(&po);
+            }
+
+            let mut speculative_pred = None;
+            let speculative =
+                cached_block.and_then(|entry| match (entry.trusted_cpu, entry.result) {
+                    (true, IncrementalResult::Sat { model }) => {
+                        let validation_start = Instant::now();
+                        let accepted = self.solvers[po.frame - 1]
+                            .validate_incremental_sat_model(&entry.query, &model);
+                        speculative_pred = accepted
+                            .then(|| self.full_pred_from_incremental_model(&model))
+                            .flatten();
+                        let accepted = speculative_pred.is_some();
+                        crate::accel::cdcl_host::note_active_preflight_result(
+                            false,
+                            accepted,
+                            validation_start.elapsed().as_nanos() as u64,
+                        );
+                        accepted.then_some(false)
+                    }
+                    (
+                        true,
+                        IncrementalResult::Unsat {
+                            core,
+                            used_constraints,
+                        },
+                    ) => {
+                        let restore_start = Instant::now();
+                        let accepted = self.solvers[po.frame - 1]
+                            .install_incremental_cpu_unsat_core(
+                                &po.state,
+                                &entry.query,
+                                &core,
+                                used_constraints,
+                            );
+                        crate::accel::cdcl_host::note_active_preflight_result(
+                            true,
+                            accepted,
+                            restore_start.elapsed().as_nanos() as u64,
+                        );
+                        accepted.then_some(true)
+                    }
+                    (false, IncrementalResult::Sat { model }) => {
+                        let validation_start = Instant::now();
+                        let accepted = self.solvers[po.frame - 1]
+                            .validate_incremental_sat_model(&entry.query, &model);
+                        speculative_pred = accepted
+                            .then(|| self.full_pred_from_incremental_model(&model))
+                            .flatten();
+                        let accepted = speculative_pred.is_some();
+                        crate::accel::cdcl_host::note_active_sat_model(
+                            accepted,
+                            validation_start.elapsed().as_nanos() as u64,
+                        );
+                        accepted.then_some(false)
+                    }
+                    (false, IncrementalResult::Unsat { core, .. }) => {
+                        let validation_start = Instant::now();
+                        let cpu_core_len = self.solvers[po.frame - 1]
+                            .validate_incremental_unsat_core(&po.state, &entry.query, &core);
+                        crate::accel::cdcl_host::note_active_unsat_core(
+                            cpu_core_len.is_some(),
+                            entry.query.assumptions.len(),
+                            core.len(),
+                            cpu_core_len.unwrap_or(0),
+                            validation_start.elapsed().as_nanos() as u64,
+                        );
+                        cpu_core_len.map(|_| true)
+                    }
+                    (_, IncrementalResult::Unknown(_)) => {
+                        crate::accel::cdcl_host::note_active_cpu_fallback();
+                        None
+                    }
+                });
+            let blocked = match speculative {
+                Some(blocked) => blocked,
+                None => self
+                    .blocked(po.frame, &po.state)
+                    .in_phase(inductor_trace::Phase::Block)
+                    .with_act_order(false)
+                    .check(),
+            };
             self.statistic.block.blocked_time += blocked_start.elapsed();
             if blocked {
                 noc += 1;
@@ -167,7 +432,9 @@ impl IC3 {
                 }
                 debug!("{}", self.frame.statistic(false));
             } else {
-                let (model, inputs) = self.get_pred(po.frame, true);
+                let (model, inputs) = speculative_pred
+                    .take()
+                    .unwrap_or_else(|| self.get_pred(po.frame, true));
                 self.add_obligation(ProofObligation::new(
                     po.frame - 1,
                     LitOrdVec::new(model),

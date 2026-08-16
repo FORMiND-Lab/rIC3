@@ -369,6 +369,14 @@ impl DagCnfSolver {
         Some(assignment)
     }
 
+    pub fn validate_incremental_sat_model(
+        &self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        self.validated_incremental_assignment(query, model).is_some()
+    }
+
     /// Validate and import a complete FPGA SAT model into GipSAT's live trail.
     /// Downstream IC3 code can then use `sat_value` and `flip_to_none` exactly
     /// as after an ordinary CPU SAT search. Any malformed, stale, or internally

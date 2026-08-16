@@ -1956,7 +1956,15 @@ pub fn paired_enabled() -> bool {
 /// Whether IC3 should prepare one speculative propagation batch. Active mode
 /// may consume validated answers; paired mode deliberately never does.
 pub fn propagation_batch_enabled() -> bool {
-    active_enabled() || paired_enabled()
+    (active_enabled() || paired_enabled())
+        && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
+}
+
+/// Whether IC3 should speculate over the currently queued proof obligations.
+/// Every consumed answer is checked again against the live frame.
+pub fn block_batch_enabled() -> bool {
+    (active_enabled() || paired_enabled())
+        && std::env::var_os("INDUCTOR_CDCL_BLOCK_BATCH").is_some()
 }
 
 fn shadow_state() -> &'static std::sync::Mutex<ShadowState> {
@@ -2084,7 +2092,7 @@ pub fn solve_active_batch(
 ) -> Vec<IncrementalResult> {
     let unknown = IncrementalResult::Unknown(super::cdcl::UnknownReason::BackendError);
     let mut output = vec![unknown.clone(); requests.len()];
-    if requests.is_empty() || !propagation_batch_enabled() {
+    if requests.is_empty() || !(active_enabled() || paired_enabled()) {
         return output;
     }
     let paired = paired_enabled();
