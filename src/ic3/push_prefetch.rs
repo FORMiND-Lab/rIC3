@@ -317,6 +317,12 @@ impl PushPrefetchCache {
         crate::accel::cdcl_host::note_active_push_prefetch_evicted(
             before.saturating_sub(self.ready.len()),
         );
+        // Publish a completed hardware batch only at a propagation-pass
+        // boundary.  Do not wait for a late batch here: measured boundary
+        // joins increased FPGA occupancy but sent IC3 down a longer proof
+        // path.  Harvesting from `take` made visibility depend on whether the
+        // device finished between two adjacent lemmas, producing even larger
+        // proof-path swings despite every individual core being valid.
         self.harvest_ready(self.epoch.saturating_sub(1));
     }
 
@@ -366,7 +372,6 @@ impl PushPrefetchCache {
         frame_idx: usize,
         lemma: &LitOrdVec,
     ) -> Option<PrefetchedPushInquiry> {
-        self.harvest_ready(self.epoch);
         let index = self
             .ready
             .iter()
@@ -476,10 +481,12 @@ impl Drop for PushPrefetchCache {
 #[cfg(test)]
 mod tests {
     use super::{
-        result_cacheable, CachedPushInquiry, FinishedPushBatch, PushBatchStat, PushPrefetchCache,
+        result_cacheable, CachedPushInquiry, FinishedPushBatch, PendingPushBatch, PushBatchStat,
+        PushPrefetchCache,
     };
     use crate::{accel::cdcl::UnknownReason, gipsat::IncrementalResult};
     use logicrs::{Lit, LitOrdVec, LitVec, Var};
+    use std::time::Instant;
 
     fn inquiry(frame_idx: usize, lit: Lit, result: IncrementalResult) -> CachedPushInquiry {
         CachedPushInquiry {
@@ -561,6 +568,35 @@ mod tests {
         assert!(!result_cacheable(&sat, false));
         assert!(result_cacheable(&sat, true));
         assert!(result_cacheable(&unsat, false));
+    }
+
+    #[test]
+    fn pending_results_are_published_only_at_pass_boundaries() {
+        let a = Lit::new(Var::from(0), true);
+        let lemma = LitOrdVec::new(LitVec::from([a]));
+        let result = IncrementalResult::Unsat {
+            core: LitVec::from([a]),
+            used_constraints: false,
+        };
+        let mut cache = PushPrefetchCache::default();
+        cache.begin_pass();
+        cache.pending = Some(PendingPushBatch {
+            batch_id: 1,
+            keys: vec![(2, lemma.clone())],
+            handle: Some(std::thread::spawn(move || vec![result])),
+            launched_at: Instant::now(),
+        });
+
+        while !cache.pending.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(cache.take(2, &lemma).is_none());
+        cache.begin_pass();
+        assert!(cache.pending.is_none());
+        assert!(matches!(
+            cache.take(2, &lemma).map(|inquiry| inquiry.result),
+            Some(IncrementalResult::Unsat { .. })
+        ));
     }
 
     #[test]
