@@ -674,12 +674,23 @@ static ACTIVE_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_ERROR: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAT_LIFT_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAT_LIFT_SUCCEEDED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAT_FULL_LITS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAT_LIFTED_LITS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SAT_LIFT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_CORE_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_CORE_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_ASSUMPTION_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_HW_CORE_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_CPU_CORE_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CPU_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_COST_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CPU_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CALIBRATIONS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CALIBRATION_PROFITABLE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CALIBRATION_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -981,7 +992,7 @@ fn active_batch_size() -> usize {
     })
 }
 
-fn active_min_batch_size() -> usize {
+pub fn active_min_batch_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         std::env::var("INDUCTOR_CDCL_ACTIVE_MIN_BATCH")
@@ -2395,6 +2406,24 @@ pub fn note_active_sat_model(accepted: bool, validation_ns: u64) {
     }
 }
 
+pub fn note_active_sat_lift(
+    attempted: bool,
+    succeeded: bool,
+    full_lits: usize,
+    result_lits: usize,
+    elapsed_ns: u64,
+) {
+    if attempted {
+        ACTIVE_SAT_LIFT_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+    }
+    if succeeded {
+        ACTIVE_SAT_LIFT_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
+    }
+    ACTIVE_SAT_FULL_LITS.fetch_add(full_lits as u64, Ordering::Relaxed);
+    ACTIVE_SAT_LIFTED_LITS.fetch_add(result_lits as u64, Ordering::Relaxed);
+    ACTIVE_SAT_LIFT_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
 pub fn note_active_unsat_core(
     accepted: bool,
     assumption_lits: usize,
@@ -2416,6 +2445,23 @@ pub fn note_active_unsat_core(
 
 pub fn note_active_cpu_fallback() {
     ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_block_cost_rejected() {
+    ACTIVE_BLOCK_COST_REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_block_cpu_sample(elapsed_ns: u64) {
+    ACTIVE_BLOCK_CPU_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_BLOCK_CPU_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
+pub fn note_active_block_calibration(profitable: bool, elapsed_ns: u64) {
+    ACTIVE_BLOCK_CALIBRATIONS.fetch_add(1, Ordering::Relaxed);
+    if profitable {
+        ACTIVE_BLOCK_CALIBRATION_PROFITABLE.fetch_add(1, Ordering::Relaxed);
+    }
+    ACTIVE_BLOCK_CALIBRATION_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
 }
 
 pub fn note_active_preflight_result(
@@ -2585,7 +2631,7 @@ pub fn flush_and_report() {
             flush_comparison_writer();
         }
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations profitable/total {}/{}, calibration {:.3} ms, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -2608,12 +2654,25 @@ pub fn flush_and_report() {
             ACTIVE_HW_LEARNTS.load(Ordering::Relaxed),
             ACTIVE_SAT_USED.load(Ordering::Relaxed),
             ACTIVE_SAT_REJECTED.load(Ordering::Relaxed),
+            ACTIVE_SAT_LIFT_SUCCEEDED.load(Ordering::Relaxed),
+            ACTIVE_SAT_LIFT_ATTEMPTED.load(Ordering::Relaxed),
+            ACTIVE_SAT_FULL_LITS.load(Ordering::Relaxed),
+            ACTIVE_SAT_LIFTED_LITS.load(Ordering::Relaxed),
+            ACTIVE_SAT_LIFT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_UNSAT_CORE_USED.load(Ordering::Relaxed),
             ACTIVE_UNSAT_CORE_REJECTED.load(Ordering::Relaxed),
             ACTIVE_UNSAT_ASSUMPTION_LITS.load(Ordering::Relaxed),
             ACTIVE_UNSAT_HW_CORE_LITS.load(Ordering::Relaxed),
             ACTIVE_UNSAT_CPU_CORE_LITS.load(Ordering::Relaxed),
             ACTIVE_CPU_FALLBACK.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_COST_REJECTED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CPU_SAMPLES.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CPU_NS.load(Ordering::Relaxed) as f64
+                / ACTIVE_BLOCK_CPU_SAMPLES.load(Ordering::Relaxed).max(1) as f64
+                / 1_000.0,
+            ACTIVE_BLOCK_CALIBRATION_PROFITABLE.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CALIBRATIONS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CALIBRATION_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_STATE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,

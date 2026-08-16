@@ -91,6 +91,8 @@ pub struct DagCnfSolver {
     resident_lemmas: Vec<LitVec>,
 
     statistic: SolverStatistic,
+    solve_time_ns: u64,
+    solve_time_samples: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +168,8 @@ impl DagCnfSolver {
             resident_trans,
             resident_lemmas: Default::default(),
             statistic: Default::default(),
+            solve_time_ns: 0,
+            solve_time_samples: 0,
             trivial_unsat: false,
             accel_id: Self::fresh_accel_id(),
             accel_level: 0,
@@ -199,6 +203,21 @@ impl DagCnfSolver {
         }
         assert!(solver.propagate() == CREF_NONE);
         solver
+    }
+
+    fn record_solve_time(&mut self, start: Instant) {
+        let elapsed = start.elapsed();
+        self.statistic.avg_solve_time += elapsed;
+        self.solve_time_ns = self
+            .solve_time_ns
+            .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+        self.solve_time_samples = self.solve_time_samples.saturating_add(1);
+    }
+
+    /// Cost history for zero-extra-solve accelerator profitability estimates.
+    /// Proof correctness never depends on these counters.
+    pub fn solve_time_totals(&self) -> (u64, u64) {
+        (self.solve_time_ns, self.solve_time_samples)
     }
 
     #[inline]
@@ -350,7 +369,7 @@ impl DagCnfSolver {
         if self.propagate() != CREF_NONE {
             self.trivial_unsat = true;
             self.unsat_core.clear();
-            self.statistic.avg_solve_time += start.elapsed();
+            self.record_solve_time(start);
             self.probe.t_setup_ns = probe_setup.ns();
             self.probe.t_total_ns = probe_total.ns();
             crate::inductor::record(&self.probe, Some(false));
@@ -371,7 +390,7 @@ impl DagCnfSolver {
                 .fetch_add(probe_dom.ns() as u64, std::sync::atomic::Ordering::Relaxed);
             if !nr_ok {
                 self.unsat_core.clear();
-                self.statistic.avg_solve_time += start.elapsed();
+                self.record_solve_time(start);
                 self.probe.t_setup_ns = probe_setup.ns();
                 self.probe.t_total_ns = probe_total.ns();
                 crate::inductor::record(&self.probe, Some(false));
@@ -575,7 +594,7 @@ impl DagCnfSolver {
         }
         crate::inductor::record(&self.probe, res);
 
-        self.statistic.avg_solve_time += start.elapsed();
+        self.record_solve_time(start);
         res
     }
 

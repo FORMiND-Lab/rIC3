@@ -183,6 +183,7 @@ pub struct IC3 {
     auxiliary_var: Vec<Var>,
     predprop: Option<PredProp>,
     mab: mab::CtxMab,
+    block_accel_policy: block::BlockAccelPolicy,
 
     rng: StdRng,
     filog: IntervalLogger,
@@ -296,6 +297,7 @@ impl IC3 {
             rst,
             predprop,
             mab,
+            block_accel_policy: Default::default(),
             rng,
             filog: Default::default(),
             tracer: Tracer::new(),

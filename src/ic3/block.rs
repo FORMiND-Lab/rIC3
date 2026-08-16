@@ -7,7 +7,8 @@ use crate::ic3::{
 use giputils::TerminateCtrl;
 use log::{debug, info};
 use logicrs::{Lit, LitOrdVec, LitVec, satif::Satif};
-use std::time::Instant;
+use rand::seq::SliceRandom;
+use std::{collections::VecDeque, time::Instant};
 
 use crate::{
     accel::cdcl_host::ActivePreflight,
@@ -25,6 +26,150 @@ struct CachedBlockInquiry {
 #[derive(Default)]
 struct BlockBatchCache {
     inquiries: Vec<CachedBlockInquiry>,
+}
+
+#[derive(Default)]
+pub(super) struct BlockAccelPolicy {
+    cpu_samples_ns: VecDeque<u64>,
+    hardware_since_sample: usize,
+    calibration_profitable: Option<bool>,
+}
+
+impl BlockAccelPolicy {
+    fn min_samples() -> usize {
+        use std::sync::OnceLock;
+        static SAMPLES: OnceLock<usize> = OnceLock::new();
+        *SAMPLES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_COST_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8)
+                .clamp(1, 64)
+        })
+    }
+
+    fn min_cpu_ns() -> u64 {
+        use std::sync::OnceLock;
+        static MIN_NS: OnceLock<u64> = OnceLock::new();
+        *MIN_NS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_MIN_CPU_NS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(100_000)
+        })
+    }
+
+    fn resample_interval() -> usize {
+        use std::sync::OnceLock;
+        static INTERVAL: OnceLock<usize> = OnceLock::new();
+        *INTERVAL.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_RESAMPLE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64)
+                .max(1)
+        })
+    }
+
+    fn sample_window() -> usize {
+        use std::sync::OnceLock;
+        static WINDOW: OnceLock<usize> = OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_COST_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256)
+                .clamp(Self::min_samples(), 4096)
+        })
+    }
+
+    fn mean_cpu_ns(&self) -> Option<u64> {
+        if self.cpu_samples_ns.len() < Self::min_samples() {
+            return None;
+        }
+        Some(
+            self.cpu_samples_ns.iter().copied().sum::<u64>()
+                / self.cpu_samples_ns.len() as u64,
+        )
+    }
+
+    fn should_offload(&self, solver_mean_ns: Option<u64>) -> bool {
+        self.should_offload_at(
+            solver_mean_ns,
+            Self::min_cpu_ns(),
+            Self::resample_interval(),
+        )
+    }
+
+    fn should_offload_at(
+        &self,
+        solver_mean_ns: Option<u64>,
+        min_cpu_ns: u64,
+        resample_interval: usize,
+    ) -> bool {
+        self.hardware_since_sample < resample_interval
+            && (self.calibration_profitable == Some(true)
+                || solver_mean_ns.is_some_and(|mean| mean >= min_cpu_ns)
+                || self
+                    .mean_cpu_ns()
+                    .is_some_and(|mean| mean >= min_cpu_ns))
+    }
+
+    fn needs_calibration(&self) -> bool {
+        self.calibration_profitable.is_none()
+    }
+
+    fn note_calibration(&mut self, elapsed_ns: u64) -> bool {
+        let profitable = elapsed_ns >= Self::min_cpu_ns();
+        self.calibration_profitable = Some(profitable);
+        crate::accel::cdcl_host::note_active_block_calibration(profitable, elapsed_ns);
+        profitable
+    }
+
+    fn note_cpu(&mut self, elapsed_ns: u64) {
+        let window = Self::sample_window();
+        if self.cpu_samples_ns.len() == window {
+            self.cpu_samples_ns.pop_front();
+        }
+        self.cpu_samples_ns.push_back(elapsed_ns);
+        self.hardware_since_sample = 0;
+        crate::accel::cdcl_host::note_active_block_cpu_sample(elapsed_ns);
+    }
+
+    fn note_hardware(&mut self) {
+        self.hardware_since_sample = self.hardware_since_sample.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod block_accel_policy_tests {
+    use super::BlockAccelPolicy;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn expected_cpu_cost_and_periodic_resampling_gate_offload() {
+        let fast = BlockAccelPolicy {
+            cpu_samples_ns: VecDeque::from(vec![20_000; 64]),
+            ..Default::default()
+        };
+        assert!(!fast.should_offload_at(None, 100_000, 64));
+
+        let mut expensive = BlockAccelPolicy {
+            cpu_samples_ns: VecDeque::from(vec![200_000; 64]),
+            ..Default::default()
+        };
+        assert!(expensive.should_offload_at(None, 100_000, 64));
+        for _ in 0..64 {
+            expensive.note_hardware();
+        }
+        assert!(!expensive.should_offload_at(None, 100_000, 64));
+
+        let calibrated = BlockAccelPolicy {
+            calibration_profitable: Some(true),
+            ..Default::default()
+        };
+        assert!(calibrated.should_offload_at(None, 100_000, 64));
+    }
 }
 
 impl BlockBatchCache {
@@ -48,6 +193,17 @@ impl BlockBatchCache {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(128)
+        })
+    }
+
+    fn model_lift_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_MODEL_LIFT")
+                .ok()
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .unwrap_or(true)
         })
     }
 
@@ -95,6 +251,54 @@ impl IC3 {
             })
             .collect::<Option<LitVec>>()?;
         Some((state, vec![inputs]))
+    }
+
+    fn pred_from_incremental_model(
+        &mut self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> Option<(LitVec, Vec<LitVec>)> {
+        let full = self.full_pred_from_incremental_model(model)?;
+        let full_lits = full.0.len();
+        let attempted = BlockBatchCache::model_lift_enabled() && query.constraints.is_empty();
+        let start = Instant::now();
+        let lifted = attempted
+            .then(|| {
+                let mut target = query.assumptions.clone();
+                target.extend(self.ts.constraint.iter().copied());
+                target.retain(|lit| self.localabs.refine_has(lit.var()));
+                let order = |mut iteration: usize, cube: &mut [Lit]| -> bool {
+                    if self.cfg.inn || !self.auxiliary_var.is_empty() {
+                        if iteration == 0 {
+                            cube.sort_by(|a, b| {
+                                self.ts_top_lv[b]
+                                    .cmp(&self.ts_top_lv[a])
+                                    .then_with(|| self.activity.cmp(b, a))
+                            });
+                            return true;
+                        }
+                        iteration -= 1;
+                    }
+                    match iteration {
+                        0 => self.activity.sort_by_activity(cube, false),
+                        1 => cube.reverse(),
+                        _ => cube.shuffle(&mut self.rng),
+                    }
+                    true
+                };
+                self.lift.lift_model(model, target, order)
+            })
+            .flatten();
+        let succeeded = lifted.is_some();
+        let result = lifted.unwrap_or(full);
+        crate::accel::cdcl_host::note_active_sat_lift(
+            attempted,
+            succeeded,
+            full_lits,
+            result.0.len(),
+            start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+        Some(result)
     }
 
     fn push_lemma(&mut self, frame: usize, mut cube: LitVec) -> (usize, LitVec) {
@@ -218,9 +422,31 @@ impl IC3 {
             // satisfy the exact live frame when this obligation is consumed,
             // and an UNSAT core is re-proved by exact GipSAT. New lemmas can
             // therefore invalidate speculation but cannot make it unsound.
+            let (solver_total_ns, solver_samples) = self.solvers.iter().fold(
+                (0u64, 0u64),
+                |(total_ns, samples), solver| {
+                    let (solver_ns, solver_samples) = solver.dcs.solve_time_totals();
+                    (
+                        total_ns.saturating_add(solver_ns),
+                        samples.saturating_add(solver_samples),
+                    )
+                },
+            );
+            let solver_mean_ns = (solver_samples >= BlockAccelPolicy::min_samples() as u64)
+                .then(|| solver_total_ns / solver_samples.max(1));
+            let needs_calibration = self.block_accel_policy.needs_calibration();
+            let block_cost_eligible = po.frame > 0
+                && (needs_calibration || self.block_accel_policy.should_offload(solver_mean_ns));
+            if po.frame > 0
+                && !block_cost_eligible
+                && crate::accel::cdcl_host::block_batch_enabled()
+            {
+                crate::accel::cdcl_host::note_active_block_cost_rejected();
+            }
             if cached_block.is_none()
                 && po.frame > 0
                 && crate::accel::cdcl_host::block_batch_enabled()
+                && block_cost_eligible
                 && self.solvers[po.frame - 1].dcs.num_var()
                     >= BlockBatchCache::min_context_vars()
             {
@@ -258,6 +484,34 @@ impl IC3 {
                     })
                     .collect();
                 let mut decisions = vec![ActivePreflight::Fpga; requests.len()];
+                if crate::accel::cdcl_host::active_enabled()
+                    && needs_calibration
+                    && requests.len() >= crate::accel::cdcl_host::active_min_batch_size()
+                {
+                    let sample_index = requests.len() / 2;
+                    let (sample_solver, sample_query) = &requests[sample_index];
+                    let mut sample_solver = (*sample_solver).clone();
+                    let sample_start = Instant::now();
+                    let sample_result = sample_solver.classify_incremental_exact(sample_query);
+                    let sample_ns = sample_start
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64;
+                    let profitable = self.block_accel_policy.note_calibration(sample_ns);
+                    decisions[sample_index] = match sample_result {
+                        IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
+                            ActivePreflight::Conclusive(sample_result)
+                        }
+                        IncrementalResult::Unknown(_) => ActivePreflight::CpuFallback,
+                    };
+                    if !profitable {
+                        for (index, decision) in decisions.iter_mut().enumerate() {
+                            if index != sample_index {
+                                *decision = ActivePreflight::CpuFallback;
+                            }
+                        }
+                    }
+                }
                 if crate::accel::cdcl_host::active_enabled() {
                     let sample_requests: Vec<_> = requests
                         .iter()
@@ -325,7 +579,7 @@ impl IC3 {
                         let accepted = self.solvers[po.frame - 1]
                             .validate_incremental_sat_model(&entry.query, &model);
                         speculative_pred = accepted
-                            .then(|| self.full_pred_from_incremental_model(&model))
+                            .then(|| self.pred_from_incremental_model(&entry.query, &model))
                             .flatten();
                         let accepted = speculative_pred.is_some();
                         crate::accel::cdcl_host::note_active_preflight_result(
@@ -362,7 +616,7 @@ impl IC3 {
                         let accepted = self.solvers[po.frame - 1]
                             .validate_incremental_sat_model(&entry.query, &model);
                         speculative_pred = accepted
-                            .then(|| self.full_pred_from_incremental_model(&model))
+                            .then(|| self.pred_from_incremental_model(&entry.query, &model))
                             .flatten();
                         let accepted = speculative_pred.is_some();
                         crate::accel::cdcl_host::note_active_sat_model(
@@ -390,12 +644,22 @@ impl IC3 {
                     }
                 });
             let blocked = match speculative {
-                Some(blocked) => blocked,
-                None => self
-                    .blocked(po.frame, &po.state)
-                    .in_phase(inductor_trace::Phase::Block)
-                    .with_act_order(false)
-                    .check(),
+                Some(blocked) => {
+                    self.block_accel_policy.note_hardware();
+                    blocked
+                }
+                None => {
+                    let cpu_start = Instant::now();
+                    let blocked = self
+                        .blocked(po.frame, &po.state)
+                        .in_phase(inductor_trace::Phase::Block)
+                        .with_act_order(false)
+                        .check();
+                    self.block_accel_policy.note_cpu(
+                        cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                    blocked
+                }
             };
             self.statistic.block.blocked_time += blocked_start.elapsed();
             if blocked {
