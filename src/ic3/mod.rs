@@ -33,6 +33,7 @@ mod mic;
 mod predprop;
 mod proofoblig;
 mod propagate;
+mod push_prefetch;
 mod solver;
 mod ui;
 mod utils;
@@ -184,6 +185,7 @@ pub struct IC3 {
     predprop: Option<PredProp>,
     mab: mab::CtxMab,
     block_accel_policy: block::BlockAccelPolicy,
+    push_prefetch: push_prefetch::PushPrefetchCache,
 
     rng: StdRng,
     filog: IntervalLogger,
@@ -298,6 +300,7 @@ impl IC3 {
             predprop,
             mab,
             block_accel_policy: Default::default(),
+            push_prefetch: Default::default(),
             rng,
             filog: Default::default(),
             tracer: Tracer::new(),
@@ -533,6 +536,7 @@ impl Engine for IC3 {
                 .collect();
             crate::inductor::report_solver_fanout(self.solvers.len(), &per);
         }
+        self.push_prefetch.finish();
         crate::accel::report();
         crate::inductor::finish(
             name,

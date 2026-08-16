@@ -13,9 +13,111 @@ use rand::seq::SliceRandom;
 use std::time::Instant;
 
 impl IC3 {
+    fn consume_hardware_push_result(
+        &mut self,
+        frame_idx: usize,
+        lemma: &LitOrdVec,
+        query: &IncrementalQuery,
+        result: &IncrementalResult,
+        prefetched: bool,
+    ) -> Option<bool> {
+        let answer = match result {
+            IncrementalResult::Sat { model } => {
+                let validation_start = Instant::now();
+                let accepted = self.solvers[frame_idx].install_incremental_sat_model(query, model);
+                crate::accel::cdcl_host::note_active_sat_model(
+                    accepted,
+                    validation_start.elapsed().as_nanos() as u64,
+                );
+                accepted.then_some(false)
+            }
+            IncrementalResult::Unsat { core, .. } => {
+                let validation_start = Instant::now();
+                let cpu_core_len =
+                    self.solvers[frame_idx].validate_incremental_unsat_core(lemma, query, core);
+                crate::accel::cdcl_host::note_active_unsat_core(
+                    cpu_core_len.is_some(),
+                    query.assumptions.len(),
+                    core.len(),
+                    cpu_core_len.unwrap_or(0),
+                    validation_start.elapsed().as_nanos() as u64,
+                );
+                cpu_core_len.map(|_| true)
+            }
+            IncrementalResult::Unknown(_) => {
+                crate::accel::cdcl_host::note_active_cpu_fallback();
+                None
+            }
+        };
+        if prefetched {
+            crate::accel::cdcl_host::note_active_push_prefetch_hit(answer.is_some());
+        }
+        answer
+    }
+
+    fn launch_push_prefetch(&mut self, from: usize, level: usize) {
+        if !crate::accel::cdcl_host::push_prefetch_enabled() {
+            return;
+        }
+        if self.push_prefetch.busy() {
+            crate::accel::cdcl_host::note_active_push_prefetch_busy();
+            return;
+        }
+        // The next successful outer iteration extends IC3 by one level and
+        // starts propagation at today's top frame. Prefetch that exact
+        // look-ahead first; old-frame repeats are only secondary candidates.
+        let n_candidates = std::iter::once(level)
+            .chain(from..level)
+            .map(|frame_idx| self.frame[frame_idx].len())
+            .sum::<usize>()
+            .min(super::push_prefetch::PushPrefetchCache::launch_window());
+        if n_candidates < crate::accel::cdcl_host::active_min_batch_size() {
+            return;
+        }
+
+        let prepare_start = Instant::now();
+        let mut keys = Vec::with_capacity(n_candidates);
+        let mut solver_frames = Vec::new();
+        let mut owned_solvers = Vec::new();
+        let mut owned_requests = Vec::with_capacity(n_candidates);
+        'frames: for frame_idx in std::iter::once(level).chain(from..level) {
+            let mut lemmas: Vec<_> = self.frame[frame_idx].iter().collect();
+            lemmas.sort_by_key(|lemma| lemma.len());
+            for lemma in lemmas {
+                if keys.len() == n_candidates {
+                    break 'frames;
+                }
+                let solver_index = match solver_frames
+                    .iter()
+                    .position(|candidate| *candidate == frame_idx)
+                {
+                    Some(solver_index) => solver_index,
+                    None => {
+                        solver_frames.push(frame_idx);
+                        owned_solvers.push(self.solvers[frame_idx].dcs.clone());
+                        owned_solvers.len() - 1
+                    }
+                };
+                keys.push((frame_idx, LitOrdVec::new(lemma.as_litvec().clone())));
+                owned_requests.push((
+                    solver_index,
+                    self.solvers[frame_idx].incremental_inductive_query(lemma, true, vec![]),
+                ));
+            }
+        }
+        let prepare_ns = prepare_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.push_prefetch
+            .start(keys, owned_solvers, owned_requests, prepare_ns);
+    }
+
     pub fn propagate(&mut self, from: Option<usize>) -> bool {
         let level = self.level();
         let from = from.unwrap_or(self.frame.early).max(1);
+        let push_prefetch_enabled =
+            crate::accel::cdcl_host::push_prefetch_enabled();
+        if push_prefetch_enabled {
+            self.push_prefetch.begin_pass();
+        }
         // Prepare the whole propagation pass before mutating any frame. SAT
         // models are safe to speculate this far ahead because every model is
         // checked again against the live solver immediately before use; a
@@ -23,11 +125,12 @@ impl IC3 {
         // trigger CPU fallback.
         let propagation_batch_enabled =
             crate::accel::cdcl_host::propagation_batch_enabled();
+        let prepare_accel_queries = propagation_batch_enabled || push_prefetch_enabled;
         let mut work: Vec<(usize, Frame, Vec<IncrementalQuery>)> = Vec::new();
         for frame_idx in from..level {
             let mut frame = self.frame[frame_idx].clone();
             frame.sort_by_key(|x| x.len());
-            let active_queries = if propagation_batch_enabled {
+            let active_queries = if prepare_accel_queries {
                 frame
                     .iter()
                     .map(|lemma| {
@@ -45,7 +148,9 @@ impl IC3 {
             .map(|(_, _, queries)| queries.len())
             .sum::<usize>();
         let mut preflight = vec![ActivePreflight::Fpga; n_queries];
-        if crate::accel::cdcl_host::active_preflight_should_run(n_queries) {
+        if propagation_batch_enabled
+            && crate::accel::cdcl_host::active_preflight_should_run(n_queries)
+        {
             let mut query_index = 0usize;
             for (frame_idx, _, queries) in &work {
                 for query in queries {
@@ -116,81 +221,64 @@ impl IC3 {
                     // to the ordinary full GipSAT inquiry below.
                     let active_answer = if ctp == 0 {
                         let result_index = frame_result_offset + lemma_index;
-                        match preflight.get(result_index) {
-                            Some(ActivePreflight::Conclusive(
-                                IncrementalResult::Sat { model },
-                            )) => {
-                                let restore_start = Instant::now();
-                                let accepted = self.solvers[frame_idx]
-                                    .install_incremental_sat_model(
-                                        &active_queries[lemma_index],
-                                        model,
-                                    );
-                                crate::accel::cdcl_host::note_active_preflight_result(
-                                    false,
-                                    accepted,
-                                    restore_start.elapsed().as_nanos() as u64,
-                                );
-                                accepted.then_some(false)
-                            }
-                            Some(ActivePreflight::Conclusive(
-                                IncrementalResult::Unsat {
-                                    core,
-                                    used_constraints,
-                                },
-                            )) => {
-                                let restore_start = Instant::now();
-                                let accepted = self.solvers[frame_idx]
-                                    .install_incremental_cpu_unsat_core(
-                                        lemma.as_litvec(),
-                                        &active_queries[lemma_index],
-                                        core,
-                                        *used_constraints,
-                                    );
-                                crate::accel::cdcl_host::note_active_preflight_result(
-                                    true,
-                                    accepted,
-                                    restore_start.elapsed().as_nanos() as u64,
-                                );
-                                accepted.then_some(true)
-                            }
-                            _ => match active_results.get(result_index) {
-                                Some(IncrementalResult::Sat { model }) => {
-                                    let validation_start = Instant::now();
+                        let prefetched = push_prefetch_enabled
+                            .then(|| self.push_prefetch.take(frame_idx, &lemma))
+                            .flatten();
+                        if let Some(result) = prefetched.as_ref() {
+                            self.consume_hardware_push_result(
+                                frame_idx,
+                                &lemma,
+                                &active_queries[lemma_index],
+                                result,
+                                true,
+                            )
+                        } else {
+                            match preflight.get(result_index) {
+                                Some(ActivePreflight::Conclusive(IncrementalResult::Sat {
+                                    model,
+                                })) => {
+                                    let restore_start = Instant::now();
                                     let accepted = self.solvers[frame_idx]
                                         .install_incremental_sat_model(
                                             &active_queries[lemma_index],
                                             model,
                                         );
-                                    crate::accel::cdcl_host::note_active_sat_model(
+                                    crate::accel::cdcl_host::note_active_preflight_result(
+                                        false,
                                         accepted,
-                                        validation_start.elapsed().as_nanos() as u64,
+                                        restore_start.elapsed().as_nanos() as u64,
                                     );
                                     accepted.then_some(false)
                                 }
-                                Some(IncrementalResult::Unsat { core, .. }) => {
-                                    let validation_start = Instant::now();
-                                    let cpu_core_len = self.solvers[frame_idx]
-                                        .validate_incremental_unsat_core(
+                                Some(ActivePreflight::Conclusive(IncrementalResult::Unsat {
+                                    core,
+                                    used_constraints,
+                                })) => {
+                                    let restore_start = Instant::now();
+                                    let accepted = self.solvers[frame_idx]
+                                        .install_incremental_cpu_unsat_core(
                                             lemma.as_litvec(),
                                             &active_queries[lemma_index],
                                             core,
+                                            *used_constraints,
                                         );
-                                    crate::accel::cdcl_host::note_active_unsat_core(
-                                        cpu_core_len.is_some(),
-                                        active_queries[lemma_index].assumptions.len(),
-                                        core.len(),
-                                        cpu_core_len.unwrap_or(0),
-                                        validation_start.elapsed().as_nanos() as u64,
+                                    crate::accel::cdcl_host::note_active_preflight_result(
+                                        true,
+                                        accepted,
+                                        restore_start.elapsed().as_nanos() as u64,
                                     );
-                                    cpu_core_len.map(|_| true)
+                                    accepted.then_some(true)
                                 }
-                                Some(IncrementalResult::Unknown(_)) => {
-                                    crate::accel::cdcl_host::note_active_cpu_fallback();
-                                    None
-                                }
-                                None => None,
-                            },
+                                _ => active_results.get(result_index).and_then(|result| {
+                                    self.consume_hardware_push_result(
+                                        frame_idx,
+                                        &lemma,
+                                        &active_queries[lemma_index],
+                                        result,
+                                        false,
+                                    )
+                                }),
+                            }
                         }
                     } else {
                         None
@@ -246,6 +334,7 @@ impl IC3 {
                 return true;
             }
         }
+        self.launch_push_prefetch(from, level);
         self.frame.early = self.level();
         false
     }

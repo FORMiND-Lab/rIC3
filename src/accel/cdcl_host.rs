@@ -726,6 +726,18 @@ static ACTIVE_BLOCK_ASYNC_HARVESTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_JOIN_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_LAUNCHED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_QUERIES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_HARVESTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_READY: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_HITS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_EVICTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_BUSY: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_JOIN_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -2035,6 +2047,21 @@ pub fn paired_enabled() -> bool {
 pub fn propagation_batch_enabled() -> bool {
     (active_enabled() || paired_enabled())
         && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
+        && !push_prefetch_enabled()
+}
+
+/// Run lemma-push inquiries in the background after one pass and consume only
+/// live-validated answers in a later pass. This is opt-in until board data
+/// proves that repeated SAT witnesses repay solver cloning and shared-card
+/// contention.
+pub fn push_prefetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    active_enabled()
+        && *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        })
 }
 
 /// Whether IC3 should speculate over the currently queued proof obligations.
@@ -2655,6 +2682,36 @@ pub fn note_active_block_async_harvest(wall_ns: u64, join_ns: u64) {
     ACTIVE_BLOCK_ASYNC_JOIN_NS.fetch_add(join_ns, Ordering::Relaxed);
 }
 
+pub fn note_active_push_prefetch_launch(n_queries: usize, prepare_ns: u64) {
+    ACTIVE_PUSH_PREFETCH_LAUNCHED.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_PUSH_PREFETCH_QUERIES.fetch_add(n_queries as u64, Ordering::Relaxed);
+    ACTIVE_PUSH_PREFETCH_PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
+}
+
+pub fn note_active_push_prefetch_harvest(n_ready: usize, wall_ns: u64, join_ns: u64) {
+    ACTIVE_PUSH_PREFETCH_HARVESTED.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_PUSH_PREFETCH_READY.fetch_add(n_ready as u64, Ordering::Relaxed);
+    ACTIVE_PUSH_PREFETCH_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
+    ACTIVE_PUSH_PREFETCH_JOIN_NS.fetch_add(join_ns, Ordering::Relaxed);
+}
+
+pub fn note_active_push_prefetch_hit(accepted: bool) {
+    ACTIVE_PUSH_PREFETCH_HITS.fetch_add(1, Ordering::Relaxed);
+    if accepted {
+        ACTIVE_PUSH_PREFETCH_USED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_PUSH_PREFETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_active_push_prefetch_evicted(n: usize) {
+    ACTIVE_PUSH_PREFETCH_EVICTED.fetch_add(n as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_push_prefetch_busy() {
+    ACTIVE_PUSH_PREFETCH_BUSY.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn note_active_preflight_result(
     unsat: bool,
     accepted: bool,
@@ -2921,6 +2978,21 @@ pub fn flush_and_report() {
             hw_conclusive.saturating_sub(block_conclusive),
             hw_used.saturating_sub(block_used),
             hw_rejected.saturating_sub(block_rejected),
+        );
+        eprintln!(
+            "inductor-cdcl: active push prefetch launched/harvested/busy {}/{}/{}, queries/ready/hits {}/{}/{}, used/rejected/evicted {}/{}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms",
+            ACTIVE_PUSH_PREFETCH_LAUNCHED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_HARVESTED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_BUSY.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_QUERIES.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_READY.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_HITS.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_USED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_REJECTED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_EVICTED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_PREPARE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_PUSH_PREFETCH_WALL_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_PUSH_PREFETCH_JOIN_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         );
         eprintln!(
             "inductor-cdcl: active block preflight conclusive/selected/fallback {}/{}/{}, wave reserved/taken {}/{}",
