@@ -2334,6 +2334,14 @@ pub fn solve_active_batch(
                     result
                 }
             };
+            // A shared persistent service can reject RUN_BATCH when another
+            // client replaced the resident context between commands. Treat
+            // every command failure as a lost context lease: this batch stays
+            // UNKNOWN and the next one atomically reloads its exact snapshot.
+            if result.is_err() {
+                context_ready = false;
+                state.loaded_context = None;
+            }
             ACTIVE_BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
             if result.is_ok() {
                 if let Some(hardware) = state.hardware.as_ref() {

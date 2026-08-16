@@ -205,12 +205,16 @@ impl DagCnfSolver {
         solver
     }
 
-    fn record_solve_time(&mut self, start: Instant) {
+    fn record_solve_time(
+        &mut self,
+        start: Instant,
+        cpu_start: crate::inductor::ThreadCpuTimer,
+    ) {
         let elapsed = start.elapsed();
         self.statistic.avg_solve_time += elapsed;
         self.solve_time_ns = self
             .solve_time_ns
-            .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+            .saturating_add(cpu_start.ns());
         self.solve_time_samples = self.solve_time_samples.saturating_add(1);
     }
 
@@ -351,6 +355,7 @@ impl DagCnfSolver {
         }
         self.statistic.num_solve += 1;
         let start = Instant::now();
+        let cpu_start = crate::inductor::ThreadCpuTimer::start();
 
         // --- Inductor instrumentation ---
         // `t_setup` runs from here to the first decision: domain computation,
@@ -369,7 +374,7 @@ impl DagCnfSolver {
         if self.propagate() != CREF_NONE {
             self.trivial_unsat = true;
             self.unsat_core.clear();
-            self.record_solve_time(start);
+            self.record_solve_time(start, cpu_start);
             self.probe.t_setup_ns = probe_setup.ns();
             self.probe.t_total_ns = probe_total.ns();
             crate::inductor::record(&self.probe, Some(false));
@@ -390,7 +395,7 @@ impl DagCnfSolver {
                 .fetch_add(probe_dom.ns() as u64, std::sync::atomic::Ordering::Relaxed);
             if !nr_ok {
                 self.unsat_core.clear();
-                self.record_solve_time(start);
+                self.record_solve_time(start, cpu_start);
                 self.probe.t_setup_ns = probe_setup.ns();
                 self.probe.t_total_ns = probe_total.ns();
                 crate::inductor::record(&self.probe, Some(false));
@@ -594,7 +599,7 @@ impl DagCnfSolver {
         }
         crate::inductor::record(&self.probe, res);
 
-        self.record_solve_time(start);
+        self.record_solve_time(start, cpu_start);
         res
     }
 

@@ -102,6 +102,22 @@ impl Worker {
         extractor: Option<LemmaIpcRx>,
     ) -> ! {
         set_max_level(LevelFilter::Warn);
+        if std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some()
+            && !portfolio_worker_uses_fpga(
+                &self.name,
+                std::env::var("INDUCTOR_CDCL_PORTFOLIO_FPGA_WORKERS")
+                    .ok()
+                    .as_deref(),
+            )
+        {
+            // This runs in the freshly forked, single-threaded child before
+            // the engine or accelerator client exists. The parent and sibling
+            // workers retain their own environment and accelerator policy.
+            unsafe {
+                std::env::remove_var("INDUCTOR_CDCL_ACTIVE");
+                std::env::remove_var("INDUCTOR_CDCL_SERVER");
+            }
+        }
         // We are already in the forked child, so take ownership of the inherited
         // in-memory model directly instead of reparsing or serializing it.
         let ts = unsafe { std::ptr::read(ts) };
@@ -125,6 +141,36 @@ impl Worker {
             let _ = cert_tx.send(certificate);
         };
         exit(0);
+    }
+}
+
+fn portfolio_worker_uses_fpga(name: &str, allowlist: Option<&str>) -> bool {
+    let Some(allowlist) = allowlist else {
+        return true;
+    };
+    allowlist
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate == "all" || candidate == name)
+}
+
+#[cfg(test)]
+mod fpga_worker_tests {
+    use super::portfolio_worker_uses_fpga;
+
+    #[test]
+    fn explicit_fpga_worker_allowlist_is_exact_and_whitespace_tolerant() {
+        assert!(portfolio_worker_uses_fpga("ic3", None));
+        assert!(portfolio_worker_uses_fpga(
+            "ic3_inn",
+            Some("ic3, ic3_inn")
+        ));
+        assert!(!portfolio_worker_uses_fpga(
+            "ic3_abs_all",
+            Some("ic3, ic3_inn")
+        ));
+        assert!(portfolio_worker_uses_fpga("anything", Some("all")));
+        assert!(!portfolio_worker_uses_fpga("ic3", Some("")));
     }
 }
 

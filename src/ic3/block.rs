@@ -493,6 +493,9 @@ impl IC3 {
     }
 
     pub fn block(&mut self, limit: Option<f64>) -> BlockResult {
+        if crate::accel::cdcl_host::block_batch_enabled() {
+            crate::inductor::ThreadCpuTimer::enable();
+        }
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
         while let Some(mut po) = self.obligations.pop(self.level()) {
@@ -632,12 +635,9 @@ impl IC3 {
                     let sample_index = requests.len() / 2;
                     let (sample_solver, sample_query) = &requests[sample_index];
                     let mut sample_solver = (*sample_solver).clone();
-                    let sample_start = Instant::now();
+                    let sample_start = crate::inductor::ThreadCpuTimer::start();
                     let sample_result = sample_solver.classify_incremental_exact(sample_query);
-                    let sample_ns = sample_start
-                        .elapsed()
-                        .as_nanos()
-                        .min(u64::MAX as u128) as u64;
+                    let sample_ns = sample_start.ns();
                     self.block_accel_policy.note_cpu(sample_ns);
                     let profitable = self.block_accel_policy.note_calibration(sample_ns);
                     decisions[sample_index] = match sample_result {
@@ -844,15 +844,13 @@ impl IC3 {
                     blocked
                 }
                 None => {
-                    let cpu_start = Instant::now();
+                    let cpu_start = crate::inductor::ThreadCpuTimer::start();
                     let blocked = self
                         .blocked(po.frame, &po.state)
                         .in_phase(inductor_trace::Phase::Block)
                         .with_act_order(false)
                         .check();
-                    self.block_accel_policy.note_cpu(
-                        cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    );
+                    self.block_accel_policy.note_cpu(cpu_start.ns());
                     blocked
                 }
             };

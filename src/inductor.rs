@@ -769,6 +769,74 @@ impl QueryProbe {
 /// Candidate gate-evaluation lane counts for the BCP datapath.
 pub const LANES: [u32; 4] = [4, 8, 16, 32];
 
+/// Per-thread CPU time for accelerator profitability decisions.
+///
+/// Wall time is the correct end-to-end metric, but it is a poor routing signal
+/// inside a many-process portfolio: a microsecond GipSAT query can appear to
+/// take milliseconds when its worker is descheduled. Using the calling
+/// thread's CPU clock keeps the FPGA crossover about SAT work rather than host
+/// contention. Non-Linux targets fall back to wall time.
+#[derive(Clone, Copy)]
+pub struct ThreadCpuTimer {
+    wall: Instant,
+    cpu_ns: Option<u64>,
+}
+
+static THREAD_CPU_TIMING: AtomicBool = AtomicBool::new(false);
+
+impl ThreadCpuTimer {
+    #[inline]
+    pub fn enable() {
+        THREAD_CPU_TIMING.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn start() -> Self {
+        Self {
+            wall: Instant::now(),
+            cpu_ns: THREAD_CPU_TIMING
+                .load(Ordering::Relaxed)
+                .then(thread_cpu_time_ns)
+                .flatten(),
+        }
+    }
+
+    #[inline]
+    pub fn ns(&self) -> u64 {
+        self.cpu_ns
+            .zip(thread_cpu_time_ns())
+            .and_then(|(start, end)| end.checked_sub(start))
+            .unwrap_or_else(|| {
+                self.wall
+                    .elapsed()
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64
+            })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn thread_cpu_time_ns() -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+    if status != 0 || time.tv_sec < 0 || time.tv_nsec < 0 {
+        return None;
+    }
+    (time.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(time.tv_nsec as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn thread_cpu_time_ns() -> Option<u64> {
+    None
+}
+
 /// A timestamp that costs nothing when tracing is off.
 ///
 /// The four time splits each need a start/stop pair, so on a short query the
