@@ -168,6 +168,19 @@ impl ProofObligationQueue {
         assert!(self.obligations.insert(po));
     }
 
+    pub fn add_if_new(&mut self, po: ProofObligation) -> bool {
+        let frame = po.frame;
+        trace!("add obligation if new: {}", po.state);
+        if !self.obligations.insert(po) {
+            return false;
+        }
+        if self.num.len() <= frame {
+            self.num.resize(frame + 1, 0);
+        }
+        self.num[frame] += 1;
+        true
+    }
+
     pub fn pop(&mut self, depth: usize) -> Option<ProofObligation> {
         if let Some(po) = self.obligations.last().filter(|po| po.frame <= depth) {
             self.num[po.frame] -= 1;
@@ -187,6 +200,18 @@ impl ProofObligationQueue {
             self.num[po.frame] -= 1;
         }
         ret
+    }
+
+    pub fn take(&mut self, po: &ProofObligation) -> Option<ProofObligation> {
+        let ret = self.obligations.take(po);
+        if let Some(taken) = &ret {
+            self.num[taken.frame] -= 1;
+        }
+        ret
+    }
+
+    pub fn contains(&self, po: &ProofObligation) -> bool {
+        self.obligations.contains(po)
     }
 
     pub fn clear(&mut self) {
@@ -214,5 +239,39 @@ impl IC3 {
     pub(super) fn add_obligation(&mut self, po: ProofObligation) {
         self.statistic.avg_po_cube_len += po.state.len();
         self.obligations.add(po)
+    }
+
+    pub(super) fn add_obligation_if_new(&mut self, po: ProofObligation) -> bool {
+        let cube_len = po.state.len();
+        if !self.obligations.add_if_new(po) {
+            return false;
+        }
+        self.statistic.avg_po_cube_len += cube_len;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProofObligation, ProofObligationQueue};
+    use logicrs::{Lit, LitOrdVec, LitVec, Var};
+
+    #[test]
+    fn conditional_insert_keeps_frame_counts_consistent() {
+        let lit = Lit::new(Var::from(0), true);
+        let po = ProofObligation::new(
+            2,
+            LitOrdVec::new(LitVec::from([lit])),
+            Vec::new(),
+            1,
+            None,
+        );
+        let mut queue = ProofObligationQueue::new();
+
+        assert!(queue.add_if_new(po.clone()));
+        assert!(!queue.add_if_new(po));
+        assert_eq!(queue.num[2], 1);
+        assert!(queue.pop(2).is_some());
+        assert_eq!(queue.num[2], 0);
     }
 }

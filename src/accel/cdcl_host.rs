@@ -698,6 +698,21 @@ static ACTIVE_BLOCK_ROUTE_ENABLES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ROUTE_DISABLES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ROUTE_REPRESENTATIVE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ROUTE_ENABLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_BLOCK_HW_CONCLUSIVE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_SELECTED_NO_ANSWER: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_RESULT_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_RESULT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CACHE_REUSED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CACHE_REUSE_AGE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CACHE_REUSE_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CACHE_REUSE_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CACHE_REPLACED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_CACHE_EVICTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_PREFLIGHT_CONCLUSIVE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_PREFLIGHT_SELECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_PREFLIGHT_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_WAVE_RESERVED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_WAVE_TAKEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_LAUNCHED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_HARVESTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
@@ -2497,6 +2512,63 @@ pub fn note_active_block_route_observation(representative_ns: u64, enabled: bool
     ACTIVE_BLOCK_ROUTE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+pub fn note_active_block_selected_result(conclusive: bool) {
+    if conclusive {
+        ACTIVE_BLOCK_HW_CONCLUSIVE.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_BLOCK_SELECTED_NO_ANSWER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_active_block_result_consumed(accepted: bool, cache_age: u64) {
+    if accepted {
+        ACTIVE_BLOCK_RESULT_USED.fetch_add(1, Ordering::Relaxed);
+        if cache_age != 0 {
+            ACTIVE_BLOCK_CACHE_REUSE_USED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        ACTIVE_BLOCK_RESULT_REJECTED.fetch_add(1, Ordering::Relaxed);
+        if cache_age != 0 {
+            ACTIVE_BLOCK_CACHE_REUSE_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn note_active_block_cache_reused(age: u64) {
+    ACTIVE_BLOCK_CACHE_REUSED.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_BLOCK_CACHE_REUSE_AGE.fetch_add(age, Ordering::Relaxed);
+}
+
+pub fn note_active_block_cache_replaced() {
+    ACTIVE_BLOCK_CACHE_REPLACED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_block_cache_evicted(n: usize) {
+    ACTIVE_BLOCK_CACHE_EVICTED.fetch_add(n as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_block_preflight(decision: &ActivePreflight) {
+    match decision {
+        ActivePreflight::Conclusive(_) => {
+            ACTIVE_BLOCK_PREFLIGHT_CONCLUSIVE.fetch_add(1, Ordering::Relaxed);
+        }
+        ActivePreflight::Fpga => {
+            ACTIVE_BLOCK_PREFLIGHT_SELECTED.fetch_add(1, Ordering::Relaxed);
+        }
+        ActivePreflight::CpuFallback => {
+            ACTIVE_BLOCK_PREFLIGHT_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn note_active_block_wave_reserved(n: usize) {
+    ACTIVE_BLOCK_WAVE_RESERVED.fetch_add(n as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_block_wave_taken() {
+    ACTIVE_BLOCK_WAVE_TAKEN.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn note_active_block_async_launch(prepare_ns: u64) {
     ACTIVE_BLOCK_ASYNC_LAUNCHED.fetch_add(1, Ordering::Relaxed);
     ACTIVE_BLOCK_ASYNC_PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
@@ -2684,6 +2756,11 @@ pub fn flush_and_report() {
             .load(Ordering::Relaxed)
             .saturating_add(ACTIVE_UNSAT_CORE_REJECTED.load(Ordering::Relaxed));
         let hw_unconsumed = hw_conclusive.saturating_sub(hw_used.saturating_add(hw_rejected));
+        let block_conclusive = ACTIVE_BLOCK_HW_CONCLUSIVE.load(Ordering::Relaxed);
+        let block_used = ACTIVE_BLOCK_RESULT_USED.load(Ordering::Relaxed);
+        let block_rejected = ACTIVE_BLOCK_RESULT_REJECTED.load(Ordering::Relaxed);
+        let block_unconsumed =
+            block_conclusive.saturating_sub(block_used.saturating_add(block_rejected));
         eprintln!(
             "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
@@ -2751,6 +2828,32 @@ pub fn flush_and_report() {
             ACTIVE_BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_UNSAT_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        );
+        eprintln!(
+            "inductor-cdcl: active source split block selected conclusive/used/rejected/unconsumed {}/{}/{}/{}, no-answer {}, cache reused/mean-age {}/{:.2}, used/rejected {}/{}, replaced/evicted {}/{}, propagation conclusive/used/rejected {}/{}/{}",
+            block_conclusive,
+            block_used,
+            block_rejected,
+            block_unconsumed,
+            ACTIVE_BLOCK_SELECTED_NO_ANSWER.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CACHE_REUSED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CACHE_REUSE_AGE.load(Ordering::Relaxed) as f64
+                / ACTIVE_BLOCK_CACHE_REUSED.load(Ordering::Relaxed).max(1) as f64,
+            ACTIVE_BLOCK_CACHE_REUSE_USED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CACHE_REUSE_REJECTED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CACHE_REPLACED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_CACHE_EVICTED.load(Ordering::Relaxed),
+            hw_conclusive.saturating_sub(block_conclusive),
+            hw_used.saturating_sub(block_used),
+            hw_rejected.saturating_sub(block_rejected),
+        );
+        eprintln!(
+            "inductor-cdcl: active block preflight conclusive/selected/fallback {}/{}/{}, wave reserved/taken {}/{}",
+            ACTIVE_BLOCK_PREFLIGHT_CONCLUSIVE.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_PREFLIGHT_SELECTED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_PREFLIGHT_FALLBACK.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_WAVE_RESERVED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_WAVE_TAKEN.load(Ordering::Relaxed),
         );
         if let Some(conflict_limit) = active_preflight_conflicts() {
             let candidates = ACTIVE_PREFLIGHT_CANDIDATES.load(Ordering::Relaxed);

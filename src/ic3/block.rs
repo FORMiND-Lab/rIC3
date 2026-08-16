@@ -22,6 +22,9 @@ struct CachedBlockInquiry {
     query: IncrementalQuery,
     result: IncrementalResult,
     trusted_cpu: bool,
+    hardware_selected: bool,
+    cached_at: u64,
+    cache_age: u64,
 }
 
 struct PendingBlockBatch {
@@ -79,6 +82,7 @@ impl Drop for PendingBlockBatch {
 struct BlockBatchCache {
     inquiries: Vec<CachedBlockInquiry>,
     pending: Vec<PendingBlockBatch>,
+    epoch: u64,
 }
 
 #[derive(Default)]
@@ -309,7 +313,13 @@ impl BlockAccelPolicy {
 
 #[cfg(test)]
 mod block_accel_policy_tests {
-    use super::BlockAccelPolicy;
+    use super::{BlockAccelPolicy, BlockBatchCache, CachedBlockInquiry};
+    use crate::{
+        accel::cdcl::UnknownReason,
+        gipsat::{IncrementalQuery, IncrementalResult},
+        ic3::proofoblig::ProofObligation,
+    };
+    use logicrs::{Lit, LitOrdVec, LitVec, Var};
     use std::collections::VecDeque;
 
     #[test]
@@ -392,6 +402,70 @@ mod block_accel_policy_tests {
         assert_eq!(policy.calibration_profitable, Some(false));
         assert_eq!(policy.representative_cpu_ns(8), Some(25_000));
     }
+
+    fn cached_inquiry(
+        frame: usize,
+        lit: Lit,
+        result: IncrementalResult,
+    ) -> CachedBlockInquiry {
+        CachedBlockInquiry {
+            frame,
+            state: LitOrdVec::new(LitVec::from([lit])),
+            query: IncrementalQuery::new(frame as u32, LitVec::from([lit])),
+            result,
+            trusted_cpu: false,
+            hardware_selected: true,
+            cached_at: 0,
+            cache_age: 0,
+        }
+    }
+
+    #[test]
+    fn block_cache_survives_an_unrelated_obligation_detour() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), true);
+        let mut cache = BlockBatchCache::default();
+        cache.insert(vec![cached_inquiry(
+            2,
+            a,
+            IncrementalResult::Sat {
+                model: LitVec::from([a]),
+            },
+        )]);
+
+        cache.advance_step();
+        let unrelated = ProofObligation::new(
+            1,
+            LitOrdVec::new(LitVec::from([b])),
+            Vec::new(),
+            0,
+            None,
+        );
+        assert!(cache.take(&unrelated, true).is_none());
+
+        cache.advance_step();
+        let original = ProofObligation::new(
+            2,
+            LitOrdVec::new(LitVec::from([a])),
+            Vec::new(),
+            0,
+            None,
+        );
+        let reused = cache.take(&original, true).unwrap();
+        assert_eq!(reused.cache_age, 2);
+    }
+
+    #[test]
+    fn block_cache_does_not_retain_unknown_answers() {
+        let a = Lit::new(Var::from(0), true);
+        let mut cache = BlockBatchCache::default();
+        cache.insert(vec![cached_inquiry(
+            2,
+            a,
+            IncrementalResult::Unknown(UnknownReason::ConflictBudget),
+        )]);
+        assert!(!cache.contains(2, &LitOrdVec::new(LitVec::from([a]))));
+    }
 }
 
 impl BlockBatchCache {
@@ -440,6 +514,52 @@ impl BlockBatchCache {
         })
     }
 
+    fn reuse_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_CACHE_REUSE")
+                .ok()
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .unwrap_or(false)
+        })
+    }
+
+    fn reuse_steps() -> u64 {
+        use std::sync::OnceLock;
+        static STEPS: OnceLock<u64> = OnceLock::new();
+        *STEPS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_CACHE_STEPS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4)
+                .clamp(1, 256)
+        })
+    }
+
+    fn wavefront_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_WAVEFRONT")
+                .ok()
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .unwrap_or(false)
+        })
+    }
+
+    fn wavefront_steps() -> usize {
+        use std::sync::OnceLock;
+        static STEPS: OnceLock<usize> = OnceLock::new();
+        *STEPS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_WAVEFRONT_STEPS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8)
+                .clamp(1, 64)
+        })
+    }
+
     fn async_depth() -> usize {
         use std::sync::OnceLock;
         static DEPTH: OnceLock<usize> = OnceLock::new();
@@ -469,24 +589,69 @@ impl BlockBatchCache {
     }
 
     fn insert(&mut self, inquiries: Vec<CachedBlockInquiry>) {
-        for inquiry in inquiries {
-            if Self::async_enabled()
-                && matches!(inquiry.result, IncrementalResult::Unknown(_))
-            {
+        for mut inquiry in inquiries {
+            let hardware = inquiry.hardware_selected;
+            let conclusive = matches!(
+                inquiry.result,
+                IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. }
+            );
+            if hardware {
+                crate::accel::cdcl_host::note_active_block_selected_result(conclusive);
+            }
+            // UNKNOWN cannot answer a later obligation and must not shadow a
+            // future retry of the same state/frame pair.
+            if !conclusive {
                 continue;
             }
+            inquiry.cached_at = self.epoch;
+            inquiry.cache_age = 0;
             if let Some(index) = self.inquiries.iter().position(|entry| {
                 entry.frame == inquiry.frame && entry.state == inquiry.state
             }) {
-                self.inquiries.swap_remove(index);
+                let replaced = self.inquiries.swap_remove(index);
+                if replaced.hardware_selected {
+                    crate::accel::cdcl_host::note_active_block_cache_replaced();
+                }
             }
             self.inquiries.push(inquiry);
         }
         const MAX_CACHED_INQUIRIES: usize = 256;
         if self.inquiries.len() > MAX_CACHED_INQUIRIES {
             let overflow = self.inquiries.len() - MAX_CACHED_INQUIRIES;
+            let hardware_evicted = self.inquiries[..overflow]
+                .iter()
+                .filter(|entry| entry.hardware_selected)
+                .count();
+            crate::accel::cdcl_host::note_active_block_cache_evicted(hardware_evicted);
             self.inquiries.drain(..overflow);
         }
+    }
+
+    fn clear_for_refresh(&mut self) {
+        let hardware_evicted = self
+            .inquiries
+            .iter()
+            .filter(|entry| entry.hardware_selected)
+            .count();
+        crate::accel::cdcl_host::note_active_block_cache_evicted(hardware_evicted);
+        self.inquiries.clear();
+    }
+
+    fn advance_step(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+        if !Self::reuse_enabled() {
+            return;
+        }
+        let max_age = Self::reuse_steps();
+        let mut hardware_evicted = 0usize;
+        self.inquiries.retain(|entry| {
+            let keep = self.epoch.saturating_sub(entry.cached_at) <= max_age;
+            if !keep && entry.hardware_selected {
+                hardware_evicted += 1;
+            }
+            keep
+        });
+        crate::accel::cdcl_host::note_active_block_cache_evicted(hardware_evicted);
     }
 
     fn harvest_ready(&mut self) {
@@ -507,12 +672,17 @@ impl BlockBatchCache {
         self.pending.push(pending);
     }
 
-    fn take(&mut self, po: &ProofObligation) -> Option<CachedBlockInquiry> {
+    fn take(&mut self, po: &ProofObligation, reused: bool) -> Option<CachedBlockInquiry> {
         let index = self
             .inquiries
             .iter()
             .position(|entry| entry.frame == po.frame && entry.state == po.state)?;
-        Some(self.inquiries.swap_remove(index))
+        let mut inquiry = self.inquiries.swap_remove(index);
+        inquiry.cache_age = self.epoch.saturating_sub(inquiry.cached_at);
+        if reused && inquiry.hardware_selected {
+            crate::accel::cdcl_host::note_active_block_cache_reused(inquiry.cache_age);
+        }
+        Some(inquiry)
     }
 }
 
@@ -661,18 +831,45 @@ impl IC3 {
         }
     }
 
+    fn restore_block_wave(&mut self, block_wave: &mut VecDeque<ProofObligation>) {
+        while let Some(po) = block_wave.pop_front() {
+            if !po.removed && !self.obligations.contains(&po) {
+                self.obligations.add(po);
+            }
+        }
+    }
+
     pub fn block(&mut self, limit: Option<f64>) -> BlockResult {
         if crate::accel::cdcl_host::block_batch_enabled() {
             crate::inductor::ThreadCpuTimer::enable();
         }
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
-        while let Some(mut po) = self.obligations.pop(self.level()) {
+        let mut block_wave = VecDeque::new();
+        loop {
+            let mut from_wave = false;
+            let mut next = None;
+            while let Some(candidate) = block_wave.pop_front() {
+                // A result processed earlier in the wave may have queued a
+                // fresher obligation for the same state. Prefer that record
+                // (notably its predecessor chain), otherwise consume the
+                // reservation removed from the global set at batch creation.
+                next = Some(self.obligations.take(&candidate).unwrap_or(candidate));
+                from_wave = true;
+                break;
+            }
+            let Some(mut po) = next.or_else(|| self.obligations.pop(self.level())) else {
+                break;
+            };
+            if from_wave {
+                crate::accel::cdcl_host::note_active_block_wave_taken();
+            }
+            block_batch.advance_step();
             block_batch.harvest_ready();
             // Remove a previously speculated answer even when this obligation
             // is discarded by one of the cheap guards below. Otherwise stale
             // entries would prevent the cache from naturally draining.
-            let mut cached_block = block_batch.take(&po);
+            let mut cached_block = block_batch.take(&po, true);
             self.render_progress();
             if po.removed {
                 continue;
@@ -680,14 +877,17 @@ impl IC3 {
             if let Some(limit) = limit
                 && noc as f64 > limit
             {
+                self.restore_block_wave(&mut block_wave);
                 return BlockResult::BlockLimitExceeded;
             }
             if self.ctrl.is_terminated() {
+                self.restore_block_wave(&mut block_wave);
                 return BlockResult::OverallTimeLimitExceeded;
             }
             if let Some(limit) = self.cfg.time_limit
                 && self.statistic.time.time().as_secs() > limit
             {
+                self.restore_block_wave(&mut block_wave);
                 return BlockResult::OverallTimeLimitExceeded;
             }
             if self.tsctx.cube_subsume_init(&po.state) {
@@ -743,19 +943,22 @@ impl IC3 {
                 && self.solvers[po.frame - 1].dcs.num_var()
                     >= BlockBatchCache::min_context_vars()
             {
-                if !BlockBatchCache::async_enabled() {
+                if !BlockBatchCache::async_enabled() && !BlockBatchCache::reuse_enabled() {
                     // The synchronous policy intentionally refreshes the
-                    // frontier after every blocking step. Asynchronous mode
-                    // retains completed answers while their obligations wait
-                    // in the priority queue.
-                    block_batch.inquiries.clear();
+                    // frontier after every blocking step when reuse is
+                    // disabled. The TTL cache is diagnostic because retained
+                    // SAT models quickly became stale in the board A/B.
+                    block_batch.clear_for_refresh();
                 }
                 let mut candidates = Vec::new();
-                if !BlockBatchCache::async_enabled()
-                    || !block_batch.contains(po.frame, &po.state)
-                {
+                let mut wave_candidates = Vec::new();
+                if !block_batch.contains(po.frame, &po.state) {
                     candidates.push((po.frame, po.state.clone()));
+                    wave_candidates.push(None);
                 }
+                let reserve_wave = BlockBatchCache::wavefront_enabled()
+                    && !BlockBatchCache::async_enabled()
+                    && block_wave.is_empty();
                 for candidate in self.obligations.iter().rev() {
                     if candidates.len() >= BlockBatchCache::window() {
                         break;
@@ -763,7 +966,8 @@ impl IC3 {
                     if candidate.frame == 0
                         || candidate.frame > self.level()
                         || candidate.removed
-                        || BlockBatchCache::async_enabled()
+                        || (BlockBatchCache::async_enabled()
+                            || BlockBatchCache::reuse_enabled())
                             && block_batch.contains(candidate.frame, &candidate.state)
                         || candidates
                             .iter()
@@ -772,28 +976,27 @@ impl IC3 {
                         continue;
                     }
                     candidates.push((candidate.frame, candidate.state.clone()));
+                    wave_candidates.push(reserve_wave.then(|| candidate.clone()));
                 }
 
-                let requests: Vec<_> = candidates
+                let queries: Vec<_> = candidates
                     .iter()
                     .map(|(frame, state)| {
                         let solver = &self.solvers[*frame - 1];
-                        (
-                            &solver.dcs,
-                            solver.incremental_inductive_query(state, false, vec![]),
-                        )
+                        solver.incremental_inductive_query(state, false, vec![])
                     })
                     .collect();
-                let mut decisions = vec![ActivePreflight::Fpga; requests.len()];
+                let mut decisions = vec![ActivePreflight::Fpga; queries.len()];
                 if crate::accel::cdcl_host::active_enabled()
                     && needs_calibration
-                    && requests.len() >= crate::accel::cdcl_host::active_min_batch_size()
+                    && queries.len() >= crate::accel::cdcl_host::active_min_batch_size()
                 {
-                    let sample_index = requests.len() / 2;
-                    let (sample_solver, sample_query) = &requests[sample_index];
-                    let mut sample_solver = (*sample_solver).clone();
+                    let sample_index = queries.len() / 2;
+                    let sample_frame = candidates[sample_index].0;
+                    let mut sample_solver = self.solvers[sample_frame - 1].dcs.clone();
                     let sample_start = crate::inductor::ThreadCpuTimer::start();
-                    let sample_result = sample_solver.classify_incremental_exact(sample_query);
+                    let sample_result =
+                        sample_solver.classify_incremental_exact(&queries[sample_index]);
                     let sample_ns = sample_start.ns();
                     self.block_accel_policy.note_cpu(sample_ns);
                     let profitable = self.block_accel_policy.note_calibration(sample_ns);
@@ -811,6 +1014,28 @@ impl IC3 {
                         }
                     }
                 }
+                if crate::accel::cdcl_host::active_preflight_should_run(queries.len()) {
+                    for (index, ((frame, _), query)) in
+                        candidates.iter().zip(queries.iter()).enumerate()
+                    {
+                        if !matches!(decisions[index], ActivePreflight::Fpga) {
+                            continue;
+                        }
+                        decisions[index] =
+                            crate::accel::cdcl_host::active_preflight_classify(
+                                &mut self.solvers[*frame - 1].dcs,
+                                query,
+                            );
+                        crate::accel::cdcl_host::note_active_block_preflight(
+                            &decisions[index],
+                        );
+                    }
+                }
+                let requests: Vec<_> = candidates
+                    .iter()
+                    .zip(queries.iter())
+                    .map(|((frame, _), query)| (&self.solvers[*frame - 1].dcs, query.clone()))
+                    .collect();
                 if crate::accel::cdcl_host::active_enabled() {
                     let sample_requests: Vec<_> = requests
                         .iter()
@@ -829,11 +1054,13 @@ impl IC3 {
                     requests.len()
                 ];
                 let mut trusted_cpu = vec![false; requests.len()];
+                let mut hardware_selected = vec![false; requests.len()];
                 let mut hardware_indices = Vec::new();
                 let mut hardware_requests = Vec::new();
                 for (index, decision) in decisions.into_iter().enumerate() {
                     match decision {
                         ActivePreflight::Fpga => {
+                            hardware_selected[index] = true;
                             hardware_indices.push(index);
                             hardware_requests.push((requests[index].0, requests[index].1.clone()));
                         }
@@ -848,14 +1075,25 @@ impl IC3 {
                     .iter()
                     .cloned()
                     .zip(requests.iter().map(|(_, query)| query.clone()))
-                    .zip(results.into_iter().zip(trusted_cpu.iter().copied()))
+                    .zip(
+                        results
+                            .into_iter()
+                            .zip(trusted_cpu.iter().copied())
+                            .zip(hardware_selected),
+                    )
                     .map(
-                        |(((frame, state), query), (result, trusted_cpu))| CachedBlockInquiry {
+                        |(
+                            ((frame, state), query),
+                            ((result, trusted_cpu), hardware_selected),
+                        )| CachedBlockInquiry {
                             frame,
                             state,
                             query,
                             result,
                             trusted_cpu,
+                            hardware_selected,
+                            cached_at: 0,
+                            cache_age: 0,
                         },
                     )
                     .collect();
@@ -913,8 +1151,31 @@ impl IC3 {
                     {
                         inquiries[index].result = result;
                     }
+                    if reserve_wave {
+                        let mut reserved = 0;
+                        for index in hardware_indices.iter().copied() {
+                            if reserved >= BlockBatchCache::wavefront_steps() {
+                                break;
+                            }
+                            if !matches!(
+                                inquiries[index].result,
+                                IncrementalResult::Sat { .. }
+                                    | IncrementalResult::Unsat { .. }
+                            ) {
+                                continue;
+                            }
+                            let Some(candidate) = wave_candidates[index].take() else {
+                                continue;
+                            };
+                            if let Some(candidate) = self.obligations.take(&candidate) {
+                                block_wave.push_back(candidate);
+                                reserved += 1;
+                            }
+                        }
+                        crate::accel::cdcl_host::note_active_block_wave_reserved(reserved);
+                    }
                     block_batch.insert(inquiries);
-                    cached_block = block_batch.take(&po);
+                    cached_block = block_batch.take(&po, false);
                 }
             }
 
@@ -972,6 +1233,10 @@ impl IC3 {
                             accepted,
                             validation_start.elapsed().as_nanos() as u64,
                         );
+                        crate::accel::cdcl_host::note_active_block_result_consumed(
+                            accepted,
+                            entry.cache_age,
+                        );
                         accepted.then_some(false)
                     }
                     (false, IncrementalResult::Unsat { core, .. }) => {
@@ -984,6 +1249,10 @@ impl IC3 {
                             core.len(),
                             cpu_core_len.unwrap_or(0),
                             validation_start.elapsed().as_nanos() as u64,
+                        );
+                        crate::accel::cdcl_host::note_active_block_result_consumed(
+                            cpu_core_len.is_some(),
+                            entry.cache_age,
                         );
                         cpu_core_len.map(|_| true)
                     }
@@ -1049,14 +1318,24 @@ impl IC3 {
                 let (model, inputs) = speculative_pred
                     .take()
                     .unwrap_or_else(|| self.get_pred(po.frame, true));
-                self.add_obligation(ProofObligation::new(
+                let pred = ProofObligation::new(
                     po.frame - 1,
                     LitOrdVec::new(model),
                     inputs,
                     po.depth + 1,
                     Some(po.clone()),
-                ));
-                self.add_obligation(po);
+                );
+                if BlockBatchCache::wavefront_enabled() {
+                    // Breadth-first processing can make two independent paths
+                    // discover the same ordered obligation before either path
+                    // reaches the head of the queue. One representative is
+                    // sufficient; both SAT predecessor chains are valid.
+                    self.add_obligation_if_new(pred);
+                    self.add_obligation_if_new(po);
+                } else {
+                    self.add_obligation(pred);
+                    self.add_obligation(po);
+                }
             }
         }
         BlockResult::Success
