@@ -3,7 +3,7 @@ use crate::{
     gipsat::{DagCnfSolver, IncrementalQuery, IncrementalResult},
 };
 use logicrs::LitOrdVec;
-use std::time::Instant;
+use std::{io::Write, time::Instant};
 
 fn retain_sat_results() -> bool {
     use std::sync::OnceLock;
@@ -112,6 +112,7 @@ struct PushBatchStat {
     exact_hits: usize,
     used: usize,
     rejected: usize,
+    counterfactual_filtered: usize,
 }
 
 #[derive(Default)]
@@ -208,9 +209,106 @@ impl PushPrefetchCache {
         used: usize,
         max_used: usize,
     ) -> bool {
-        Self::boundary_wait_eligible(n_queries, max_queries)
-            && max_used != 0
-            && used >= max_used
+        Self::boundary_wait_eligible(n_queries, max_queries) && max_used != 0 && used >= max_used
+    }
+
+    fn counterfactual_modulus() -> u64 {
+        use std::sync::OnceLock;
+        static MODULUS: OnceLock<u64> = OnceLock::new();
+        *MODULUS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_COUNTERFACTUAL_MODULUS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1)
+                .min(1 << 20)
+        })
+    }
+
+    fn counterfactual_residue() -> u64 {
+        use std::sync::OnceLock;
+        static RESIDUE: OnceLock<u64> = OnceLock::new();
+        *RESIDUE.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_COUNTERFACTUAL_RESIDUE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    fn counterfactual_trace_path() -> Option<&'static str> {
+        use std::sync::OnceLock;
+        static PATH: OnceLock<Option<String>> = OnceLock::new();
+        PATH.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_COUNTERFACTUAL_TSV")
+                .ok()
+                .filter(|path| !path.is_empty())
+        })
+        .as_deref()
+    }
+
+    fn counterfactual_hash(frame_idx: usize, lemma: &LitOrdVec) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = FNV_OFFSET;
+        for word in std::iter::once(frame_idx as u64)
+            .chain(std::iter::once(lemma.len() as u64))
+            .chain(lemma.iter().map(|lit| u64::from(Into::<u32>::into(*lit))))
+        {
+            for byte in word.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+        hash
+    }
+
+    fn counterfactual_selected(hash: u64, modulus: u64, residue: u64) -> bool {
+        match modulus {
+            0 => false,
+            1 => true,
+            modulus => hash % modulus == residue % modulus,
+        }
+    }
+
+    fn write_counterfactual_trace(&self) {
+        let Some(path) = Self::counterfactual_trace_path() else {
+            return;
+        };
+        let needs_header = std::fs::metadata(path)
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(true);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path);
+        let Ok(mut file) = file else {
+            eprintln!("inductor-cdcl: cannot append counterfactual trace {path}");
+            return;
+        };
+        if needs_header {
+            let _ = writeln!(
+                file,
+                "pid\tmodulus\tresidue\tfinal_epoch\tbatch_id\tqueries\tready\texact_hits\tfiltered\tused\trejected\tharvest_epoch"
+            );
+        }
+        for stat in &self.batch_stats {
+            let _ = writeln!(
+                file,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                std::process::id(),
+                Self::counterfactual_modulus(),
+                Self::counterfactual_residue(),
+                self.epoch,
+                stat.batch_id,
+                stat.n_queries,
+                stat.ready,
+                stat.exact_hits,
+                stat.counterfactual_filtered,
+                stat.used,
+                stat.rejected,
+                stat.harvested_at,
+            );
+        }
     }
 
     fn adaptive_enabled() -> bool {
@@ -375,8 +473,12 @@ impl PushPrefetchCache {
             exact_hits: 0,
             used: 0,
             rejected: 0,
+            counterfactual_filtered: 0,
         });
-        if self.batch_stats.len() > 64 {
+        // Production admission only needs a short rolling history. A requested
+        // counterfactual trace is an explicit experiment, so retain every row
+        // until finish rather than silently losing the beginning of long runs.
+        if self.batch_stats.len() > 64 && Self::counterfactual_trace_path().is_none() {
             self.batch_stats.remove(0);
         }
         for mut inquiry in finished.inquiries {
@@ -408,10 +510,7 @@ impl PushPrefetchCache {
 
     fn harvest_boundary(&mut self, harvested_at: u64) {
         let wait = self.pending.as_ref().is_some_and(|pending| {
-            Self::boundary_wait_eligible(
-                pending.keys.len(),
-                Self::boundary_wait_max_queries(),
-            )
+            Self::boundary_wait_eligible(pending.keys.len(), Self::boundary_wait_max_queries())
         });
         if wait {
             let mut pending = self.pending.take().unwrap();
@@ -431,6 +530,26 @@ impl PushPrefetchCache {
             .ready
             .iter()
             .position(|entry| entry.frame_idx == frame_idx && &entry.lemma == lemma)?;
+        let modulus = Self::counterfactual_modulus();
+        if modulus != 1
+            && !Self::counterfactual_selected(
+                Self::counterfactual_hash(frame_idx, lemma),
+                modulus,
+                Self::counterfactual_residue(),
+            )
+        {
+            let entry = self.ready.swap_remove(index);
+            if let Some(stat) = self
+                .batch_stats
+                .iter_mut()
+                .find(|stat| stat.batch_id == entry.batch_id)
+            {
+                stat.exact_hits = stat.exact_hits.saturating_add(1);
+                stat.counterfactual_filtered = stat.counterfactual_filtered.saturating_add(1);
+            }
+            crate::accel::cdcl_host::note_active_push_prefetch_evicted(1);
+            return None;
+        }
         let max_used = Self::boundary_wait_max_used();
         if max_used != 0 {
             let batch_id = self.ready[index].batch_id;
@@ -472,9 +591,7 @@ impl PushPrefetchCache {
                 .batch_stats
                 .iter()
                 .find(|stat| stat.batch_id == batch_id)
-                .is_some_and(|stat| {
-                    Self::boundary_wait_eligible(stat.n_queries, max_queries)
-                });
+                .is_some_and(|stat| Self::boundary_wait_eligible(stat.n_queries, max_queries));
         if let Some(stat) = self
             .batch_stats
             .iter_mut()
@@ -532,26 +649,28 @@ impl PushPrefetchCache {
             self.insert(finished, self.epoch);
         }
         if !self.batch_stats.is_empty() {
-            let summary = self
-                .batch_stats
+            let summary_start = self.batch_stats.len().saturating_sub(64);
+            let summary = self.batch_stats[summary_start..]
                 .iter()
                 .map(|stat| {
                     format!(
-                        "{}:{}/{}/{}/{}/{}",
+                        "{}:{}/{}/{}/{}/{}/{}",
                         stat.batch_id,
                         stat.n_queries,
                         stat.ready,
                         stat.exact_hits,
                         stat.used,
                         stat.rejected,
+                        stat.counterfactual_filtered,
                     )
                 })
                 .collect::<Vec<_>>()
                 .join(",");
             eprintln!(
-                "inductor-cdcl: active push prefetch batch id:queries/ready/hits/used/rejected {}",
+                "inductor-cdcl: active push prefetch last-64 batch id:queries/ready/hits/used/rejected/filtered {}",
                 summary,
             );
+            self.write_counterfactual_trace();
             self.batch_stats.clear();
         }
         if Self::boundary_wait_max_used() != 0 {
@@ -710,6 +829,27 @@ mod tests {
     }
 
     #[test]
+    fn counterfactual_partition_is_stable_and_exhaustive() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), false);
+        let lemma = LitOrdVec::new(LitVec::from([a, b]));
+        let hash = PushPrefetchCache::counterfactual_hash(3, &lemma);
+
+        assert_eq!(hash, PushPrefetchCache::counterfactual_hash(3, &lemma));
+        assert_ne!(hash, PushPrefetchCache::counterfactual_hash(4, &lemma));
+        assert_ne!(
+            hash,
+            PushPrefetchCache::counterfactual_hash(3, &LitOrdVec::new(LitVec::from([a])))
+        );
+        assert!(!PushPrefetchCache::counterfactual_selected(hash, 0, 0));
+        assert!(PushPrefetchCache::counterfactual_selected(hash, 1, 0));
+        assert_ne!(
+            PushPrefetchCache::counterfactual_selected(hash, 2, 0),
+            PushPrefetchCache::counterfactual_selected(hash, 2, 1)
+        );
+    }
+
+    #[test]
     fn admission_uses_only_batches_that_had_a_consumption_pass() {
         let stats = vec![
             PushBatchStat {
@@ -720,6 +860,7 @@ mod tests {
                 exact_hits: 0,
                 used: 0,
                 rejected: 0,
+                counterfactual_filtered: 0,
             },
             PushBatchStat {
                 batch_id: 2,
@@ -729,6 +870,7 @@ mod tests {
                 exact_hits: 8,
                 used: 8,
                 rejected: 0,
+                counterfactual_filtered: 0,
             },
         ];
         assert_eq!(
@@ -754,6 +896,7 @@ mod tests {
                 exact_hits: 0,
                 used: 0,
                 rejected: 0,
+                counterfactual_filtered: 0,
             },
             PushBatchStat {
                 batch_id: 2,
@@ -763,6 +906,7 @@ mod tests {
                 exact_hits: 0,
                 used: 0,
                 rejected: 0,
+                counterfactual_filtered: 0,
             },
         ];
         assert!(!cache.should_launch_with_policy(4, 2, 2, 8));
