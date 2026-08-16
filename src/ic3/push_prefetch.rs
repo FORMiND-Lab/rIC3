@@ -122,6 +122,7 @@ pub(super) struct PushPrefetchCache {
     epoch: u64,
     next_batch_id: u64,
     next_probe_epoch: u64,
+    boundary_wait_used: usize,
 }
 
 impl PushPrefetchCache {
@@ -171,6 +172,45 @@ impl PushPrefetchCache {
                 .unwrap_or(4)
                 .clamp(1, 64)
         })
+    }
+
+    fn boundary_wait_max_queries() -> usize {
+        use std::sync::OnceLock;
+        static MAX_QUERIES: OnceLock<usize> = OnceLock::new();
+        *MAX_QUERIES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_BOUNDARY_WAIT_MAX_QUERIES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+                .min(Self::launch_window())
+        })
+    }
+
+    fn boundary_wait_eligible(n_queries: usize, max_queries: usize) -> bool {
+        max_queries != 0 && n_queries <= max_queries
+    }
+
+    fn boundary_wait_max_used() -> usize {
+        use std::sync::OnceLock;
+        static MAX_USED: OnceLock<usize> = OnceLock::new();
+        *MAX_USED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH_BOUNDARY_WAIT_MAX_USED")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+                .min(1 << 20)
+        })
+    }
+
+    fn boundary_wait_use_limited(
+        n_queries: usize,
+        max_queries: usize,
+        used: usize,
+        max_used: usize,
+    ) -> bool {
+        Self::boundary_wait_eligible(n_queries, max_queries)
+            && max_used != 0
+            && used >= max_used
     }
 
     fn adaptive_enabled() -> bool {
@@ -317,13 +357,12 @@ impl PushPrefetchCache {
         crate::accel::cdcl_host::note_active_push_prefetch_evicted(
             before.saturating_sub(self.ready.len()),
         );
-        // Publish a completed hardware batch only at a propagation-pass
-        // boundary.  Do not wait for a late batch here: measured boundary
-        // joins increased FPGA occupancy but sent IC3 down a longer proof
-        // path.  Harvesting from `take` made visibility depend on whether the
-        // device finished between two adjacent lemmas, producing even larger
-        // proof-path swings despite every individual core being valid.
-        self.harvest_ready(self.epoch.saturating_sub(1));
+        // Publish a hardware batch only at a propagation-pass boundary.
+        // Large batches remain non-blocking: measured unconditional joins
+        // increased occupancy but sent IC3 down a longer proof path. An
+        // optional small-batch threshold can make short SAT-Accel-style waves
+        // deterministic at this boundary without waiting for 512-query tails.
+        self.harvest_boundary(self.epoch.saturating_sub(1));
     }
 
     fn insert(&mut self, finished: FinishedPushBatch, harvested_at: u64) {
@@ -367,6 +406,22 @@ impl PushPrefetchCache {
         }
     }
 
+    fn harvest_boundary(&mut self, harvested_at: u64) {
+        let wait = self.pending.as_ref().is_some_and(|pending| {
+            Self::boundary_wait_eligible(
+                pending.keys.len(),
+                Self::boundary_wait_max_queries(),
+            )
+        });
+        if wait {
+            let mut pending = self.pending.take().unwrap();
+            let finished = pending.finish();
+            self.insert(finished, harvested_at);
+        } else {
+            self.harvest_ready(harvested_at);
+        }
+    }
+
     pub(super) fn take(
         &mut self,
         frame_idx: usize,
@@ -376,6 +431,26 @@ impl PushPrefetchCache {
             .ready
             .iter()
             .position(|entry| entry.frame_idx == frame_idx && &entry.lemma == lemma)?;
+        let max_used = Self::boundary_wait_max_used();
+        if max_used != 0 {
+            let batch_id = self.ready[index].batch_id;
+            let n_queries = self
+                .batch_stats
+                .iter()
+                .find(|stat| stat.batch_id == batch_id)
+                .map(|stat| stat.n_queries)
+                .unwrap_or(0);
+            if Self::boundary_wait_use_limited(
+                n_queries,
+                Self::boundary_wait_max_queries(),
+                self.boundary_wait_used,
+                max_used,
+            ) {
+                self.ready.swap_remove(index);
+                crate::accel::cdcl_host::note_active_push_prefetch_evicted(1);
+                return None;
+            }
+        }
         let entry = self.ready.swap_remove(index);
         if let Some(stat) = self
             .batch_stats
@@ -391,6 +466,15 @@ impl PushPrefetchCache {
     }
 
     pub(super) fn note_validation(&mut self, batch_id: u64, accepted: bool) {
+        let max_queries = Self::boundary_wait_max_queries();
+        let boundary_wait_batch = max_queries != 0
+            && self
+                .batch_stats
+                .iter()
+                .find(|stat| stat.batch_id == batch_id)
+                .is_some_and(|stat| {
+                    Self::boundary_wait_eligible(stat.n_queries, max_queries)
+                });
         if let Some(stat) = self
             .batch_stats
             .iter_mut()
@@ -398,6 +482,9 @@ impl PushPrefetchCache {
         {
             if accepted {
                 stat.used = stat.used.saturating_add(1);
+                if boundary_wait_batch {
+                    self.boundary_wait_used = self.boundary_wait_used.saturating_add(1);
+                }
             } else {
                 stat.rejected = stat.rejected.saturating_add(1);
             }
@@ -466,6 +553,13 @@ impl PushPrefetchCache {
                 summary,
             );
             self.batch_stats.clear();
+        }
+        if Self::boundary_wait_max_used() != 0 {
+            eprintln!(
+                "inductor-cdcl: active push prefetch boundary-wait used/budget {}/{}",
+                self.boundary_wait_used,
+                Self::boundary_wait_max_used(),
+            );
         }
         crate::accel::cdcl_host::note_active_push_prefetch_evicted(self.ready.len());
         self.ready.clear();
@@ -596,6 +690,22 @@ mod tests {
         assert!(matches!(
             cache.take(2, &lemma).map(|inquiry| inquiry.result),
             Some(IncrementalResult::Unsat { .. })
+        ));
+    }
+
+    #[test]
+    fn boundary_wait_targets_only_nonempty_small_batch_limit() {
+        assert!(!PushPrefetchCache::boundary_wait_eligible(1, 0));
+        assert!(PushPrefetchCache::boundary_wait_eligible(96, 96));
+        assert!(!PushPrefetchCache::boundary_wait_eligible(97, 96));
+        assert!(!PushPrefetchCache::boundary_wait_use_limited(
+            96, 96, 255, 256
+        ));
+        assert!(PushPrefetchCache::boundary_wait_use_limited(
+            96, 96, 256, 256
+        ));
+        assert!(!PushPrefetchCache::boundary_wait_use_limited(
+            97, 96, 256, 256
         ));
     }
 
