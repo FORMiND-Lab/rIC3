@@ -153,10 +153,18 @@ impl Worker {
     }
 }
 
+const DEFAULT_FPGA_PORTFOLIO_WORKERS: [&str; 2] = ["ic3", "ic3_ctg_limit"];
+
 fn portfolio_worker_uses_fpga(name: &str, allowlist: Option<&str>) -> bool {
-    let Some(allowlist) = allowlist else {
-        return true;
-    };
+    let allowlist = allowlist.map(str::trim);
+    if allowlist.is_none() || allowlist == Some("auto") {
+        // These workers share the same transition relation and have sustained
+        // concurrent request supply on the VCK5000 without context thrashing.
+        // Wider portfolios must be an explicit opt-in because incompatible
+        // IC3 abstractions otherwise repeatedly invalidate queued requests.
+        return DEFAULT_FPGA_PORTFOLIO_WORKERS.contains(&name);
+    }
+    let allowlist = allowlist.unwrap();
     allowlist
         .split(',')
         .map(str::trim)
@@ -168,17 +176,23 @@ mod fpga_worker_tests {
     use super::portfolio_worker_uses_fpga;
 
     #[test]
-    fn explicit_fpga_worker_allowlist_is_exact_and_whitespace_tolerant() {
+    fn automatic_fpga_worker_policy_selects_the_validated_pair() {
         assert!(portfolio_worker_uses_fpga("ic3", None));
-        assert!(portfolio_worker_uses_fpga(
-            "ic3_inn",
-            Some("ic3, ic3_inn")
-        ));
+        assert!(portfolio_worker_uses_fpga("ic3_ctg_limit", None));
+        assert!(!portfolio_worker_uses_fpga("ic3_no_parent", None));
+        assert!(!portfolio_worker_uses_fpga("ic3_inn", Some("auto")));
+        assert!(portfolio_worker_uses_fpga("ic3", Some(" auto ")));
+    }
+
+    #[test]
+    fn explicit_fpga_worker_allowlist_is_exact_and_whitespace_tolerant() {
+        assert!(portfolio_worker_uses_fpga("ic3_inn", Some("ic3, ic3_inn")));
         assert!(!portfolio_worker_uses_fpga(
             "ic3_abs_all",
             Some("ic3, ic3_inn")
         ));
         assert!(portfolio_worker_uses_fpga("anything", Some("all")));
+        assert!(portfolio_worker_uses_fpga("anything", Some("*")));
         assert!(!portfolio_worker_uses_fpga("ic3", Some("")));
     }
 }
