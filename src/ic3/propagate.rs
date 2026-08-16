@@ -19,7 +19,6 @@ impl IC3 {
         lemma: &LitOrdVec,
         query: &IncrementalQuery,
         result: &IncrementalResult,
-        prefetched: bool,
     ) -> Option<bool> {
         let answer = match result {
             IncrementalResult::Sat { model } => {
@@ -49,9 +48,6 @@ impl IC3 {
                 None
             }
         };
-        if prefetched {
-            crate::accel::cdcl_host::note_active_push_prefetch_hit(answer.is_some());
-        }
         answer
     }
 
@@ -66,14 +62,27 @@ impl IC3 {
         // The next successful outer iteration extends IC3 by one level and
         // starts propagation at today's top frame. Prefetch that exact
         // look-ahead first; old-frame repeats are only secondary candidates.
-        let n_candidates = std::iter::once(level)
-            .chain(from..level)
-            .map(|frame_idx| self.frame[frame_idx].len())
-            .sum::<usize>()
+        let max_lemma_len = super::push_prefetch::PushPrefetchCache::max_lemma_len();
+        let mut eligible_candidates = 0usize;
+        let mut skipped_long = 0usize;
+        for frame_idx in std::iter::once(level).chain(from..level) {
+            for lemma in self.frame[frame_idx].iter() {
+                if max_lemma_len != 0 && lemma.len() > max_lemma_len {
+                    skipped_long += 1;
+                } else {
+                    eligible_candidates += 1;
+                }
+            }
+        }
+        let n_candidates = eligible_candidates
             .min(super::push_prefetch::PushPrefetchCache::launch_window());
         if n_candidates < crate::accel::cdcl_host::active_min_batch_size() {
             return;
         }
+        if !self.push_prefetch.should_launch() {
+            return;
+        }
+        crate::accel::cdcl_host::note_active_push_prefetch_skipped_long(skipped_long);
 
         let prepare_start = Instant::now();
         let mut keys = Vec::with_capacity(n_candidates);
@@ -84,6 +93,9 @@ impl IC3 {
             let mut lemmas: Vec<_> = self.frame[frame_idx].iter().collect();
             lemmas.sort_by_key(|lemma| lemma.len());
             for lemma in lemmas {
+                if max_lemma_len != 0 && lemma.len() > max_lemma_len {
+                    continue;
+                }
                 if keys.len() == n_candidates {
                     break 'frames;
                 }
@@ -225,13 +237,19 @@ impl IC3 {
                             .then(|| self.push_prefetch.take(frame_idx, &lemma))
                             .flatten();
                         if let Some(result) = prefetched.as_ref() {
-                            self.consume_hardware_push_result(
+                            let answer = self.consume_hardware_push_result(
                                 frame_idx,
                                 &lemma,
                                 &active_queries[lemma_index],
-                                result,
-                                true,
-                            )
+                                &result.result,
+                            );
+                            self.push_prefetch
+                                .note_validation(result.batch_id, answer.is_some());
+                            crate::accel::cdcl_host::note_active_push_prefetch_hit(
+                                lemma.len(),
+                                answer.is_some(),
+                            );
+                            answer
                         } else {
                             match preflight.get(result_index) {
                                 Some(ActivePreflight::Conclusive(IncrementalResult::Sat {
@@ -275,7 +293,6 @@ impl IC3 {
                                         &lemma,
                                         &active_queries[lemma_index],
                                         result,
-                                        false,
                                     )
                                 }),
                             }

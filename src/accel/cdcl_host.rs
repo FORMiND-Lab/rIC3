@@ -738,6 +738,40 @@ static ACTIVE_PUSH_PREFETCH_BUSY: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PUSH_PREFETCH_JOIN_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_ADMITTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_REPROBES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_SKIPPED_LONG: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_EVAL_QUERIES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_EVAL_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PUSH_PREFETCH_SUBMITTED_BY_LEN: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ACTIVE_PUSH_PREFETCH_READY_BY_LEN: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ACTIVE_PUSH_PREFETCH_HITS_BY_LEN: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ACTIVE_PUSH_PREFETCH_USED_BY_LEN: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -2695,13 +2729,58 @@ pub fn note_active_push_prefetch_harvest(n_ready: usize, wall_ns: u64, join_ns: 
     ACTIVE_PUSH_PREFETCH_JOIN_NS.fetch_add(join_ns, Ordering::Relaxed);
 }
 
-pub fn note_active_push_prefetch_hit(accepted: bool) {
+fn push_prefetch_length_bucket(lemma_len: usize) -> usize {
+    match lemma_len {
+        0..=4 => 0,
+        5..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 3,
+        _ => 4,
+    }
+}
+
+pub fn note_active_push_prefetch_submit_length(lemma_len: usize) {
+    ACTIVE_PUSH_PREFETCH_SUBMITTED_BY_LEN[push_prefetch_length_bucket(lemma_len)]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_push_prefetch_ready_length(lemma_len: usize) {
+    ACTIVE_PUSH_PREFETCH_READY_BY_LEN[push_prefetch_length_bucket(lemma_len)]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_push_prefetch_hit(lemma_len: usize, accepted: bool) {
+    let bucket = push_prefetch_length_bucket(lemma_len);
     ACTIVE_PUSH_PREFETCH_HITS.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_PUSH_PREFETCH_HITS_BY_LEN[bucket].fetch_add(1, Ordering::Relaxed);
     if accepted {
         ACTIVE_PUSH_PREFETCH_USED.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_PUSH_PREFETCH_USED_BY_LEN[bucket].fetch_add(1, Ordering::Relaxed);
     } else {
         ACTIVE_PUSH_PREFETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+pub fn note_active_push_prefetch_admission(
+    admitted: bool,
+    reprobe: bool,
+    evaluated_queries: usize,
+    evaluated_used: usize,
+) {
+    if admitted {
+        ACTIVE_PUSH_PREFETCH_ADMITTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_PUSH_PREFETCH_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+    if reprobe {
+        ACTIVE_PUSH_PREFETCH_REPROBES.fetch_add(1, Ordering::Relaxed);
+    }
+    ACTIVE_PUSH_PREFETCH_EVAL_QUERIES.store(evaluated_queries as u64, Ordering::Relaxed);
+    ACTIVE_PUSH_PREFETCH_EVAL_USED.store(evaluated_used as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_push_prefetch_skipped_long(n: usize) {
+    ACTIVE_PUSH_PREFETCH_SKIPPED_LONG.fetch_add(n as u64, Ordering::Relaxed);
 }
 
 pub fn note_active_push_prefetch_evicted(n: usize) {
@@ -2993,6 +3072,28 @@ pub fn flush_and_report() {
             ACTIVE_PUSH_PREFETCH_PREPARE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_PUSH_PREFETCH_WALL_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_PUSH_PREFETCH_JOIN_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        );
+        let push_bucket_values = |buckets: &[AtomicU64; 5]| {
+            buckets
+                .iter()
+                .map(|value| value.load(Ordering::Relaxed))
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "inductor-cdcl: active push prefetch len buckets <=4/5-8/9-16/17-32/>32 submitted {:?}, ready {:?}, hits {:?}, used {:?}",
+            push_bucket_values(&ACTIVE_PUSH_PREFETCH_SUBMITTED_BY_LEN),
+            push_bucket_values(&ACTIVE_PUSH_PREFETCH_READY_BY_LEN),
+            push_bucket_values(&ACTIVE_PUSH_PREFETCH_HITS_BY_LEN),
+            push_bucket_values(&ACTIVE_PUSH_PREFETCH_USED_BY_LEN),
+        );
+        eprintln!(
+            "inductor-cdcl: active push prefetch adaptive admitted/suppressed/reprobes {}/{}/{}, latest used/query {}/{}, skipped-long {}",
+            ACTIVE_PUSH_PREFETCH_ADMITTED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_SUPPRESSED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_REPROBES.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_EVAL_USED.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_EVAL_QUERIES.load(Ordering::Relaxed),
+            ACTIVE_PUSH_PREFETCH_SKIPPED_LONG.load(Ordering::Relaxed),
         );
         eprintln!(
             "inductor-cdcl: active block preflight conclusive/selected/fallback {}/{}/{}, wave reserved/taken {}/{}",
