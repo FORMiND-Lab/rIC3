@@ -25,7 +25,7 @@ use logicrs::LitVec;
 #[cfg(has_cdcl_accel)]
 use std::ffi::CString;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(has_cdcl_accel)]
 unsafe extern "C" {
@@ -342,6 +342,9 @@ impl HardwareCdcl {
             };
             if rc != 0 {
                 return Err(HardwareError::Open(rc));
+            }
+            if let Ok(worker) = std::env::var("INDUCTOR_CDCL_PORTFOLIO_WORKER") {
+                eprintln!("inductor-cdcl: portfolio worker {worker} connected to FPGA service");
             }
             Ok(Self {
                 n_var: 0,
@@ -691,6 +694,10 @@ static ACTIVE_BLOCK_CPU_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_CALIBRATIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_CALIBRATION_PROFITABLE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_CALIBRATION_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ROUTE_ENABLES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ROUTE_DISABLES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ROUTE_REPRESENTATIVE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ROUTE_ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_BLOCK_ASYNC_LAUNCHED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_HARVESTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
@@ -2477,6 +2484,19 @@ pub fn note_active_block_calibration(profitable: bool, elapsed_ns: u64) {
     ACTIVE_BLOCK_CALIBRATION_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
 }
 
+pub fn note_active_block_route_decision(enabled: bool) {
+    if enabled {
+        ACTIVE_BLOCK_ROUTE_ENABLES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_BLOCK_ROUTE_DISABLES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_active_block_route_observation(representative_ns: u64, enabled: bool) {
+    ACTIVE_BLOCK_ROUTE_REPRESENTATIVE_NS.store(representative_ns, Ordering::Relaxed);
+    ACTIVE_BLOCK_ROUTE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 pub fn note_active_block_async_launch(prepare_ns: u64) {
     ACTIVE_BLOCK_ASYNC_LAUNCHED.fetch_add(1, Ordering::Relaxed);
     ACTIVE_BLOCK_ASYNC_PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
@@ -2654,8 +2674,18 @@ pub fn flush_and_report() {
         if active_compare_cpu_enabled() {
             flush_comparison_writer();
         }
+        let hw_conclusive = ACTIVE_HW_SAT
+            .load(Ordering::Relaxed)
+            .saturating_add(ACTIVE_HW_UNSAT.load(Ordering::Relaxed));
+        let hw_used = ACTIVE_SAT_USED
+            .load(Ordering::Relaxed)
+            .saturating_add(ACTIVE_UNSAT_CORE_USED.load(Ordering::Relaxed));
+        let hw_rejected = ACTIVE_SAT_REJECTED
+            .load(Ordering::Relaxed)
+            .saturating_add(ACTIVE_UNSAT_CORE_REJECTED.load(Ordering::Relaxed));
+        let hw_unconsumed = hw_conclusive.saturating_sub(hw_used.saturating_add(hw_rejected));
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations profitable/total {}/{}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -2672,6 +2702,10 @@ pub fn flush_and_report() {
             ACTIVE_HW_UNSAT.load(Ordering::Relaxed),
             ACTIVE_UNKNOWN.load(Ordering::Relaxed),
             ACTIVE_ERROR.load(Ordering::Relaxed),
+            hw_used,
+            hw_conclusive,
+            hw_rejected,
+            hw_unconsumed,
             ACTIVE_HW_DECISIONS.load(Ordering::Relaxed),
             ACTIVE_HW_CONFLICTS.load(Ordering::Relaxed),
             ACTIVE_HW_PROPAGATIONS.load(Ordering::Relaxed),
@@ -2696,6 +2730,14 @@ pub fn flush_and_report() {
                 / 1_000.0,
             ACTIVE_BLOCK_CALIBRATION_PROFITABLE.load(Ordering::Relaxed),
             ACTIVE_BLOCK_CALIBRATIONS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ROUTE_ENABLES.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ROUTE_DISABLES.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ROUTE_REPRESENTATIVE_NS.load(Ordering::Relaxed) as f64 / 1_000.0,
+            if ACTIVE_BLOCK_ROUTE_ENABLED.load(Ordering::Relaxed) {
+                "FPGA"
+            } else {
+                "CPU"
+            },
             ACTIVE_BLOCK_CALIBRATION_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_BLOCK_ASYNC_HARVESTED.load(Ordering::Relaxed),
             ACTIVE_BLOCK_ASYNC_LAUNCHED.load(Ordering::Relaxed),

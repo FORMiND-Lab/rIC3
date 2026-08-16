@@ -84,6 +84,8 @@ struct BlockBatchCache {
 #[derive(Default)]
 pub(super) struct BlockAccelPolicy {
     cpu_samples_ns: VecDeque<u64>,
+    cpu_samples_scratch_ns: Vec<u64>,
+    calibration_samples_ns: Vec<u64>,
     hardware_since_sample: usize,
     calibration_profitable: Option<bool>,
 }
@@ -112,6 +114,30 @@ impl BlockAccelPolicy {
         })
     }
 
+    fn disable_cpu_ns() -> u64 {
+        use std::sync::OnceLock;
+        static MAX_NS: OnceLock<u64> = OnceLock::new();
+        *MAX_NS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_DISABLE_CPU_NS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| Self::min_cpu_ns().saturating_mul(3) / 4)
+                .min(Self::min_cpu_ns())
+        })
+    }
+
+    fn calibration_samples() -> usize {
+        use std::sync::OnceLock;
+        static SAMPLES: OnceLock<usize> = OnceLock::new();
+        *SAMPLES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_CALIBRATION_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8)
+                .clamp(1, 64)
+        })
+    }
+
     fn resample_interval() -> usize {
         use std::sync::OnceLock;
         static INTERVAL: OnceLock<usize> = OnceLock::new();
@@ -136,36 +162,39 @@ impl BlockAccelPolicy {
         })
     }
 
-    fn mean_cpu_ns(&self) -> Option<u64> {
-        if self.cpu_samples_ns.len() < Self::min_samples() {
+    fn representative_ns(samples: impl Iterator<Item = u64>) -> Option<u64> {
+        let mut samples: Vec<_> = samples.collect();
+        samples.sort_unstable();
+        samples
+            .get(samples.len().saturating_sub(1) / 2)
+            .copied()
+    }
+
+    fn representative_cpu_ns(&mut self, min_samples: usize) -> Option<u64> {
+        if self.cpu_samples_ns.len() < min_samples {
             return None;
         }
-        Some(
-            self.cpu_samples_ns.iter().copied().sum::<u64>()
-                / self.cpu_samples_ns.len() as u64,
-        )
+        // Use the complete retained distribution. A short tail of expensive
+        // fifo inquiries is not enough evidence to reverse a route whose
+        // typical inquiry is cheap. Reusing the scratch allocation and using
+        // linear-time selection avoids sorting or allocating on every sample.
+        self.cpu_samples_scratch_ns.clear();
+        self.cpu_samples_scratch_ns
+            .extend(self.cpu_samples_ns.iter().copied());
+        let median_index = self.cpu_samples_scratch_ns.len().saturating_sub(1) / 2;
+        let (_, median, _) = self
+            .cpu_samples_scratch_ns
+            .select_nth_unstable(median_index);
+        Some(*median)
     }
 
-    fn should_offload(&self, solver_mean_ns: Option<u64>) -> bool {
-        self.should_offload_at(
-            solver_mean_ns,
-            Self::min_cpu_ns(),
-            Self::resample_interval(),
-        )
+    fn should_offload(&self) -> bool {
+        self.should_offload_at(Self::resample_interval())
     }
 
-    fn should_offload_at(
-        &self,
-        solver_mean_ns: Option<u64>,
-        min_cpu_ns: u64,
-        resample_interval: usize,
-    ) -> bool {
+    fn should_offload_at(&self, resample_interval: usize) -> bool {
         self.hardware_since_sample < resample_interval
-            && (self.calibration_profitable == Some(true)
-                || solver_mean_ns.is_some_and(|mean| mean >= min_cpu_ns)
-                || self
-                    .mean_cpu_ns()
-                    .is_some_and(|mean| mean >= min_cpu_ns))
+            && self.calibration_profitable == Some(true)
     }
 
     fn needs_calibration(&self) -> bool {
@@ -173,20 +202,104 @@ impl BlockAccelPolicy {
     }
 
     fn note_calibration(&mut self, elapsed_ns: u64) -> bool {
-        let profitable = elapsed_ns >= Self::min_cpu_ns();
-        self.calibration_profitable = Some(profitable);
-        crate::accel::cdcl_host::note_active_block_calibration(profitable, elapsed_ns);
+        let above_threshold = elapsed_ns >= Self::min_cpu_ns();
+        let before = self.calibration_profitable;
+        let profitable = self.note_calibration_at(
+            elapsed_ns,
+            Self::calibration_samples(),
+            Self::min_cpu_ns(),
+        );
+        crate::accel::cdcl_host::note_active_block_calibration(
+            above_threshold,
+            elapsed_ns,
+        );
+        if before != self.calibration_profitable
+            && let Some(enabled) = self.calibration_profitable
+        {
+            let representative = Self::representative_ns(
+                self.calibration_samples_ns.iter().copied(),
+            )
+            .unwrap_or(0);
+            crate::accel::cdcl_host::note_active_block_route_observation(
+                representative,
+                enabled,
+            );
+            crate::accel::cdcl_host::note_active_block_route_decision(enabled);
+        }
         profitable
     }
 
     fn note_cpu(&mut self, elapsed_ns: u64) {
-        let window = Self::sample_window();
+        let before = self.calibration_profitable;
+        let representative = self.note_cpu_at(
+            elapsed_ns,
+            Self::sample_window(),
+            Self::min_samples(),
+            Self::min_cpu_ns(),
+            Self::disable_cpu_ns(),
+        );
+        if let (Some(representative), Some(enabled)) =
+            (representative, self.calibration_profitable)
+        {
+            crate::accel::cdcl_host::note_active_block_route_observation(
+                representative,
+                enabled,
+            );
+        }
+        if before != self.calibration_profitable
+            && let Some(enabled) = self.calibration_profitable
+        {
+            crate::accel::cdcl_host::note_active_block_route_decision(enabled);
+        }
+        crate::accel::cdcl_host::note_active_block_cpu_sample(elapsed_ns);
+    }
+
+    fn note_calibration_at(
+        &mut self,
+        elapsed_ns: u64,
+        required_samples: usize,
+        enable_ns: u64,
+    ) -> bool {
+        if self.calibration_profitable.is_none() {
+            self.calibration_samples_ns.push(elapsed_ns);
+            if self.calibration_samples_ns.len() >= required_samples.max(1) {
+                let representative = Self::representative_ns(
+                    self.calibration_samples_ns.iter().copied(),
+                )
+                .unwrap_or(0);
+                self.calibration_profitable = Some(representative >= enable_ns);
+            }
+        }
+        self.calibration_profitable == Some(true)
+    }
+
+    fn note_cpu_at(
+        &mut self,
+        elapsed_ns: u64,
+        window: usize,
+        min_samples: usize,
+        enable_ns: u64,
+        disable_ns: u64,
+    ) -> Option<u64> {
+        let window = window.max(min_samples).max(1);
         if self.cpu_samples_ns.len() == window {
             self.cpu_samples_ns.pop_front();
         }
         self.cpu_samples_ns.push_back(elapsed_ns);
         self.hardware_since_sample = 0;
-        crate::accel::cdcl_host::note_active_block_cpu_sample(elapsed_ns);
+        let Some(representative) = self.representative_cpu_ns(min_samples.max(1)) else {
+            return None;
+        };
+        match self.calibration_profitable {
+            Some(true) if representative < disable_ns => {
+                self.calibration_profitable = Some(false);
+            }
+            Some(false) if representative >= enable_ns => {
+                self.calibration_profitable = Some(true);
+            }
+            _ => {}
+        }
+        Some(representative)
     }
 
     fn note_hardware(&mut self) {
@@ -200,28 +313,84 @@ mod block_accel_policy_tests {
     use std::collections::VecDeque;
 
     #[test]
-    fn expected_cpu_cost_and_periodic_resampling_gate_offload() {
+    fn calibrated_route_requires_periodic_cpu_resampling() {
         let fast = BlockAccelPolicy {
             cpu_samples_ns: VecDeque::from(vec![20_000; 64]),
             ..Default::default()
         };
-        assert!(!fast.should_offload_at(None, 100_000, 64));
+        assert!(!fast.should_offload_at(64));
 
         let mut expensive = BlockAccelPolicy {
             cpu_samples_ns: VecDeque::from(vec![200_000; 64]),
             ..Default::default()
         };
-        assert!(expensive.should_offload_at(None, 100_000, 64));
+        expensive.calibration_profitable = Some(true);
+        assert!(expensive.should_offload_at(64));
         for _ in 0..64 {
             expensive.note_hardware();
         }
-        assert!(!expensive.should_offload_at(None, 100_000, 64));
+        assert!(!expensive.should_offload_at(64));
 
         let calibrated = BlockAccelPolicy {
             calibration_profitable: Some(true),
             ..Default::default()
         };
-        assert!(calibrated.should_offload_at(None, 100_000, 64));
+        assert!(calibrated.should_offload_at(64));
+    }
+
+    #[test]
+    fn calibration_uses_a_representative_distribution_not_one_outlier() {
+        let mut rejected = BlockAccelPolicy::default();
+        assert!(!rejected.note_calibration_at(300_000, 3, 100_000));
+        assert!(!rejected.note_calibration_at(20_000, 3, 100_000));
+        assert!(!rejected.note_calibration_at(30_000, 3, 100_000));
+        assert_eq!(rejected.calibration_profitable, Some(false));
+
+        let mut accepted = BlockAccelPolicy::default();
+        assert!(!accepted.note_calibration_at(250_000, 3, 100_000));
+        assert!(!accepted.note_calibration_at(40_000, 3, 100_000));
+        assert!(accepted.note_calibration_at(180_000, 3, 100_000));
+        assert_eq!(accepted.calibration_profitable, Some(true));
+    }
+
+    #[test]
+    fn rolling_median_has_enable_disable_hysteresis() {
+        let mut policy = BlockAccelPolicy {
+            calibration_profitable: Some(true),
+            ..Default::default()
+        };
+        for _ in 0..8 {
+            policy.note_cpu_at(80_000, 8, 8, 100_000, 75_000);
+        }
+        assert_eq!(policy.calibration_profitable, Some(true));
+        for _ in 0..8 {
+            policy.note_cpu_at(60_000, 8, 8, 100_000, 75_000);
+        }
+        assert_eq!(policy.calibration_profitable, Some(false));
+        for _ in 0..8 {
+            policy.note_cpu_at(90_000, 8, 8, 100_000, 75_000);
+        }
+        assert_eq!(policy.calibration_profitable, Some(false));
+        for _ in 0..8 {
+            policy.note_cpu_at(120_000, 8, 8, 100_000, 75_000);
+        }
+        assert_eq!(policy.calibration_profitable, Some(true));
+    }
+
+    #[test]
+    fn rolling_median_ignores_a_short_expensive_tail() {
+        let mut policy = BlockAccelPolicy {
+            calibration_profitable: Some(false),
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            policy.note_cpu_at(25_000, 64, 8, 100_000, 75_000);
+        }
+        for _ in 0..8 {
+            policy.note_cpu_at(500_000, 64, 8, 100_000, 75_000);
+        }
+        assert_eq!(policy.calibration_profitable, Some(false));
+        assert_eq!(policy.representative_cpu_ns(8), Some(25_000));
     }
 }
 
@@ -557,21 +726,9 @@ impl IC3 {
             // satisfy the exact live frame when this obligation is consumed,
             // and an UNSAT core is re-proved by exact GipSAT. New lemmas can
             // therefore invalidate speculation but cannot make it unsound.
-            let (solver_total_ns, solver_samples) = self.solvers.iter().fold(
-                (0u64, 0u64),
-                |(total_ns, samples), solver| {
-                    let (solver_ns, solver_samples) = solver.dcs.solve_time_totals();
-                    (
-                        total_ns.saturating_add(solver_ns),
-                        samples.saturating_add(solver_samples),
-                    )
-                },
-            );
-            let solver_mean_ns = (solver_samples >= BlockAccelPolicy::min_samples() as u64)
-                .then(|| solver_total_ns / solver_samples.max(1));
             let needs_calibration = self.block_accel_policy.needs_calibration();
             let block_cost_eligible = po.frame > 0
-                && (needs_calibration || self.block_accel_policy.should_offload(solver_mean_ns));
+                && (needs_calibration || self.block_accel_policy.should_offload());
             if po.frame > 0
                 && !block_cost_eligible
                 && crate::accel::cdcl_host::block_batch_enabled()

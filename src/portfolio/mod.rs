@@ -102,20 +102,29 @@ impl Worker {
         extractor: Option<LemmaIpcRx>,
     ) -> ! {
         set_max_level(LevelFilter::Warn);
-        if std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some()
-            && !portfolio_worker_uses_fpga(
+        let active_fpga = std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some();
+        let selected_fpga = active_fpga
+            && portfolio_worker_uses_fpga(
                 &self.name,
                 std::env::var("INDUCTOR_CDCL_PORTFOLIO_FPGA_WORKERS")
                     .ok()
                     .as_deref(),
-            )
-        {
+            );
+        if active_fpga && !selected_fpga {
             // This runs in the freshly forked, single-threaded child before
             // the engine or accelerator client exists. The parent and sibling
             // workers retain their own environment and accelerator policy.
             unsafe {
                 std::env::remove_var("INDUCTOR_CDCL_ACTIVE");
                 std::env::remove_var("INDUCTOR_CDCL_SERVER");
+            }
+        } else if selected_fpga {
+            // A portfolio time limit terminates children before their final
+            // statistics report. Preserve the selected worker name in its
+            // private post-fork environment so the lazy hardware connection
+            // can identify which policy actually crossed the route gate.
+            unsafe {
+                std::env::set_var("INDUCTOR_CDCL_PORTFOLIO_WORKER", &self.name);
             }
         }
         // We are already in the forked child, so take ownership of the inherited
