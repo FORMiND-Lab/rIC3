@@ -596,6 +596,105 @@ impl IncrementalCdcl for HardwareCdcl {
 struct ShadowContext {
     n_var: u32,
     clauses: Vec<ResidentClause>,
+    scope: ShadowContextScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShadowContextScope {
+    /// Only the immutable transition CNF is resident. Frame lemmas travel in
+    /// every query, so no other resident clause may be active at its frame.
+    SharedTransition,
+    /// Transition clauses are shared across all frames and every remaining
+    /// clause is active only at this exact frame.
+    ExactFrame(u32),
+}
+
+/// Exact physical context currently resident on the FPGA. Incremental updates
+/// are kept within one frame: retaining inactive clauses from many frames is
+/// logically valid, but bloats the occurrence lists that every BCP scans.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadedContext {
+    n_var: u32,
+    clauses: Vec<ResidentClause>,
+    scope: ShadowContextScope,
+}
+
+impl From<&ShadowContext> for LoadedContext {
+    fn from(context: &ShadowContext) -> Self {
+        Self {
+            n_var: context.n_var,
+            clauses: context.clauses.clone(),
+            scope: context.scope,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContextUpdate {
+    Ready,
+    Append(Vec<ResidentClause>),
+    Reload,
+}
+
+/// Decide whether a logical query snapshot is already represented by the
+/// physical resident snapshot, can be reached by a monotonic clause append, or
+/// needs an exact reload. This is deliberately strict: any transition change,
+/// frame change, lemma deletion/reordering, or unexpected clause range forces
+/// a reload.
+fn plan_context_update(
+    loaded: Option<&LoadedContext>,
+    target: &ShadowContext,
+) -> ContextUpdate {
+    let Some(loaded) = loaded else {
+        return ContextUpdate::Reload;
+    };
+    if loaded.n_var != target.n_var {
+        return ContextUpdate::Reload;
+    }
+    if target.scope == ShadowContextScope::SharedTransition {
+        return if loaded.scope == target.scope && loaded.clauses == target.clauses {
+            ContextUpdate::Ready
+        } else {
+            ContextUpdate::Reload
+        };
+    }
+    let ShadowContextScope::ExactFrame(frame) = target.scope else {
+        unreachable!();
+    };
+    if loaded.scope != ShadowContextScope::ExactFrame(frame) {
+        return ContextUpdate::Reload;
+    }
+    let is_shared = |clause: &&ResidentClause| clause.lo == 0 && clause.hi == u32::MAX;
+    if !loaded
+        .clauses
+        .iter()
+        .filter(is_shared)
+        .eq(target.clauses.iter().filter(is_shared))
+    {
+        return ContextUpdate::Reload;
+    }
+    if target.clauses.iter().any(|clause| {
+        !(clause.lo == 0 && clause.hi == u32::MAX)
+            && !(clause.lo == frame && clause.hi == frame)
+    }) || loaded.clauses.iter().any(|clause| {
+        !(clause.lo == 0 && clause.hi == u32::MAX)
+            && !(clause.lo == frame && clause.hi == frame)
+    }) {
+        return ContextUpdate::Reload;
+    }
+    let is_frame = |clause: &&ResidentClause| clause.lo == frame && clause.hi == frame;
+    let mut target_frame = target.clauses.iter().filter(is_frame);
+    for resident in loaded.clauses.iter().filter(is_frame) {
+        if target_frame.next() != Some(resident) {
+            return ContextUpdate::Reload;
+        }
+    }
+    let delta: Vec<_> = target_frame.cloned().collect();
+    if delta.is_empty() {
+        ContextUpdate::Ready
+    } else {
+        ContextUpdate::Append(delta)
+    }
 }
 
 struct ShadowBatch {
@@ -611,7 +710,7 @@ struct ShadowState {
 
 struct ActiveState {
     hardware: Option<HardwareCdcl>,
-    loaded_context: Option<ShadowContext>,
+    loaded_context: Option<LoadedContext>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -669,6 +768,9 @@ static ACTIVE_OFFERED_PASSES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MAX_READY: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOADS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CONTEXT_APPENDS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CONTEXT_APPEND_CLAUSES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CONTEXT_APPEND_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_SAT: AtomicU64 = AtomicU64::new(0);
@@ -794,6 +896,7 @@ static ACTIVE_MIC_BATCH_ECON_HW_VALID: AtomicBool = AtomicBool::new(false);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CONTEXT_APPEND_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_FALLBACK_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCH_NS: AtomicU64 = AtomicU64::new(0);
@@ -1693,6 +1796,7 @@ impl BatchedSolverContext {
                     .cloned()
                     .map(|literals| ResidentClause::new(0, u32::MAX, literals))
                     .collect(),
+                scope: ShadowContextScope::SharedTransition,
             })
         } else {
             self.exact.get_or_insert_with(|| ShadowContext {
@@ -1701,9 +1805,17 @@ impl BatchedSolverContext {
                     .trans
                     .iter()
                     .cloned()
-                    .chain(self.lemmas.iter().cloned())
-                    .map(|literals| ResidentClause::new(self.frame, self.frame, literals))
+                    .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+                    .chain(
+                        self.lemmas
+                            .iter()
+                            .cloned()
+                            .map(|literals| {
+                                ResidentClause::new(self.frame, self.frame, literals)
+                            }),
+                    )
                     .collect(),
+                scope: ShadowContextScope::ExactFrame(self.frame),
             })
         }
     }
@@ -1748,17 +1860,37 @@ fn prepare_batched_query(
                 .into_iter()
                 .map(|literals| ResidentClause::new(0, u32::MAX, literals))
                 .collect();
-            return (ShadowContext { n_var, clauses }, query, true);
+            return (
+                ShadowContext {
+                    n_var,
+                    clauses,
+                    scope: ShadowContextScope::SharedTransition,
+                },
+                query,
+                true,
+            );
         }
         query.constraints.truncate(n_existing_constraints);
     }
 
     let clauses = trans
         .into_iter()
-        .chain(lemmas)
-        .map(|literals| ResidentClause::new(frame, frame, literals))
+        .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+        .chain(
+            lemmas
+                .into_iter()
+                .map(|literals| ResidentClause::new(frame, frame, literals)),
+        )
         .collect();
-    (ShadowContext { n_var, clauses }, query, false)
+    (
+        ShadowContext {
+            n_var,
+            clauses,
+            scope: ShadowContextScope::ExactFrame(frame),
+        },
+        query,
+        false,
+    )
 }
 
 fn dump_mismatch_dimacs(context: &ShadowContext, query: &IncrementalQuery) {
@@ -2431,7 +2563,12 @@ pub fn solve_active_batch_with_min(
     };
     for mut group in groups {
         let mut context_load_ns = 0u64;
-        let mut context_ready = state.loaded_context.as_ref() == Some(&group.context);
+        let context_update = plan_context_update(state.loaded_context.as_ref(), &group.context);
+        let mut context_ready = context_update == ContextUpdate::Ready;
+        let mut append_clauses = match context_update {
+            ContextUpdate::Append(clauses) => Some(clauses),
+            ContextUpdate::Ready | ContextUpdate::Reload => None,
+        };
         let batches = std::mem::take(&mut group.batches);
         for range in batches {
             let start = range.start;
@@ -2443,6 +2580,47 @@ pub fn solve_active_batch_with_min(
             ACTIVE_BATCHES.fetch_add(1, Ordering::Relaxed);
             let mut batch_ns = 0u64;
             let mut result = None;
+            if !context_ready && let Some(clauses) = append_clauses.take() {
+                let append_start = std::time::Instant::now();
+                let appended = state
+                    .hardware
+                    .as_mut()
+                    .ok_or(HardwareError::Unavailable)
+                    .and_then(|hardware| hardware.add_frame_clauses(&clauses));
+                let append_ns = append_start
+                    .elapsed()
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64;
+                ACTIVE_CONTEXT_APPEND_NS.fetch_add(append_ns, Ordering::Relaxed);
+                match appended {
+                    Ok(()) => {
+                        ACTIVE_CONTEXT_APPENDS.fetch_add(1, Ordering::Relaxed);
+                        ACTIVE_CONTEXT_APPEND_CLAUSES
+                            .fetch_add(clauses.len() as u64, Ordering::Relaxed);
+                        if let Some(loaded) = state.loaded_context.as_mut() {
+                            loaded.clauses.extend(clauses);
+                            context_ready = true;
+                            context_load_ns = append_ns;
+                        } else {
+                            // The planner can only return Append for a loaded
+                            // context. Keep this defensive branch exact if the
+                            // state representation changes later.
+                            ACTIVE_CONTEXT_APPEND_FALLBACKS
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "inductor-cdcl: incremental context append failed: {error}"
+                        );
+                        ACTIVE_CONTEXT_APPEND_FALLBACKS
+                            .fetch_add(1, Ordering::Relaxed);
+                        // ADD_FRAME_CLAUSES is atomic in the kernel, but a
+                        // transport/server failure also invalidates the lease.
+                        state.loaded_context = None;
+                    }
+                }
+            }
             if !context_ready {
                 let combined_start = std::time::Instant::now();
                 let combined = state
@@ -2466,7 +2644,7 @@ pub fn solve_active_batch_with_min(
                         ACTIVE_COMBINED_BATCHES.fetch_add(1, Ordering::Relaxed);
                         ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
                         context_ready = true;
-                        state.loaded_context = Some(group.context.clone());
+                        state.loaded_context = Some(LoadedContext::from(&group.context));
                         batch_ns = combined_ns;
                         result = Some(Ok(results));
                     }
@@ -2505,7 +2683,7 @@ pub fn solve_active_batch_with_min(
                         }
                         ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
                         context_ready = true;
-                        state.loaded_context = Some(group.context.clone());
+                        state.loaded_context = Some(LoadedContext::from(&group.context));
                     }
                 }
             }
@@ -3047,7 +3225,7 @@ pub fn flush_and_report() {
         let hw_ns = PAIRED_HW_NS.load(Ordering::Relaxed);
         let service_ratio = cpu_ns as f64 / hw_ns.max(1) as f64;
         eprintln!(
-            "inductor-cdcl: paired selector frame >= {}, assumptions <= {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, filtered {}, queries {}, batches {}, CPU/HW agree {}, mismatch {}, HW unknown {}, HW-faster batches {}, CPU-reference {:.3} ms, FPGA service {:.3} ms, service ratio {:.3}x, init {:.3} ms, context loads {} / {:.3} ms, combined ok/fallback {}/{} / {:.3} ms, errors {}, CSV {}",
+            "inductor-cdcl: paired selector frame >= {}, assumptions <= {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, filtered {}, queries {}, batches {}, CPU/HW agree {}, mismatch {}, HW unknown {}, HW-faster batches {}, CPU-reference {:.3} ms, FPGA service {:.3} ms, service ratio {:.3}x, init {:.3} ms, context loads {} / {:.3} ms, appends {}/{} clauses (fallbacks {}) / {:.3} ms, combined ok/fallback {}/{} / {:.3} ms, errors {}, CSV {}",
             paired_min_frame(),
             paired_max_assumptions(),
             ACTIVE_PASSES.load(Ordering::Relaxed),
@@ -3068,6 +3246,10 @@ pub fn flush_and_report() {
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOADS.load(Ordering::Relaxed),
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_CONTEXT_APPENDS.load(Ordering::Relaxed),
+            ACTIVE_CONTEXT_APPEND_CLAUSES.load(Ordering::Relaxed),
+            ACTIVE_CONTEXT_APPEND_FALLBACKS.load(Ordering::Relaxed),
+            ACTIVE_CONTEXT_APPEND_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_COMBINED_BATCHES.load(Ordering::Relaxed),
             ACTIVE_COMBINED_FALLBACKS.load(Ordering::Relaxed),
             ACTIVE_COMBINED_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
@@ -3081,6 +3263,7 @@ pub fn flush_and_report() {
             let hybrid_service_ns = preflight_ns.saturating_add(hw_ns);
             let hybrid_with_load_ns = hybrid_service_ns
                 .saturating_add(ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed))
+                .saturating_add(ACTIVE_CONTEXT_APPEND_NS.load(Ordering::Relaxed))
                 .saturating_add(ACTIVE_COMBINED_FALLBACK_NS.load(Ordering::Relaxed));
             eprintln!(
                 "inductor-cdcl: paired preflight conflicts {}, candidates {}, conclusive {}, selected {}, preflight total/clone/solve {:.3}/{:.3}/{:.3} ms, all-candidate CPU baseline {:.3} ms, projected hybrid service {:.3} ms ({:.3}x), with context load {:.3} ms ({:.3}x)",
@@ -3118,7 +3301,7 @@ pub fn flush_and_report() {
         let block_unconsumed =
             block_conclusive.saturating_sub(block_used.saturating_add(block_rejected));
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, appends {}/{} clauses (fallbacks {}), combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load/append {:.3}/{:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -3129,6 +3312,9 @@ pub fn flush_and_report() {
             ACTIVE_OFFERED.load(Ordering::Relaxed),
             ACTIVE_BATCHES.load(Ordering::Relaxed),
             ACTIVE_CONTEXT_LOADS.load(Ordering::Relaxed),
+            ACTIVE_CONTEXT_APPENDS.load(Ordering::Relaxed),
+            ACTIVE_CONTEXT_APPEND_CLAUSES.load(Ordering::Relaxed),
+            ACTIVE_CONTEXT_APPEND_FALLBACKS.load(Ordering::Relaxed),
             ACTIVE_COMBINED_BATCHES.load(Ordering::Relaxed),
             ACTIVE_COMBINED_FALLBACKS.load(Ordering::Relaxed),
             ACTIVE_HW_SAT.load(Ordering::Relaxed),
@@ -3180,6 +3366,7 @@ pub fn flush_and_report() {
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_STATE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_CONTEXT_APPEND_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_COMBINED_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_VALIDATE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
@@ -3363,6 +3550,7 @@ pub fn flush_and_report() {
                 cpu_ns as f64
                     / hw_ns
                         .saturating_add(ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed))
+                        .saturating_add(ACTIVE_CONTEXT_APPEND_NS.load(Ordering::Relaxed))
                         .saturating_add(ACTIVE_COMBINED_FALLBACK_NS.load(Ordering::Relaxed))
                         .max(1) as f64,
                 std::env::var("INDUCTOR_CDCL_ACTIVE_COMPARE_CSV")
@@ -3660,14 +3848,19 @@ mod tests {
         let (exact, unchanged, used) = prepare_batched_query(&solver, query.clone(), false);
         assert!(!used);
         assert_eq!(unchanged.constraints, query.constraints);
+        assert_eq!(exact.scope, ShadowContextScope::ExactFrame(7));
+        assert!(exact.clauses.iter().all(|clause| {
+            clause.lo == 0 && clause.hi == u32::MAX
+                || clause.lo == 7 && clause.hi == 7
+        }));
         assert!(exact
             .clauses
             .iter()
-            .all(|clause| clause.lo == 7 && clause.hi == 7));
+            .any(|clause| clause.lo == 0 && clause.hi == u32::MAX));
         assert!(exact
             .clauses
             .iter()
-            .any(|clause| clause.literals.as_slice() == [!a, b]));
+            .any(|clause| clause.lo == 7 && clause.literals.as_slice() == [!a, b]));
 
         let mut later_solver = solver.clone();
         later_solver.accel_level = 8;
@@ -3707,11 +3900,72 @@ mod tests {
         assert_eq!(unchanged.assumptions, query.assumptions);
         assert_eq!(unchanged.constraints, query.constraints);
         assert_eq!(unchanged.domain, query.domain);
-        assert!(context
-            .clauses
-            .iter()
-            .all(|clause| clause.lo == 5 && clause.hi == 5));
+        assert_eq!(context.scope, ShadowContextScope::ExactFrame(5));
+        assert!(context.clauses.iter().all(|clause| {
+            clause.lo == 0 && clause.hi == u32::MAX
+                || clause.lo == 5 && clause.hi == 5
+        }));
         assert!(context.clauses.len() > query_lemma_word_limit() / 5);
+    }
+
+    #[test]
+    fn resident_context_appends_only_monotonic_same_frame_deltas() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), true);
+        let c = Lit::new(Var::from(2), true);
+        let transition = ResidentClause::new(0, u32::MAX, LitVec::from([a, b]));
+        let frame_one_a = ResidentClause::new(1, 1, LitVec::from([!a]));
+        let frame_one_b = ResidentClause::new(1, 1, LitVec::from([!b]));
+        let frame_two = ResidentClause::new(2, 2, LitVec::from([c]));
+        let frame_one = |lemmas: Vec<ResidentClause>| ShadowContext {
+            n_var: 3,
+            clauses: std::iter::once(transition.clone())
+                .chain(lemmas)
+                .collect(),
+            scope: ShadowContextScope::ExactFrame(1),
+        };
+        let target_one = frame_one(vec![frame_one_a.clone(), frame_one_b.clone()]);
+        let mut loaded = LoadedContext::from(&frame_one(vec![frame_one_a.clone()]));
+
+        assert_eq!(
+            plan_context_update(Some(&loaded), &target_one),
+            ContextUpdate::Append(vec![frame_one_b.clone()]),
+        );
+        loaded.clauses.push(frame_one_b.clone());
+        assert_eq!(
+            plan_context_update(Some(&loaded), &target_one),
+            ContextUpdate::Ready,
+        );
+
+        let target_two = ShadowContext {
+            n_var: 3,
+            clauses: vec![transition.clone(), frame_two.clone()],
+            scope: ShadowContextScope::ExactFrame(2),
+        };
+        assert_eq!(
+            plan_context_update(Some(&loaded), &target_two),
+            ContextUpdate::Reload,
+        );
+
+        // A shorter/reordered frame log or a transition change can no longer
+        // be represented by append-only state and must replace the context.
+        assert_eq!(
+            plan_context_update(Some(&loaded), &frame_one(vec![])),
+            ContextUpdate::Reload,
+        );
+        let changed_transition = ShadowContext {
+            n_var: 3,
+            clauses: vec![
+                ResidentClause::new(0, u32::MAX, LitVec::from([a, c])),
+                frame_one_a,
+                frame_one_b,
+            ],
+            scope: ShadowContextScope::ExactFrame(1),
+        };
+        assert_eq!(
+            plan_context_update(Some(&loaded), &changed_transition),
+            ContextUpdate::Reload,
+        );
     }
 
     #[test]
