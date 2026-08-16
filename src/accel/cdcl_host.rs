@@ -698,6 +698,14 @@ static ACTIVE_BLOCK_ROUTE_ENABLES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ROUTE_DISABLES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ROUTE_REPRESENTATIVE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ROUTE_ENABLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_BLOCK_BATCH_ECON_PROBES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BATCH_ECON_OFFLOADS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BATCH_ECON_REJECTS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BATCH_ECON_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BATCH_ECON_HW_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BATCH_ECON_HW_VALID: AtomicBool = AtomicBool::new(false);
+static ACTIVE_BLOCK_BATCH_ECON_ROUTE: AtomicBool = AtomicBool::new(false);
+const DEFAULT_BLOCK_BATCH_ECONOMICS: bool = true;
 static ACTIVE_BLOCK_HW_CONCLUSIVE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_SELECTED_NO_ANSWER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_RESULT_USED: AtomicU64 = AtomicU64::new(0);
@@ -1033,6 +1041,32 @@ pub fn active_min_batch_size() -> usize {
     })
 }
 
+pub fn block_batch_economics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_BLOCK_BATCH_ECONOMICS")
+            .ok()
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            // Learn the end-to-end batch cost and fall back to exact GipSAT
+            // when the VCK5000 cannot repay it. Set the variable to 0 only
+            // for controlled comparisons with the legacy per-query route.
+            .unwrap_or(DEFAULT_BLOCK_BATCH_ECONOMICS)
+    })
+}
+
+pub fn block_min_batch_cpu_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_BLOCK_MIN_BATCH_CPU_NS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            // A full batch below this aggregate CPU cost cannot amortize the
+            // measured VCK5000 service and transport floor. The adaptive
+            // hardware estimate takes over after the first bounded probe.
+            .unwrap_or(2_500_000)
+    })
+}
+
 fn paired_min_frame() -> u32 {
     static FRAME: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *FRAME.get_or_init(|| {
@@ -1134,6 +1168,7 @@ fn sample_keeps_fpga(
     n_remaining: usize,
     min_batch: usize,
     min_cpu_ns: u64,
+    min_batch_cpu_ns: Option<u64>,
     all_conclusive: bool,
 ) -> bool {
     let mut distribution = sample_solve_ns.to_vec();
@@ -1146,9 +1181,12 @@ fn sample_keeps_fpga(
     else {
         return false;
     };
+    let aggregate_profitable = min_batch_cpu_ns.is_some_and(|minimum| {
+        representative_ns.saturating_mul(n_remaining as u64) >= minimum
+    });
     all_conclusive
         && n_remaining >= min_batch
-        && representative_ns >= min_cpu_ns
+        && (representative_ns >= min_cpu_ns || aggregate_profitable)
 }
 
 /// Avoid paying even the bounded CPU classification cost when the raw
@@ -1319,6 +1357,7 @@ pub fn active_sample_select_pass(
             remaining.len(),
             active_min_batch_size(),
             active_sample_min_cpu_ns(),
+            block_batch_economics_enabled().then_some(block_min_batch_cpu_ns()),
             all_conclusive,
         ) {
             ACTIVE_SAMPLE_CPU_BATCHES.fetch_add(1, Ordering::Relaxed);
@@ -2512,6 +2551,42 @@ pub fn note_active_block_route_observation(representative_ns: u64, enabled: bool
     ACTIVE_BLOCK_ROUTE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Monotonic process-local service counters around one synchronous block
+/// submission. The elapsed time includes the persistent-service round trip,
+/// queueing behind another portfolio client, and a combined context load when
+/// one was required, so the adaptive route learns the cost the caller really
+/// paid instead of a kernel-only idealization.
+pub fn active_batch_service_snapshot() -> (u64, u64, u64) {
+    (
+        ACTIVE_BATCHES.load(Ordering::Relaxed),
+        ACTIVE_OFFERED.load(Ordering::Relaxed),
+        ACTIVE_BATCH_NS.load(Ordering::Relaxed),
+    )
+}
+
+pub fn note_active_block_batch_economics(
+    projected_cpu_ns: u64,
+    projected_hardware_ns: Option<u64>,
+    probe: bool,
+    selected: bool,
+) {
+    ACTIVE_BLOCK_BATCH_ECON_CPU_NS.store(projected_cpu_ns, Ordering::Relaxed);
+    ACTIVE_BLOCK_BATCH_ECON_HW_NS.store(
+        projected_hardware_ns.unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    ACTIVE_BLOCK_BATCH_ECON_HW_VALID
+        .store(projected_hardware_ns.is_some(), Ordering::Relaxed);
+    ACTIVE_BLOCK_BATCH_ECON_ROUTE.store(selected && !probe, Ordering::Relaxed);
+    if probe {
+        ACTIVE_BLOCK_BATCH_ECON_PROBES.fetch_add(1, Ordering::Relaxed);
+    } else if selected {
+        ACTIVE_BLOCK_BATCH_ECON_OFFLOADS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_BLOCK_BATCH_ECON_REJECTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn note_active_block_selected_result(conclusive: bool) {
     if conclusive {
         ACTIVE_BLOCK_HW_CONCLUSIVE.fetch_add(1, Ordering::Relaxed);
@@ -2855,6 +2930,28 @@ pub fn flush_and_report() {
             ACTIVE_BLOCK_WAVE_RESERVED.load(Ordering::Relaxed),
             ACTIVE_BLOCK_WAVE_TAKEN.load(Ordering::Relaxed),
         );
+        let batch_hw_valid = ACTIVE_BLOCK_BATCH_ECON_HW_VALID.load(Ordering::Relaxed);
+        eprintln!(
+            "inductor-cdcl: active block batch economics probes/offloads/rejects {}/{}/{}, projected CPU/HW {:.3}/{}, route {}",
+            ACTIVE_BLOCK_BATCH_ECON_PROBES.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BATCH_ECON_OFFLOADS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BATCH_ECON_REJECTS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BATCH_ECON_CPU_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            if batch_hw_valid {
+                format!(
+                    "{:.3} ms",
+                    ACTIVE_BLOCK_BATCH_ECON_HW_NS.load(Ordering::Relaxed) as f64
+                        / 1_000_000.0
+                )
+            } else {
+                "untrained".to_string()
+            },
+            if ACTIVE_BLOCK_BATCH_ECON_ROUTE.load(Ordering::Relaxed) {
+                "FPGA"
+            } else {
+                "CPU"
+            },
+        );
         if let Some(conflict_limit) = active_preflight_conflicts() {
             let candidates = ACTIVE_PREFLIGHT_CANDIDATES.load(Ordering::Relaxed);
             eprintln!(
@@ -2942,22 +3039,40 @@ mod tests {
         assert_eq!(representative_sample_positions(10, 3), vec![1, 5, 8]);
         assert_eq!(representative_sample_positions(3, 8), vec![0, 1, 2]);
         assert!(sample_keeps_fpga(
-            &[250_000, 300_000, 900_000], 16, 8, 200_000, true
+            &[250_000, 300_000, 900_000], 16, 8, 200_000, None, true
         ));
         assert!(!sample_keeps_fpga(
-            &[50_000, 100_000, 900_000], 16, 8, 200_000, true
+            &[50_000, 100_000, 900_000], 16, 8, 200_000, None, true
         ));
         // With an even sample the lower median prevents one expensive half
         // from routing a frame whose other half is cheap.
         assert!(!sample_keeps_fpga(
-            &[150_000, 600_000], 16, 8, 200_000, true
+            &[150_000, 600_000], 16, 8, 200_000, None, true
         ));
         assert!(!sample_keeps_fpga(
-            &[250_000, 300_000], 7, 8, 200_000, true
+            &[250_000, 300_000], 7, 8, 200_000, None, true
         ));
-        assert!(!sample_keeps_fpga(&[], 16, 8, 200_000, true));
+        assert!(!sample_keeps_fpga(&[], 16, 8, 200_000, None, true));
         assert!(!sample_keeps_fpga(
-            &[250_000, 300_000], 16, 8, 200_000, false
+            &[250_000, 300_000], 16, 8, 200_000, None, false
+        ));
+        // Many individually cheap inquiries can still amortize one FPGA
+        // submission; a genuinely cheap aggregate remains on the CPU.
+        assert!(sample_keeps_fpga(
+            &[80_000, 90_000, 100_000],
+            64,
+            8,
+            200_000,
+            Some(4_000_000),
+            true,
+        ));
+        assert!(!sample_keeps_fpga(
+            &[20_000, 25_000, 30_000],
+            64,
+            8,
+            200_000,
+            Some(4_000_000),
+            true,
         ));
     }
 

@@ -88,13 +88,57 @@ struct BlockBatchCache {
 const DEFAULT_BLOCK_ASYNC: bool = false;
 const DEFAULT_BLOCK_WAVEFRONT: bool = true;
 
-#[derive(Default)]
 pub(super) struct BlockAccelPolicy {
     cpu_samples_ns: VecDeque<u64>,
     cpu_samples_scratch_ns: Vec<u64>,
     calibration_samples_ns: Vec<u64>,
+    hardware_batch_samples: VecDeque<HardwareBatchSample>,
+    hardware_batch_ns_scratch: Vec<u64>,
+    hardware_batch_queries_scratch: Vec<usize>,
     hardware_since_sample: usize,
+    cpu_since_batch_probe: usize,
     calibration_profitable: Option<bool>,
+    batch_route_profitable: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HardwareBatchSample {
+    service_per_batch_ns: u64,
+    queries_per_batch: usize,
+    conclusive_percent: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchRouteDecision {
+    Reject,
+    Probe,
+    Offload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BatchRouteEvaluation {
+    decision: BatchRouteDecision,
+    projected_cpu_ns: u64,
+    projected_hardware_ns: Option<u64>,
+}
+
+impl Default for BlockAccelPolicy {
+    fn default() -> Self {
+        Self {
+            cpu_samples_ns: VecDeque::new(),
+            cpu_samples_scratch_ns: Vec::new(),
+            calibration_samples_ns: Vec::new(),
+            hardware_batch_samples: VecDeque::new(),
+            hardware_batch_ns_scratch: Vec::new(),
+            hardware_batch_queries_scratch: Vec::new(),
+            hardware_since_sample: 0,
+            // Permit exactly one bounded bootstrap probe once the aggregate
+            // CPU floor is met; later probes require a real CPU cooldown.
+            cpu_since_batch_probe: usize::MAX,
+            calibration_profitable: None,
+            batch_route_profitable: None,
+        }
+    }
 }
 
 impl BlockAccelPolicy {
@@ -169,6 +213,80 @@ impl BlockAccelPolicy {
         })
     }
 
+    fn batch_hardware_window() -> usize {
+        use std::sync::OnceLock;
+        static WINDOW: OnceLock<usize> = OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_BATCH_COST_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32)
+                .clamp(1, 256)
+        })
+    }
+
+    fn batch_enable_speedup_pct() -> u64 {
+        use std::sync::OnceLock;
+        static PERCENT: OnceLock<u64> = OnceLock::new();
+        *PERCENT.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_BATCH_SPEEDUP_PCT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(125)
+                .clamp(100, 1000)
+        })
+    }
+
+    fn batch_disable_speedup_pct() -> u64 {
+        use std::sync::OnceLock;
+        static PERCENT: OnceLock<u64> = OnceLock::new();
+        *PERCENT.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_BATCH_DISABLE_PCT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(105)
+                .clamp(100, Self::batch_enable_speedup_pct())
+        })
+    }
+
+    fn batch_probe_interval() -> usize {
+        use std::sync::OnceLock;
+        static INTERVAL: OnceLock<usize> = OnceLock::new();
+        *INTERVAL.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_BATCH_PROBE_CPU_QUERIES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(16_384)
+                .max(1)
+        })
+    }
+
+    fn batch_probe_min_cpu_ns() -> u64 {
+        use std::sync::OnceLock;
+        static NS: OnceLock<u64> = OnceLock::new();
+        *NS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_BATCH_PROBE_MIN_CPU_NS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(50_000)
+        })
+    }
+
+    fn batch_cpu_cap_ns() -> u64 {
+        use std::sync::OnceLock;
+        static NS: OnceLock<u64> = OnceLock::new();
+        *NS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_BATCH_CPU_CAP_NS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                // A seconds-long GipSAT tail will still be retried after a
+                // bounded hardware UNKNOWN. Cap its bootstrap influence until
+                // the measured conclusive ratio proves the FPGA can replace it.
+                .unwrap_or(10_000_000)
+                .max(1)
+        })
+    }
+
     fn representative_ns(samples: impl Iterator<Item = u64>) -> Option<u64> {
         let mut samples: Vec<_> = samples.collect();
         samples.sort_unstable();
@@ -193,6 +311,191 @@ impl BlockAccelPolicy {
             .cpu_samples_scratch_ns
             .select_nth_unstable(median_index);
         Some(*median)
+    }
+
+    fn batch_probe_ready(&self, probe_interval: usize) -> bool {
+        self.cpu_since_batch_probe >= probe_interval.max(1)
+    }
+
+    fn batch_cpu_per_query_ns(&self, min_samples: usize, cap_ns: u64) -> Option<u64> {
+        if self.cpu_samples_ns.len() < min_samples.max(1) {
+            return None;
+        }
+        let total = self.cpu_samples_ns.iter().fold(0u64, |total, sample| {
+            total.saturating_add((*sample).min(cap_ns))
+        });
+        Some(total / self.cpu_samples_ns.len() as u64)
+    }
+
+    fn batch_has_minimum_cpu_work_at(
+        &mut self,
+        n_candidates: usize,
+        min_batch: usize,
+        min_samples: usize,
+        min_batch_cpu_ns: u64,
+        cpu_cap_ns: u64,
+        probe_min_cpu_ns: u64,
+    ) -> bool {
+        if n_candidates < min_batch {
+            return false;
+        }
+        self.batch_cpu_per_query_ns(min_samples, cpu_cap_ns)
+            .is_some_and(|mean| {
+                (mean >= probe_min_cpu_ns || !self.hardware_batch_samples.is_empty())
+                    && mean.saturating_mul(n_candidates as u64) >= min_batch_cpu_ns
+            })
+    }
+
+    fn batch_route_at(
+        &mut self,
+        n_candidates: usize,
+        min_batch: usize,
+        min_samples: usize,
+        min_batch_cpu_ns: u64,
+        cpu_cap_ns: u64,
+        probe_min_cpu_ns: u64,
+        enable_speedup_pct: u64,
+        disable_speedup_pct: u64,
+        probe_interval: usize,
+    ) -> BatchRouteEvaluation {
+        let Some(mean_cpu_ns) = self.batch_cpu_per_query_ns(min_samples, cpu_cap_ns) else {
+            return BatchRouteEvaluation {
+                decision: BatchRouteDecision::Reject,
+                projected_cpu_ns: 0,
+                projected_hardware_ns: None,
+            };
+        };
+        let mut projected_cpu_ns = mean_cpu_ns.saturating_mul(n_candidates as u64);
+        if n_candidates < min_batch
+            || projected_cpu_ns < min_batch_cpu_ns
+            || self.hardware_batch_samples.is_empty() && mean_cpu_ns < probe_min_cpu_ns
+        {
+            self.batch_route_profitable = Some(false);
+            return BatchRouteEvaluation {
+                decision: BatchRouteDecision::Reject,
+                projected_cpu_ns,
+                projected_hardware_ns: None,
+            };
+        }
+        if self.hardware_since_sample >= Self::resample_interval() {
+            return BatchRouteEvaluation {
+                decision: BatchRouteDecision::Reject,
+                projected_cpu_ns,
+                projected_hardware_ns: None,
+            };
+        }
+        if self.hardware_batch_samples.is_empty() {
+            return BatchRouteEvaluation {
+                decision: if self.batch_probe_ready(probe_interval) {
+                    BatchRouteDecision::Probe
+                } else {
+                    BatchRouteDecision::Reject
+                },
+                projected_cpu_ns,
+                projected_hardware_ns: None,
+            };
+        }
+
+        self.hardware_batch_ns_scratch.clear();
+        self.hardware_batch_queries_scratch.clear();
+        self.hardware_batch_ns_scratch.extend(
+            self.hardware_batch_samples
+                .iter()
+                .map(|sample| sample.service_per_batch_ns),
+        );
+        self.hardware_batch_queries_scratch.extend(
+            self.hardware_batch_samples
+                .iter()
+                .map(|sample| sample.queries_per_batch),
+        );
+        let batch_index = self.hardware_batch_ns_scratch.len().saturating_sub(1) / 2;
+        let (_, service_per_batch_ns, _) = self
+            .hardware_batch_ns_scratch
+            .select_nth_unstable(batch_index);
+        let query_index = self
+            .hardware_batch_queries_scratch
+            .len()
+            .saturating_sub(1)
+            / 2;
+        let (_, queries_per_batch, _) = self
+            .hardware_batch_queries_scratch
+            .select_nth_unstable(query_index);
+        let mut conclusive_distribution: Vec<_> = self
+            .hardware_batch_samples
+            .iter()
+            .map(|sample| sample.conclusive_percent)
+            .collect();
+        let conclusive_index = conclusive_distribution.len().saturating_sub(1) / 2;
+        let (_, conclusive_percent, _) =
+            conclusive_distribution.select_nth_unstable(conclusive_index);
+        projected_cpu_ns = projected_cpu_ns
+            .saturating_mul(*conclusive_percent)
+            / 100;
+        let estimated_batches = n_candidates.div_ceil((*queries_per_batch).max(1));
+        let projected_hardware_ns = service_per_batch_ns
+            .saturating_mul(estimated_batches as u64);
+        let required_speedup = if self.batch_route_profitable == Some(true) {
+            disable_speedup_pct.min(enable_speedup_pct)
+        } else {
+            enable_speedup_pct
+        };
+        let profitable = u128::from(projected_cpu_ns).saturating_mul(100)
+            >= u128::from(projected_hardware_ns)
+                .saturating_mul(u128::from(required_speedup));
+        self.batch_route_profitable = Some(profitable);
+        let decision = if profitable {
+            BatchRouteDecision::Offload
+        } else if self.batch_probe_ready(probe_interval) {
+            BatchRouteDecision::Probe
+        } else {
+            BatchRouteDecision::Reject
+        };
+        BatchRouteEvaluation {
+            decision,
+            projected_cpu_ns,
+            projected_hardware_ns: Some(projected_hardware_ns),
+        }
+    }
+
+    fn batch_route(&mut self, n_candidates: usize) -> BatchRouteEvaluation {
+        self.batch_route_at(
+            n_candidates,
+            crate::accel::cdcl_host::active_min_batch_size(),
+            Self::min_samples(),
+            crate::accel::cdcl_host::block_min_batch_cpu_ns(),
+            Self::batch_cpu_cap_ns(),
+            Self::batch_probe_min_cpu_ns(),
+            Self::batch_enable_speedup_pct(),
+            Self::batch_disable_speedup_pct(),
+            Self::batch_probe_interval(),
+        )
+    }
+
+    fn note_hardware_batch(
+        &mut self,
+        queries: u64,
+        batches: u64,
+        service_ns: u64,
+        conclusive: u64,
+    ) {
+        // A selected probe consumed the opportunity even when transport or
+        // device setup failed before a measurable batch. Do not hammer an
+        // unavailable service on every following frontier.
+        self.cpu_since_batch_probe = 0;
+        if queries == 0 || batches == 0 || service_ns == 0 {
+            return;
+        }
+        let sample = HardwareBatchSample {
+            service_per_batch_ns: service_ns.div_ceil(batches),
+            queries_per_batch: usize::try_from(queries.div_ceil(batches))
+                .unwrap_or(usize::MAX)
+                .max(1),
+            conclusive_percent: conclusive.min(queries).saturating_mul(100) / queries,
+        };
+        if self.hardware_batch_samples.len() == Self::batch_hardware_window() {
+            self.hardware_batch_samples.pop_front();
+        }
+        self.hardware_batch_samples.push_back(sample);
     }
 
     fn should_offload(&self) -> bool {
@@ -294,6 +597,7 @@ impl BlockAccelPolicy {
         }
         self.cpu_samples_ns.push_back(elapsed_ns);
         self.hardware_since_sample = 0;
+        self.cpu_since_batch_probe = self.cpu_since_batch_probe.saturating_add(1);
         let Some(representative) = self.representative_cpu_ns(min_samples.max(1)) else {
             return None;
         };
@@ -317,8 +621,8 @@ impl BlockAccelPolicy {
 #[cfg(test)]
 mod block_accel_policy_tests {
     use super::{
-        BlockAccelPolicy, BlockBatchCache, CachedBlockInquiry, DEFAULT_BLOCK_ASYNC,
-        DEFAULT_BLOCK_WAVEFRONT,
+        BatchRouteDecision, BlockAccelPolicy, BlockBatchCache, CachedBlockInquiry,
+        DEFAULT_BLOCK_ASYNC, DEFAULT_BLOCK_WAVEFRONT,
     };
     use crate::{
         accel::cdcl::UnknownReason,
@@ -407,6 +711,195 @@ mod block_accel_policy_tests {
         }
         assert_eq!(policy.calibration_profitable, Some(false));
         assert_eq!(policy.representative_cpu_ns(8), Some(25_000));
+    }
+
+    #[test]
+    fn aggregate_batch_economics_probes_many_moderate_queries_only() {
+        let mut aggregate = BlockAccelPolicy::default();
+        for _ in 0..8 {
+            aggregate.note_cpu_at(80_000, 64, 8, 100_000, 75_000);
+        }
+        assert_eq!(
+            aggregate
+                .batch_route_at(
+                    64,
+                    8,
+                    8,
+                    4_000_000,
+                    10_000_000,
+                    50_000,
+                    125,
+                    105,
+                    256,
+                )
+                .decision,
+            BatchRouteDecision::Probe,
+        );
+
+        let mut cheap = BlockAccelPolicy::default();
+        for _ in 0..8 {
+            cheap.note_cpu_at(25_000, 64, 8, 100_000, 75_000);
+        }
+        assert_eq!(
+            cheap
+                .batch_route_at(
+                    64,
+                    8,
+                    8,
+                    4_000_000,
+                    10_000_000,
+                    50_000,
+                    125,
+                    105,
+                    256,
+                )
+                .decision,
+            BatchRouteDecision::Reject,
+        );
+
+        let mut cheap_but_numerous = BlockAccelPolicy::default();
+        for _ in 0..8 {
+            cheap_but_numerous.note_cpu_at(40_000, 64, 8, 100_000, 75_000);
+        }
+        assert_eq!(
+            cheap_but_numerous
+                .batch_route_at(
+                    64,
+                    8,
+                    8,
+                    2_000_000,
+                    10_000_000,
+                    50_000,
+                    125,
+                    105,
+                    256,
+                )
+                .decision,
+            BatchRouteDecision::Reject,
+        );
+    }
+
+    #[test]
+    fn measured_batch_service_controls_route_and_probe_cooldown() {
+        let mut profitable = BlockAccelPolicy::default();
+        for _ in 0..8 {
+            profitable.note_cpu_at(200_000, 64, 8, 100_000, 75_000);
+        }
+        // Two measured batches carried 16 queries each and cost 2 ms each.
+        // A 64-query frontier therefore predicts 12.8 ms CPU versus 8 ms FPGA.
+        profitable.note_hardware_batch(32, 2, 4_000_000, 32);
+        let evaluation =
+            profitable.batch_route_at(
+                64,
+                8,
+                8,
+                4_000_000,
+                10_000_000,
+                50_000,
+                125,
+                105,
+                256,
+            );
+        assert_eq!(evaluation.decision, BatchRouteDecision::Offload);
+        assert_eq!(evaluation.projected_cpu_ns, 12_800_000);
+        assert_eq!(evaluation.projected_hardware_ns, Some(8_000_000));
+
+        let mut all_unknown = BlockAccelPolicy::default();
+        for _ in 0..8 {
+            all_unknown.note_cpu_at(200_000, 64, 8, 100_000, 75_000);
+        }
+        all_unknown.note_hardware_batch(32, 2, 4_000_000, 0);
+        let unknown_evaluation =
+            all_unknown.batch_route_at(
+                64,
+                8,
+                8,
+                4_000_000,
+                10_000_000,
+                50_000,
+                125,
+                105,
+                256,
+            );
+        assert_eq!(unknown_evaluation.decision, BatchRouteDecision::Reject);
+        assert_eq!(unknown_evaluation.projected_cpu_ns, 0);
+
+        let mut failed_probe = BlockAccelPolicy::default();
+        for _ in 0..8 {
+            failed_probe.note_cpu_at(200_000, 64, 8, 100_000, 75_000);
+        }
+        failed_probe.note_hardware_batch(0, 0, 0, 0);
+        assert_eq!(
+            failed_probe
+                .batch_route_at(
+                    64,
+                    8,
+                    8,
+                    4_000_000,
+                    10_000_000,
+                    50_000,
+                    125,
+                    105,
+                    256,
+                )
+                .decision,
+            BatchRouteDecision::Reject,
+        );
+
+        let mut slow = BlockAccelPolicy::default();
+        for _ in 0..8 {
+            slow.note_cpu_at(80_000, 64, 8, 100_000, 75_000);
+        }
+        slow.note_hardware_batch(64, 1, 5_000_000, 64);
+        assert_eq!(
+            slow.batch_route_at(
+                64,
+                8,
+                8,
+                4_000_000,
+                10_000_000,
+                50_000,
+                125,
+                105,
+                256,
+            )
+                .decision,
+            BatchRouteDecision::Reject,
+        );
+        for _ in 0..255 {
+            slow.note_cpu_at(80_000, 256, 8, 100_000, 75_000);
+        }
+        assert_eq!(
+            slow.batch_route_at(
+                64,
+                8,
+                8,
+                4_000_000,
+                10_000_000,
+                50_000,
+                125,
+                105,
+                256,
+            )
+                .decision,
+            BatchRouteDecision::Reject,
+        );
+        slow.note_cpu_at(80_000, 256, 8, 100_000, 75_000);
+        assert_eq!(
+            slow.batch_route_at(
+                64,
+                8,
+                8,
+                4_000_000,
+                10_000_000,
+                50_000,
+                125,
+                105,
+                256,
+            )
+                .decision,
+            BatchRouteDecision::Probe,
+        );
     }
 
     fn cached_inquiry(
@@ -977,8 +1470,26 @@ impl IC3 {
             // and an UNSAT core is re-proved by exact GipSAT. New lemmas can
             // therefore invalidate speculation but cannot make it unsound.
             let needs_calibration = self.block_accel_policy.needs_calibration();
-            let block_cost_eligible = po.frame > 0
-                && (needs_calibration || self.block_accel_policy.should_offload());
+            let direct_cost_eligible =
+                needs_calibration || self.block_accel_policy.should_offload();
+            let batch_economics =
+                crate::accel::cdcl_host::block_batch_economics_enabled();
+            let batch_plan_eligible = batch_economics
+                && (needs_calibration
+                    || (self.block_accel_policy.batch_route_profitable != Some(false)
+                        || self
+                            .block_accel_policy
+                            .batch_probe_ready(BlockAccelPolicy::batch_probe_interval()))
+                        && self.block_accel_policy.batch_has_minimum_cpu_work_at(
+                            BlockBatchCache::window(),
+                            crate::accel::cdcl_host::active_min_batch_size(),
+                            BlockAccelPolicy::min_samples(),
+                            crate::accel::cdcl_host::block_min_batch_cpu_ns(),
+                            BlockAccelPolicy::batch_cpu_cap_ns(),
+                            BlockAccelPolicy::batch_probe_min_cpu_ns(),
+                        ));
+            let block_cost_eligible =
+                po.frame > 0 && (direct_cost_eligible || batch_plan_eligible);
             if po.frame > 0
                 && !block_cost_eligible
                 && crate::accel::cdcl_host::block_batch_enabled()
@@ -1037,6 +1548,7 @@ impl IC3 {
                     })
                     .collect();
                 let mut decisions = vec![ActivePreflight::Fpga; queries.len()];
+                let mut direct_route_profitable = self.block_accel_policy.should_offload();
                 if crate::accel::cdcl_host::active_enabled()
                     && needs_calibration
                     && queries.len() >= crate::accel::cdcl_host::active_min_batch_size()
@@ -1049,18 +1561,30 @@ impl IC3 {
                         sample_solver.classify_incremental_exact(&queries[sample_index]);
                     let sample_ns = sample_start.ns();
                     self.block_accel_policy.note_cpu(sample_ns);
-                    let profitable = self.block_accel_policy.note_calibration(sample_ns);
+                    direct_route_profitable =
+                        self.block_accel_policy.note_calibration(sample_ns);
                     decisions[sample_index] = match sample_result {
                         IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
                             ActivePreflight::Conclusive(sample_result)
                         }
                         IncrementalResult::Unknown(_) => ActivePreflight::CpuFallback,
                     };
-                    if !profitable {
-                        for (index, decision) in decisions.iter_mut().enumerate() {
-                            if index != sample_index {
-                                *decision = ActivePreflight::CpuFallback;
-                            }
+                }
+                let batch_meets_cpu_floor = batch_economics
+                    && self.block_accel_policy.batch_has_minimum_cpu_work_at(
+                        queries.len(),
+                        crate::accel::cdcl_host::active_min_batch_size(),
+                        BlockAccelPolicy::min_samples(),
+                        crate::accel::cdcl_host::block_min_batch_cpu_ns(),
+                        BlockAccelPolicy::batch_cpu_cap_ns(),
+                        BlockAccelPolicy::batch_probe_min_cpu_ns(),
+                    );
+                if (batch_economics && !batch_meets_cpu_floor)
+                    || (!batch_economics && !direct_route_profitable)
+                {
+                    for decision in &mut decisions {
+                        if matches!(decision, ActivePreflight::Fpga) {
+                            *decision = ActivePreflight::CpuFallback;
                         }
                     }
                 }
@@ -1086,7 +1610,7 @@ impl IC3 {
                     .zip(queries.iter())
                     .map(|((frame, _), query)| (&self.solvers[*frame - 1].dcs, query.clone()))
                     .collect();
-                if crate::accel::cdcl_host::active_enabled() {
+                if crate::accel::cdcl_host::active_enabled() && !batch_economics {
                     let sample_requests: Vec<_> = requests
                         .iter()
                         .map(|(solver, query)| (*solver, query))
@@ -1095,6 +1619,36 @@ impl IC3 {
                         &sample_requests,
                         &mut decisions,
                     );
+                }
+
+                if batch_economics {
+                    let selected = decisions
+                        .iter()
+                        .filter(|decision| matches!(decision, ActivePreflight::Fpga))
+                        .count();
+                    let route_selected = if selected
+                        >= crate::accel::cdcl_host::active_min_batch_size()
+                    {
+                        let evaluation = self.block_accel_policy.batch_route(selected);
+                        let selected = evaluation.decision != BatchRouteDecision::Reject;
+                        crate::accel::cdcl_host::note_active_block_batch_economics(
+                            evaluation.projected_cpu_ns,
+                            evaluation.projected_hardware_ns,
+                            evaluation.decision == BatchRouteDecision::Probe,
+                            selected,
+                        );
+                        selected
+                    } else {
+                        false
+                    };
+                    if !route_selected {
+                        for decision in &mut decisions {
+                            if matches!(decision, ActivePreflight::Fpga) {
+                                *decision = ActivePreflight::CpuFallback;
+                            }
+                        }
+                        crate::accel::cdcl_host::note_active_block_cost_rejected();
+                    }
                 }
 
                 let mut results = vec![
@@ -1194,8 +1748,28 @@ impl IC3 {
                         launched_at,
                     });
                 } else {
+                    let service_before =
+                        crate::accel::cdcl_host::active_batch_service_snapshot();
                     let hardware_results =
                         crate::accel::cdcl_host::solve_active_batch(hardware_requests);
+                    let hardware_conclusive = hardware_results
+                        .iter()
+                        .filter(|result| {
+                            matches!(
+                                result,
+                                IncrementalResult::Sat { .. }
+                                    | IncrementalResult::Unsat { .. }
+                            )
+                        })
+                        .count() as u64;
+                    let service_after =
+                        crate::accel::cdcl_host::active_batch_service_snapshot();
+                    self.block_accel_policy.note_hardware_batch(
+                        service_after.1.saturating_sub(service_before.1),
+                        service_after.0.saturating_sub(service_before.0),
+                        service_after.2.saturating_sub(service_before.2),
+                        hardware_conclusive,
+                    );
                     for (index, result) in
                         hardware_indices.iter().copied().zip(hardware_results)
                     {
