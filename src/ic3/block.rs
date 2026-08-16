@@ -15,6 +15,7 @@ use crate::{
     gipsat::{IncrementalQuery, IncrementalResult},
 };
 
+#[derive(Clone)]
 struct CachedBlockInquiry {
     frame: usize,
     state: LitOrdVec,
@@ -23,9 +24,61 @@ struct CachedBlockInquiry {
     trusted_cpu: bool,
 }
 
+struct PendingBlockBatch {
+    inquiries: Vec<CachedBlockInquiry>,
+    hardware_indices: Vec<usize>,
+    handle: Option<std::thread::JoinHandle<Vec<IncrementalResult>>>,
+    launched_at: Instant,
+}
+
+impl PendingBlockBatch {
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    fn finish(&mut self) -> Vec<CachedBlockInquiry> {
+        let wait_start = Instant::now();
+        let n_hardware = self.hardware_indices.len();
+        let results = self
+            .handle
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_else(|| {
+                vec![
+                    IncrementalResult::Unknown(
+                        crate::accel::cdcl::UnknownReason::BackendError,
+                    );
+                    n_hardware
+                ]
+            });
+        crate::accel::cdcl_host::note_active_block_async_harvest(
+            self.launched_at
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+            wait_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+        for (index, result) in self.hardware_indices.iter().copied().zip(results) {
+            self.inquiries[index].result = result;
+        }
+        std::mem::take(&mut self.inquiries)
+    }
+}
+
+impl Drop for PendingBlockBatch {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            let _ = self.finish();
+        }
+    }
+}
+
 #[derive(Default)]
 struct BlockBatchCache {
     inquiries: Vec<CachedBlockInquiry>,
+    pending: Vec<PendingBlockBatch>,
 }
 
 #[derive(Default)]
@@ -207,6 +260,84 @@ impl BlockBatchCache {
         })
     }
 
+    fn async_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC")
+                .ok()
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .unwrap_or(false)
+        })
+    }
+
+    fn async_depth() -> usize {
+        use std::sync::OnceLock;
+        static DEPTH: OnceLock<usize> = OnceLock::new();
+        *DEPTH.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC_DEPTH")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1)
+                .clamp(1, 8)
+        })
+    }
+
+    fn can_launch(&self) -> bool {
+        !Self::async_enabled() || self.pending.len() < Self::async_depth()
+    }
+
+    fn contains(&self, frame: usize, state: &LitOrdVec) -> bool {
+        self.inquiries
+            .iter()
+            .any(|entry| entry.frame == frame && &entry.state == state)
+            || self.pending.iter().any(|pending| {
+                pending
+                    .inquiries
+                    .iter()
+                    .any(|entry| entry.frame == frame && &entry.state == state)
+            })
+    }
+
+    fn insert(&mut self, inquiries: Vec<CachedBlockInquiry>) {
+        for inquiry in inquiries {
+            if Self::async_enabled()
+                && matches!(inquiry.result, IncrementalResult::Unknown(_))
+            {
+                continue;
+            }
+            if let Some(index) = self.inquiries.iter().position(|entry| {
+                entry.frame == inquiry.frame && entry.state == inquiry.state
+            }) {
+                self.inquiries.swap_remove(index);
+            }
+            self.inquiries.push(inquiry);
+        }
+        const MAX_CACHED_INQUIRIES: usize = 256;
+        if self.inquiries.len() > MAX_CACHED_INQUIRIES {
+            let overflow = self.inquiries.len() - MAX_CACHED_INQUIRIES;
+            self.inquiries.drain(..overflow);
+        }
+    }
+
+    fn harvest_ready(&mut self) {
+        let mut index = 0;
+        while index < self.pending.len() {
+            if !self.pending[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let mut pending = self.pending.swap_remove(index);
+            let inquiries = pending.finish();
+            self.insert(inquiries);
+        }
+    }
+
+    fn start(&mut self, pending: PendingBlockBatch) {
+        debug_assert!(self.pending.len() < Self::async_depth());
+        self.pending.push(pending);
+    }
+
     fn take(&mut self, po: &ProofObligation) -> Option<CachedBlockInquiry> {
         let index = self
             .inquiries
@@ -365,6 +496,7 @@ impl IC3 {
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
         while let Some(mut po) = self.obligations.pop(self.level()) {
+            block_batch.harvest_ready();
             // Remove a previously speculated answer even when this obligation
             // is discarded by one of the cheap guards below. Otherwise stale
             // entries would prevent the cache from naturally draining.
@@ -444,19 +576,26 @@ impl IC3 {
                 crate::accel::cdcl_host::note_active_block_cost_rejected();
             }
             if cached_block.is_none()
+                && block_batch.can_launch()
                 && po.frame > 0
                 && crate::accel::cdcl_host::block_batch_enabled()
                 && block_cost_eligible
                 && self.solvers[po.frame - 1].dcs.num_var()
                     >= BlockBatchCache::min_context_vars()
             {
-                // A newly generated higher-priority obligation can overtake
-                // every entry in the previous snapshot. Those answers are
-                // now increasingly likely to be stale and, more importantly,
-                // must not prevent the current frontier from forming a new
-                // batch. Dropping an unconsumed candidate is always safe.
-                block_batch.inquiries.clear();
-                let mut candidates = vec![(po.frame, po.state.clone())];
+                if !BlockBatchCache::async_enabled() {
+                    // The synchronous policy intentionally refreshes the
+                    // frontier after every blocking step. Asynchronous mode
+                    // retains completed answers while their obligations wait
+                    // in the priority queue.
+                    block_batch.inquiries.clear();
+                }
+                let mut candidates = Vec::new();
+                if !BlockBatchCache::async_enabled()
+                    || !block_batch.contains(po.frame, &po.state)
+                {
+                    candidates.push((po.frame, po.state.clone()));
+                }
                 for candidate in self.obligations.iter().rev() {
                     if candidates.len() >= BlockBatchCache::window() {
                         break;
@@ -464,6 +603,8 @@ impl IC3 {
                     if candidate.frame == 0
                         || candidate.frame > self.level()
                         || candidate.removed
+                        || BlockBatchCache::async_enabled()
+                            && block_batch.contains(candidate.frame, &candidate.state)
                         || candidates
                             .iter()
                             .any(|(_, state)| state == &candidate.state)
@@ -497,6 +638,7 @@ impl IC3 {
                         .elapsed()
                         .as_nanos()
                         .min(u64::MAX as u128) as u64;
+                    self.block_accel_policy.note_cpu(sample_ns);
                     let profitable = self.block_accel_policy.note_calibration(sample_ns);
                     decisions[sample_index] = match sample_result {
                         IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
@@ -545,19 +687,11 @@ impl IC3 {
                         ActivePreflight::CpuFallback => {}
                     }
                 }
-                for (index, result) in
-                    hardware_indices
-                        .into_iter()
-                        .zip(crate::accel::cdcl_host::solve_active_batch(
-                            hardware_requests,
-                        ))
-                {
-                    results[index] = result;
-                }
-                block_batch.inquiries = candidates
-                    .into_iter()
-                    .zip(requests.into_iter().map(|(_, query)| query))
-                    .zip(results.into_iter().zip(trusted_cpu))
+                let mut inquiries: Vec<_> = candidates
+                    .iter()
+                    .cloned()
+                    .zip(requests.iter().map(|(_, query)| query.clone()))
+                    .zip(results.into_iter().zip(trusted_cpu.iter().copied()))
                     .map(
                         |(((frame, state), query), (result, trusted_cpu))| CachedBlockInquiry {
                             frame,
@@ -568,12 +702,70 @@ impl IC3 {
                         },
                     )
                     .collect();
-                cached_block = block_batch.take(&po);
+                let asynchronous = BlockBatchCache::async_enabled()
+                    && crate::accel::cdcl_host::active_enabled()
+                    && hardware_indices.len()
+                        >= crate::accel::cdcl_host::active_min_batch_size();
+                if asynchronous {
+                    let prepare_start = Instant::now();
+                    let mut solver_frames = Vec::new();
+                    let mut owned_solvers = Vec::new();
+                    let mut owned_requests = Vec::with_capacity(hardware_indices.len());
+                    for index in &hardware_indices {
+                        let frame = candidates[*index].0;
+                        let solver_index = match solver_frames
+                            .iter()
+                            .position(|candidate| *candidate == frame)
+                        {
+                            Some(solver_index) => solver_index,
+                            None => {
+                                solver_frames.push(frame);
+                                owned_solvers.push((*requests[*index].0).clone());
+                                owned_solvers.len() - 1
+                            }
+                        };
+                        owned_requests.push((solver_index, requests[*index].1.clone()));
+                    }
+                    let prepare_ns = prepare_start
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64;
+                    crate::accel::cdcl_host::note_active_block_async_launch(prepare_ns);
+                    let launched_at = Instant::now();
+                    let handle = std::thread::spawn(move || {
+                        let hardware_requests = owned_requests
+                            .into_iter()
+                            .map(|(solver_index, query)| (&owned_solvers[solver_index], query))
+                            .collect();
+                        crate::accel::cdcl_host::solve_active_batch(hardware_requests)
+                    });
+                    if trusted_cpu.first() == Some(&true) {
+                        cached_block = inquiries.first().cloned();
+                    }
+                    block_batch.start(PendingBlockBatch {
+                        inquiries,
+                        hardware_indices,
+                        handle: Some(handle),
+                        launched_at,
+                    });
+                } else {
+                    let hardware_results =
+                        crate::accel::cdcl_host::solve_active_batch(hardware_requests);
+                    for (index, result) in
+                        hardware_indices.iter().copied().zip(hardware_results)
+                    {
+                        inquiries[index].result = result;
+                    }
+                    block_batch.insert(inquiries);
+                    cached_block = block_batch.take(&po);
+                }
             }
 
             let mut speculative_pred = None;
-            let speculative =
-                cached_block.and_then(|entry| match (entry.trusted_cpu, entry.result) {
+            let mut speculative_trusted_cpu = false;
+            let speculative = cached_block.and_then(|entry| {
+                speculative_trusted_cpu = entry.trusted_cpu;
+                match (entry.trusted_cpu, entry.result) {
                     (true, IncrementalResult::Sat { model }) => {
                         let validation_start = Instant::now();
                         let accepted = self.solvers[po.frame - 1]
@@ -642,10 +834,13 @@ impl IC3 {
                         crate::accel::cdcl_host::note_active_cpu_fallback();
                         None
                     }
-                });
+                }
+            });
             let blocked = match speculative {
                 Some(blocked) => {
-                    self.block_accel_policy.note_hardware();
+                    if !speculative_trusted_cpu {
+                        self.block_accel_policy.note_hardware();
+                    }
                     blocked
                 }
                 None => {

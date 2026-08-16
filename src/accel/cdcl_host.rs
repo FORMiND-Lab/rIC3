@@ -691,6 +691,11 @@ static ACTIVE_BLOCK_CPU_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_CALIBRATIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_CALIBRATION_PROFITABLE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_CALIBRATION_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_LAUNCHED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_HARVESTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_JOIN_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -2464,6 +2469,17 @@ pub fn note_active_block_calibration(profitable: bool, elapsed_ns: u64) {
     ACTIVE_BLOCK_CALIBRATION_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
 }
 
+pub fn note_active_block_async_launch(prepare_ns: u64) {
+    ACTIVE_BLOCK_ASYNC_LAUNCHED.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_BLOCK_ASYNC_PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
+}
+
+pub fn note_active_block_async_harvest(wall_ns: u64, join_ns: u64) {
+    ACTIVE_BLOCK_ASYNC_HARVESTED.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_BLOCK_ASYNC_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
+    ACTIVE_BLOCK_ASYNC_JOIN_NS.fetch_add(join_ns, Ordering::Relaxed);
+}
+
 pub fn note_active_preflight_result(
     unsat: bool,
     accepted: bool,
@@ -2631,7 +2647,7 @@ pub fn flush_and_report() {
             flush_comparison_writer();
         }
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations profitable/total {}/{}, calibration {:.3} ms, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations profitable/total {}/{}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load {:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -2673,6 +2689,11 @@ pub fn flush_and_report() {
             ACTIVE_BLOCK_CALIBRATION_PROFITABLE.load(Ordering::Relaxed),
             ACTIVE_BLOCK_CALIBRATIONS.load(Ordering::Relaxed),
             ACTIVE_BLOCK_CALIBRATION_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_BLOCK_ASYNC_HARVESTED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ASYNC_LAUNCHED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ASYNC_PREPARE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_BLOCK_ASYNC_WALL_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_BLOCK_ASYNC_JOIN_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_INIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_STATE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_CONTEXT_LOAD_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
