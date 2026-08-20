@@ -151,6 +151,10 @@ struct HardwareWork {
 pub struct MicChainResult {
     pub cube: LitVec,
     pub trials: u32,
+    /// Physical two-lane engine rounds reconstructed from the ordered input
+    /// and returned cube. This is smaller than `trials` exactly when a lane-0
+    /// SAT made lane 1's adjacent speculative inquiry consumable.
+    pub physical_rounds: u32,
     pub complete: bool,
     pub client_ns: u64,
     pub context_reused: bool,
@@ -159,6 +163,42 @@ pub struct MicChainResult {
     pub conflicts: u64,
     pub propagations: u64,
     pub learnt_clauses: u64,
+}
+
+fn mic_chain_physical_rounds(input: &[(Lit, Lit)], output: &LitVec, trials: u32) -> Option<u32> {
+    let trials = usize::try_from(trials).ok()?;
+    if trials > input.len() {
+        return None;
+    }
+    // The device preserves input order. Mark retained literals with a single
+    // subsequence walk so duplicate or reordered output is rejected here as
+    // well as by the transport decoder.
+    let mut retained = vec![false; input.len()];
+    let mut next_input = 0usize;
+    for literal in output {
+        let relative = input[next_input..]
+            .iter()
+            .position(|(current, _)| current == literal)?;
+        next_input += relative;
+        retained[next_input] = true;
+        next_input += 1;
+    }
+
+    let mut semantic = 0usize;
+    let mut rounds = 0u32;
+    while semantic < trials {
+        rounds = rounds.checked_add(1)?;
+        // A retained literal means lane 0 answered SAT, so the adjacent lane
+        // was the exact next inquiry and both semantic trials shared a round.
+        // A dropped literal means UNSAT; lane 1 ran speculatively but its
+        // stale answer was discarded and does not advance the traversal.
+        semantic += if retained[semantic] && semantic + 1 < trials {
+            2
+        } else {
+            1
+        };
+    }
+    Some(rounds)
 }
 
 fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<HardwareWork>> {
@@ -672,9 +712,12 @@ impl HardwareCdcl {
                 next_input += relative + 1;
                 decoded.push(Lit::new(Var::from(word >> 1), word & 1 == 0));
             }
+            let physical_rounds = mic_chain_physical_rounds(cube, &decoded, header.trials)
+                .ok_or(HardwareError::InvalidResponse)?;
             Ok(MicChainResult {
                 cube: decoded,
                 trials: header.trials,
+                physical_rounds,
                 complete: header.complete == 1,
                 client_ns: 0,
                 context_reused: false,
@@ -1117,6 +1160,7 @@ static ACTIVE_MIC_CHAIN_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_INPUT_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_OUTPUT_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_TRIALS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_PHYSICAL_ROUNDS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_COMPLETE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_PARTIAL: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -2932,6 +2976,10 @@ pub fn solve_active_mic_chain(
             ACTIVE_MIC_CHAIN_INPUT_LITS.fetch_add(cube.len() as u64, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_OUTPUT_LITS.fetch_add(result.cube.len() as u64, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_TRIALS.fetch_add(u64::from(result.trials), Ordering::Relaxed);
+            ACTIVE_MIC_CHAIN_PHYSICAL_ROUNDS.fetch_add(
+                u64::from(result.physical_rounds),
+                Ordering::Relaxed,
+            );
             if result.complete {
                 ACTIVE_MIC_CHAIN_COMPLETE.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -4109,12 +4157,13 @@ pub fn flush_and_report() {
             },
         );
         eprintln!(
-            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials {}, input/output lits {}/{}, device/client service {:.3}/{:.3} ms, context reused {}, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, adoption accepted/rejected {}/{}, CPU verify {:.3} ms, CPU MIC loops/trials replaced {}/{}",
+            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials/physical rounds {}/{}, input/output lits {}/{}, device/client service {:.3}/{:.3} ms, context reused {}, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, adoption accepted/rejected {}/{}, CPU verify {:.3} ms, CPU MIC loops/trials replaced {}/{}",
             ACTIVE_MIC_CHAIN_COMMANDS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_COMPLETE.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_PARTIAL.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_ERRORS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_TRIALS.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_PHYSICAL_ROUNDS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_INPUT_LITS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_OUTPUT_LITS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_SERVICE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
@@ -4285,6 +4334,28 @@ mod tests {
             4,
             7,
         ));
+    }
+
+    #[test]
+    fn mic_physical_rounds_count_only_consumable_second_lane_answers() {
+        let vars: Vec<_> = (0..4).map(Var::from).collect();
+        let current: Vec<_> = vars.iter().map(|var| Lit::new(*var, true)).collect();
+        let input: Vec<_> = current.iter().copied().map(|lit| (lit, !lit)).collect();
+
+        assert_eq!(
+            mic_chain_physical_rounds(&input, &LitVec::from_iter(current.iter().copied()), 4),
+            Some(2),
+        );
+        // The first UNSAT drop invalidates lane 1. The next two retained
+        // literals share a round, and the last one needs its own round.
+        assert_eq!(
+            mic_chain_physical_rounds(
+                &input,
+                &LitVec::from_iter(current.iter().copied().skip(1)),
+                4,
+            ),
+            Some(3),
+        );
     }
 
     #[test]
