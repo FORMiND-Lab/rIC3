@@ -1836,7 +1836,7 @@ impl IC3 {
                     ) => {
                         let restore_start = Instant::now();
                         let accepted = self.solvers[po.frame - 1]
-                            .install_incremental_cpu_unsat_core(
+                            .install_incremental_proven_unsat_core(
                                 &po.state,
                                 &entry.query,
                                 &core,
@@ -1851,38 +1851,96 @@ impl IC3 {
                     }
                     (false, IncrementalResult::Sat { model }) => {
                         let validation_start = Instant::now();
-                        let accepted = self.solvers[po.frame - 1]
-                            .validate_incremental_sat_model(&entry.query, &model);
+                        // Only a synchronous answer consumed in the same block
+                        // epoch is eligible for direct trust. Background and
+                        // retained answers can be perfectly correct for an old
+                        // frame snapshot, yet stale after CPU strengthening.
+                        let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check()
+                            && entry.cache_age == 0
+                            && !BlockBatchCache::async_enabled();
+                        if crate::accel::cdcl_host::active_skip_cpu_check() && !direct_trust {
+                            crate::accel::cdcl_host::note_active_trusted_sat_stale();
+                        }
+                        let accepted = if direct_trust {
+                            self.solvers[po.frame - 1]
+                                .trusted_incremental_sat_model_shape(&entry.query, &model)
+                        } else {
+                            self.solvers[po.frame - 1]
+                                .validate_incremental_sat_model(&entry.query, &model)
+                        };
                         speculative_pred = accepted
                             .then(|| self.pred_from_incremental_model(&entry.query, &model))
                             .flatten();
                         let accepted = speculative_pred.is_some();
-                        crate::accel::cdcl_host::note_active_sat_model(
-                            accepted,
-                            validation_start.elapsed().as_nanos() as u64,
-                        );
+                        if direct_trust {
+                            crate::accel::cdcl_host::note_active_trusted_sat(
+                                accepted,
+                                validation_start.elapsed().as_nanos() as u64,
+                            );
+                        } else {
+                            crate::accel::cdcl_host::note_active_sat_model(
+                                accepted,
+                                validation_start.elapsed().as_nanos() as u64,
+                            );
+                        }
                         crate::accel::cdcl_host::note_active_block_result_consumed(
                             accepted,
                             entry.cache_age,
                         );
                         accepted.then_some(false)
                     }
-                    (false, IncrementalResult::Unsat { core, .. }) => {
+                    (
+                        false,
+                        IncrementalResult::Unsat {
+                            core,
+                            used_constraints,
+                        },
+                    ) => {
                         let validation_start = Instant::now();
-                        let cpu_core_len = self.solvers[po.frame - 1]
-                            .validate_incremental_unsat_core(&po.state, &entry.query, &core);
-                        crate::accel::cdcl_host::note_active_unsat_core(
-                            cpu_core_len.is_some(),
-                            entry.query.assumptions.len(),
-                            core.len(),
-                            cpu_core_len.unwrap_or(0),
-                            validation_start.elapsed().as_nanos() as u64,
-                        );
+                        // UNSAT survives every later frame strengthening, so a
+                        // qualified core may be restored even when a background
+                        // or retained result is older than the current frame.
+                        let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check();
+                        let (accepted, cpu_core_len) = if direct_trust {
+                            (
+                                self.solvers[po.frame - 1].install_incremental_proven_unsat_core(
+                                    &po.state,
+                                    &entry.query,
+                                    &core,
+                                    used_constraints,
+                                ),
+                                0,
+                            )
+                        } else {
+                            let cpu_core_len = self.solvers[po.frame - 1]
+                                .validate_incremental_unsat_core(
+                                    &po.state,
+                                    &entry.query,
+                                    &core,
+                                );
+                            (cpu_core_len.is_some(), cpu_core_len.unwrap_or(0))
+                        };
+                        if direct_trust {
+                            crate::accel::cdcl_host::note_active_trusted_unsat(
+                                accepted,
+                                entry.query.assumptions.len(),
+                                core.len(),
+                                validation_start.elapsed().as_nanos() as u64,
+                            );
+                        } else {
+                            crate::accel::cdcl_host::note_active_unsat_core(
+                                accepted,
+                                entry.query.assumptions.len(),
+                                core.len(),
+                                cpu_core_len,
+                                validation_start.elapsed().as_nanos() as u64,
+                            );
+                        }
                         crate::accel::cdcl_host::note_active_block_result_consumed(
-                            cpu_core_len.is_some(),
+                            accepted,
                             entry.cache_age,
                         );
-                        cpu_core_len.map(|_| true)
+                        accepted.then_some(true)
                     }
                     (_, IncrementalResult::Unknown(_)) => {
                         crate::accel::cdcl_host::note_active_cpu_fallback();

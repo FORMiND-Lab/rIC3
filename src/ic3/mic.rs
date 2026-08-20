@@ -470,12 +470,25 @@ impl IC3 {
                 // `TsLift::lift_model`.  This avoids the watcher/model-state
                 // mismatch exposed by the first importer prototype.
                 let validation_start = Instant::now();
-                let accepted = self.solvers[frame - 1]
-                    .validate_incremental_sat_model(&prefetched.query, model);
-                crate::accel::cdcl_host::note_active_sat_model(
-                    accepted,
-                    validation_start.elapsed().as_nanos() as u64,
-                );
+                let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check();
+                let accepted = if direct_trust {
+                    self.solvers[frame - 1]
+                        .trusted_incremental_sat_model_shape(&prefetched.query, model)
+                } else {
+                    self.solvers[frame - 1]
+                        .validate_incremental_sat_model(&prefetched.query, model)
+                };
+                if direct_trust {
+                    crate::accel::cdcl_host::note_active_trusted_sat(
+                        accepted,
+                        validation_start.elapsed().as_nanos() as u64,
+                    );
+                } else {
+                    crate::accel::cdcl_host::note_active_sat_model(
+                        accepted,
+                        validation_start.elapsed().as_nanos() as u64,
+                    );
+                }
                 if accepted {
                     Some(MicDropAnswer::Sat {
                         query: &prefetched.query,
@@ -487,25 +500,48 @@ impl IC3 {
                     None
                 }
             }
-            IncrementalResult::Unsat { core, .. } => {
+            IncrementalResult::Unsat {
+                core,
+                used_constraints,
+            } => {
                 let validation_start = Instant::now();
-                let cpu_core_len = self.solvers[frame - 1].validate_incremental_unsat_core(
-                    cube,
-                    &prefetched.query,
-                    core,
-                );
-                crate::accel::cdcl_host::note_active_unsat_core(
-                    cpu_core_len.is_some(),
-                    prefetched.query.assumptions.len(),
-                    core.len(),
-                    cpu_core_len.unwrap_or(0),
-                    validation_start.elapsed().as_nanos() as u64,
-                );
+                let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check();
+                let (accepted, cpu_core_len) = if direct_trust {
+                    (
+                        self.solvers[frame - 1].install_incremental_proven_unsat_core(
+                            cube,
+                            &prefetched.query,
+                            core,
+                            *used_constraints,
+                        ),
+                        0,
+                    )
+                } else {
+                    let cpu_core_len = self.solvers[frame - 1]
+                        .validate_incremental_unsat_core(cube, &prefetched.query, core);
+                    (cpu_core_len.is_some(), cpu_core_len.unwrap_or(0))
+                };
+                if direct_trust {
+                    crate::accel::cdcl_host::note_active_trusted_unsat(
+                        accepted,
+                        prefetched.query.assumptions.len(),
+                        core.len(),
+                        validation_start.elapsed().as_nanos() as u64,
+                    );
+                } else {
+                    crate::accel::cdcl_host::note_active_unsat_core(
+                        accepted,
+                        prefetched.query.assumptions.len(),
+                        core.len(),
+                        cpu_core_len,
+                        validation_start.elapsed().as_nanos() as u64,
+                    );
+                }
                 crate::accel::cdcl_host::note_active_mic_consumed(
                     true,
-                    cpu_core_len.is_some(),
+                    accepted,
                 );
-                cpu_core_len.map(|_| MicDropAnswer::Blocked)
+                accepted.then_some(MicDropAnswer::Blocked)
             }
             IncrementalResult::Unknown(_) => {
                 crate::accel::cdcl_host::note_active_cpu_fallback();

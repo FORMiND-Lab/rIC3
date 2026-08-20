@@ -19,20 +19,60 @@ impl IC3 {
         lemma: &LitOrdVec,
         query: &IncrementalQuery,
         result: &IncrementalResult,
+        snapshot_is_live: bool,
     ) -> Option<bool> {
         if crate::accel::cdcl_host::active_skip_cpu_check() {
-            return match result {
-                IncrementalResult::Sat { .. } => {
-                    Some(false)
+            match result {
+                IncrementalResult::Sat { model } if snapshot_is_live => {
+                    // Trusting the FPGA removes semantic clause replay, but
+                    // downstream CTP/get_pred still consumes GipSAT's model
+                    // state. Reconstruct that state from the complete device
+                    // assignment instead of leaving a stale CPU trail live.
+                    let install_start = Instant::now();
+                    let accepted = self.solvers[frame_idx]
+                        .install_trusted_incremental_sat_model(query, model);
+                    crate::accel::cdcl_host::note_active_trusted_sat(
+                        accepted,
+                        install_start.elapsed().as_nanos() as u64,
+                    );
+                    return accepted.then_some(false);
                 }
-                IncrementalResult::Unsat { .. } => {
-                    Some(true)
+                IncrementalResult::Unsat {
+                    core,
+                    used_constraints,
+                } => {
+                    // A trusted UNSAT answer still has to publish its core to
+                    // the ordinary `inductive_core` consumer. This operation
+                    // checks only transport shape/subset membership and does
+                    // not solve the inquiry again on CPU.
+                    let install_start = Instant::now();
+                    let accepted = self.solvers[frame_idx]
+                        .install_incremental_proven_unsat_core(
+                            lemma.as_litvec(),
+                            query,
+                            core,
+                            *used_constraints,
+                        );
+                    crate::accel::cdcl_host::note_active_trusted_unsat(
+                        accepted,
+                        query.assumptions.len(),
+                        core.len(),
+                        install_start.elapsed().as_nanos() as u64,
+                    );
+                    return accepted.then_some(true);
                 }
                 IncrementalResult::Unknown(_) => {
                     crate::accel::cdcl_host::note_active_cpu_fallback();
-                    None
+                    return None;
                 }
-            };
+                // SAT is not monotonic under frame strengthening: a model that
+                // was valid for the submitted snapshot may violate a new live
+                // lemma. Fall through to the exact clause validator. UNSAT is
+                // monotonic and can always use direct core restoration above.
+                IncrementalResult::Sat { .. } => {
+                    crate::accel::cdcl_host::note_active_trusted_sat_stale();
+                }
+            }
         }
         let answer = match result {
             IncrementalResult::Sat { model } => {
@@ -160,15 +200,15 @@ impl IC3 {
         if push_prefetch_enabled {
             self.push_prefetch.begin_pass();
         }
-        // Prepare the whole propagation pass before mutating any frame. SAT
-        // models are safe to speculate this far ahead because every model is
-        // checked again against the live solver immediately before use; a
-        // lemma learned by an earlier frame can only reject a stale model and
-        // trigger CPU fallback.
+        // Prepare the whole propagation pass before mutating any frame. The
+        // monotonic solver revision below distinguishes a still-live snapshot
+        // from one strengthened by an earlier result in this pass. Conservative
+        // mode validates both; qualified direct trust is allowed only for the
+        // unchanged revision.
         let propagation_batch_enabled =
             crate::accel::cdcl_host::propagation_batch_enabled();
         let prepare_accel_queries = propagation_batch_enabled || push_prefetch_enabled;
-        let mut work: Vec<(usize, Frame, Vec<IncrementalQuery>)> = Vec::new();
+        let mut work: Vec<(usize, Frame, Vec<IncrementalQuery>, u64)> = Vec::new();
         for frame_idx in from..level {
             let mut frame = self.frame[frame_idx].clone();
             frame.sort_by_key(|x| x.len());
@@ -183,18 +223,21 @@ impl IC3 {
             } else {
                 Vec::new()
             };
-            work.push((frame_idx, frame, active_queries));
+            let context_revision = self.solvers[frame_idx]
+                .dcs
+                .incremental_context_revision();
+            work.push((frame_idx, frame, active_queries, context_revision));
         }
         let n_queries = work
             .iter()
-            .map(|(_, _, queries)| queries.len())
+            .map(|(_, _, queries, _)| queries.len())
             .sum::<usize>();
         let mut preflight = vec![ActivePreflight::Fpga; n_queries];
         if propagation_batch_enabled
             && crate::accel::cdcl_host::active_preflight_should_run(n_queries)
         {
             let mut query_index = 0usize;
-            for (frame_idx, _, queries) in &work {
+            for (frame_idx, _, queries, _) in &work {
                 for query in queries {
                     preflight[query_index] =
                         crate::accel::cdcl_host::active_preflight_classify(
@@ -205,7 +248,7 @@ impl IC3 {
                 }
             }
             let mut sample_requests = Vec::with_capacity(n_queries);
-            for (frame_idx, _, queries) in &work {
+            for (frame_idx, _, queries, _) in &work {
                 let solver = &self.solvers[*frame_idx].dcs;
                 for query in queries {
                     sample_requests.push((solver, query));
@@ -220,7 +263,7 @@ impl IC3 {
             let mut requests = Vec::new();
             let mut request_indices = Vec::new();
             let mut query_index = 0usize;
-            for (frame_idx, _, queries) in &work {
+            for (frame_idx, _, queries, _) in &work {
                 let solver = &self.solvers[*frame_idx].dcs;
                 for query in queries {
                     if matches!(&preflight[query_index], ActivePreflight::Fpga) {
@@ -247,7 +290,7 @@ impl IC3 {
         };
 
         let mut result_offset = 0usize;
-        for (frame_idx, frame, active_queries) in work {
+        for (frame_idx, frame, active_queries, context_revision) in work {
             let frame_result_offset = result_offset;
             result_offset += active_queries.len();
             let _op =
@@ -272,6 +315,7 @@ impl IC3 {
                                 &lemma,
                                 &active_queries[lemma_index],
                                 &result.result,
+                                false,
                             );
                             self.push_prefetch
                                 .note_validation(result.batch_id, answer.is_some());
@@ -304,7 +348,7 @@ impl IC3 {
                                 })) => {
                                     let restore_start = Instant::now();
                                     let accepted = self.solvers[frame_idx]
-                                        .install_incremental_cpu_unsat_core(
+                                        .install_incremental_proven_unsat_core(
                                             lemma.as_litvec(),
                                             &active_queries[lemma_index],
                                             core,
@@ -323,6 +367,10 @@ impl IC3 {
                                         &lemma,
                                         &active_queries[lemma_index],
                                         result,
+                                        self.solvers[frame_idx]
+                                            .dcs
+                                            .incremental_context_revision()
+                                            == context_revision,
                                     )
                                 }),
                             }

@@ -89,6 +89,9 @@ pub struct DagCnfSolver {
     /// longer retain its original record, so the accelerator boundary keeps
     /// this semantic log instead of reconstructing clauses from the trail.
     resident_lemmas: Vec<LitVec>,
+    /// Monotonic formula generation used to distinguish a qualified device
+    /// result from a result that was correct for an older IC3 frame snapshot.
+    resident_revision: u64,
 
     statistic: SolverStatistic,
     solve_time_ns: u64,
@@ -167,6 +170,7 @@ impl DagCnfSolver {
             constraint: Default::default(),
             resident_trans,
             resident_lemmas: Default::default(),
+            resident_revision: 0,
             statistic: Default::default(),
             solve_time_ns: 0,
             solve_time_samples: 0,
@@ -611,6 +615,10 @@ impl DagCnfSolver {
         (self.cdb.num_lemma(), self.cdb.lemma_lits())
     }
 
+    pub fn incremental_context_revision(&self) -> u64 {
+        self.resident_revision
+    }
+
     pub fn solve_with_restart_limit(
         &mut self,
         assumps: &[Lit],
@@ -793,6 +801,7 @@ impl Satif for DagCnfSolver {
     fn add_clause(&mut self, clause: &[Lit]) {
         self.reset();
         self.resident_lemmas.push(LitVec::from(clause));
+        self.resident_revision = self.resident_revision.saturating_add(1);
         for l in clause.iter() {
             self.add_domain(l.var(), true);
         }

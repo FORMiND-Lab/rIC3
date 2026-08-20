@@ -99,12 +99,30 @@ impl TransysSolver {
         self.dcs.install_incremental_sat_model(query, model)
     }
 
+    pub fn install_trusted_incremental_sat_model(
+        &mut self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        self.dcs
+            .install_trusted_incremental_sat_model(query, model)
+    }
+
     pub fn validate_incremental_sat_model(
         &self,
         query: &IncrementalQuery,
         model: &[Lit],
     ) -> bool {
         self.dcs.validate_incremental_sat_model(query, model)
+    }
+
+    pub fn trusted_incremental_sat_model_shape(
+        &self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        self.dcs
+            .trusted_incremental_sat_model_shape(query, model)
     }
 
     /// Validate a hardware assumption core with an exact reduced GipSAT
@@ -121,17 +139,17 @@ impl TransysSolver {
             .validate_incremental_unsat_core(query, hardware_core)
     }
 
-    /// Restore an exact CPU-preflight core for the ordinary IC3
-    /// `inductive_core` consumer. Unlike a hardware core, this result already
-    /// came from GipSAT and therefore does not require another proof solve.
-    pub fn install_incremental_cpu_unsat_core(
+    /// Restore an already-qualified core for the ordinary IC3 `inductive_core`
+    /// consumer. Exact CPU preflight and explicit trusted-accelerator mode use
+    /// this path; neither needs another proof solve.
+    pub fn install_incremental_proven_unsat_core(
         &mut self,
         cube: &[Lit],
         query: &IncrementalQuery,
         core: &[Lit],
         used_constraints: bool,
     ) -> bool {
-        if !self.dcs.install_incremental_cpu_unsat_core(
+        if !self.dcs.install_incremental_proven_unsat_core(
             query,
             core,
             used_constraints,

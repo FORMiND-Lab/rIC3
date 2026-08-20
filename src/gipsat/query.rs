@@ -285,12 +285,12 @@ impl DagCnfSolver {
         result
     }
 
-    /// Restore the failed-assumption core of an exact CPU preflight without
-    /// repeating the solve. The result was proved against this solver before
-    /// the propagation pass began; IC3 may only have strengthened the frame
-    /// since then, so the UNSAT implication remains valid. This entry point is
-    /// deliberately separate from the untrusted hardware-core validator.
-    pub fn install_incremental_cpu_unsat_core(
+    /// Restore the failed-assumption core of an already-qualified result
+    /// without repeating the solve. This covers exact CPU preflight and the
+    /// explicit trusted-accelerator policy. IC3 may only have strengthened the
+    /// frame since classification, so the UNSAT implication remains valid.
+    /// This entry point is separate from the untrusted hardware-core validator.
+    pub fn install_incremental_proven_unsat_core(
         &mut self,
         query: &IncrementalQuery,
         core: &[Lit],
@@ -321,15 +321,11 @@ impl DagCnfSolver {
         true
     }
 
-    /// Check a hardware SAT model against the exact, current CPU formula.
-    ///
-    /// This is intentionally stricter than checking the sparse values GipSAT
-    /// normally exposes: an accelerator answer may bypass CPU search only if
-    /// it assigns every non-activation variable exactly once and satisfies the
-    /// transition CNF, every current permanent lemma, the assumptions, and all
-    /// query-local constraints. A stale model from a batch prepared before IC3
-    /// added another lemma therefore fails closed.
-    fn validated_incremental_assignment(
+    /// Decode the fixed-width accelerator model without proving its clauses on
+    /// the CPU.  Even a trusted device must still satisfy transport invariants:
+    /// the result belongs to this frame and contains one value for every
+    /// variable, with no duplicate or out-of-range entries.
+    fn complete_incremental_assignment(
         &self,
         query: &IncrementalQuery,
         model: &[Lit],
@@ -347,7 +343,23 @@ impl DagCnfSolver {
             }
             *slot = Some(lit.polarity());
         }
-        let assignment: Vec<bool> = assignment.into_iter().collect::<Option<_>>()?;
+        assignment.into_iter().collect::<Option<_>>()
+    }
+
+    /// Check a hardware SAT model against the exact, current CPU formula.
+    ///
+    /// This is intentionally stricter than checking the sparse values GipSAT
+    /// normally exposes: an untrusted accelerator answer may bypass CPU search
+    /// only if it assigns every variable exactly once and satisfies the
+    /// transition CNF, every current permanent lemma, the assumptions, and all
+    /// query-local constraints. A stale model from a batch prepared before IC3
+    /// added another lemma therefore fails closed.
+    fn validated_incremental_assignment(
+        &self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> Option<Vec<bool>> {
+        let assignment = self.complete_incremental_assignment(query, model)?;
         let lit_true = |lit: Lit| {
             let var: usize = lit.var().into();
             assignment
@@ -369,27 +381,11 @@ impl DagCnfSolver {
         Some(assignment)
     }
 
-    pub fn validate_incremental_sat_model(
-        &self,
-        query: &IncrementalQuery,
-        model: &[Lit],
-    ) -> bool {
-        self.validated_incremental_assignment(query, model).is_some()
-    }
-
-    /// Validate and import a complete FPGA SAT model into GipSAT's live trail.
-    /// Downstream IC3 code can then use `sat_value` and `flip_to_none` exactly
-    /// as after an ordinary CPU SAT search. Any malformed, stale, or internally
-    /// inconsistent model is rejected and the next ordinary solve resets the
-    /// temporary setup before falling back to CPU.
-    pub fn install_incremental_sat_model(
+    fn install_incremental_assignment(
         &mut self,
         query: &IncrementalQuery,
-        model: &[Lit],
+        assignment: Vec<bool>,
     ) -> bool {
-        let Some(assignment) = self.validated_incremental_assignment(query, model) else {
-            return false;
-        };
         if self.trivial_unsat || self.propagate() != CREF_NONE {
             return false;
         }
@@ -442,14 +438,64 @@ impl DagCnfSolver {
                 _ => self.assign(lit, CREF_NONE),
             }
         }
-        // The model was checked clause-by-clause above. Feeding a complete
-        // assignment into GipSAT's propagation queue is both redundant and
-        // violates its normal invariant that each decision is propagated
-        // before the next one is enqueued. Keep watchers untouched and mark
-        // the imported trail consumed; downstream model lifting only reads
-        // values and selectively calls `flip_to_none`.
+        // The ordinary path checked the model clause-by-clause; the trusted
+        // path relies on the already-qualified device. In both cases feeding a
+        // complete assignment into GipSAT's propagation queue is redundant and
+        // violates its normal one-decision-at-a-time invariant. Downstream
+        // predecessor lifting only reads values and selectively calls
+        // `flip_to_none`.
         self.propagated = self.trail.len() as u32;
         true
+    }
+
+    pub fn validate_incremental_sat_model(
+        &self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        self.validated_incremental_assignment(query, model).is_some()
+    }
+
+    /// Verify only the fixed-width transport contract for a model returned by
+    /// a qualified accelerator. No resident/query clause is evaluated here.
+    pub fn trusted_incremental_sat_model_shape(
+        &self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        self.complete_incremental_assignment(query, model).is_some()
+    }
+
+    /// Validate and import a complete FPGA SAT model into GipSAT's live trail.
+    /// Downstream IC3 code can then use `sat_value` and `flip_to_none` exactly
+    /// as after an ordinary CPU SAT search. Any malformed, stale, or internally
+    /// inconsistent model is rejected and the next ordinary solve resets the
+    /// temporary setup before falling back to CPU.
+    pub fn install_incremental_sat_model(
+        &mut self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        let Some(assignment) = self.validated_incremental_assignment(query, model) else {
+            return false;
+        };
+        self.install_incremental_assignment(query, assignment)
+    }
+
+    /// Install a SAT assignment returned by an already-qualified FPGA without
+    /// re-evaluating every resident and temporary clause on the CPU. This is
+    /// not a solver fallback: only frame/model transport shape is checked, then
+    /// GipSAT's live model state is reconstructed for existing IC3 consumers.
+    /// Use only behind the explicit accelerator trust policy.
+    pub fn install_trusted_incremental_sat_model(
+        &mut self,
+        query: &IncrementalQuery,
+        model: &[Lit],
+    ) -> bool {
+        let Some(assignment) = self.complete_incremental_assignment(query, model) else {
+            return false;
+        };
+        self.install_incremental_assignment(query, assignment)
     }
 
     /// Re-prove an FPGA failed-assumption core against the exact live CPU
@@ -690,13 +736,13 @@ mod tests {
         // Simulate an earlier push strengthening this frame between the
         // speculative preflight and ordered IC3 consumption.
         solver.add_clause(&[b]);
-        assert!(solver.install_incremental_cpu_unsat_core(
+        assert!(solver.install_incremental_proven_unsat_core(
             &unsat,
             &core,
             used_constraints,
         ));
         assert!(core.iter().all(|lit| solver.unsat_has(*lit)));
-        assert!(!solver.install_incremental_cpu_unsat_core(
+        assert!(!solver.install_incremental_proven_unsat_core(
             &unsat,
             &[!a],
             used_constraints,
@@ -831,5 +877,53 @@ mod tests {
 
         solver.add_clause(&[!b]);
         assert!(!solver.install_incremental_sat_model(&query, &model));
+    }
+
+    #[test]
+    fn qualified_hardware_model_can_be_imported_without_clause_replay() {
+        // The trusted entry point is intentionally distinct from the ordinary
+        // validator. Use a complete but semantically false assignment to prove
+        // this test exercises only transport shape and live-state restoration.
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let mut solver = DagCnfSolver::new(&dc);
+        solver.add_clause(&[!a, b]);
+        let mut query = IncrementalQuery::new(0, LitVec::from([!a]));
+        query.domain = (0..solver.num_var()).map(Var::from).collect();
+        let IncrementalResult::Sat { mut model } = solver.classify_incremental_exact(&query) else {
+            panic!("expected a source model");
+        };
+        let a_slot = model
+            .iter_mut()
+            .find(|lit| lit.var() == a.var())
+            .expect("complete source model");
+        *a_slot = a;
+
+        assert!(!solver.validate_incremental_sat_model(&query, &model));
+        assert!(solver.install_trusted_incremental_sat_model(&query, &model));
+        assert_eq!(solver.sat_value(a), Some(true));
+
+        let incomplete = LitVec::from([a, b]);
+        assert!(!solver.install_trusted_incremental_sat_model(&query, &incomplete));
+        let wrong_frame = IncrementalQuery::new(1, LitVec::new());
+        assert!(!solver.install_trusted_incremental_sat_model(&wrong_frame, &model));
+    }
+
+    #[test]
+    fn incremental_context_revision_tracks_permanent_strengthening() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let mut solver = DagCnfSolver::new(&dc);
+        assert_eq!(solver.incremental_context_revision(), 0);
+        solver.add_clause(&[a, b]);
+        assert_eq!(solver.incremental_context_revision(), 1);
+
+        let mut clone = solver.clone();
+        assert_eq!(clone.incremental_context_revision(), 1);
+        clone.add_clause(&[!a, b]);
+        assert_eq!(clone.incremental_context_revision(), 2);
+        assert_eq!(solver.incremental_context_revision(), 1);
     }
 }

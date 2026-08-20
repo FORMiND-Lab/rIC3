@@ -956,6 +956,7 @@ static SHADOW_STATE: std::sync::OnceLock<std::sync::Mutex<ShadowState>> =
     std::sync::OnceLock::new();
 static ACTIVE_STATE: std::sync::OnceLock<std::sync::Mutex<ActiveState>> =
     std::sync::OnceLock::new();
+static ACTIVE_HARDWARE_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static SHADOW_OFFERED: AtomicU64 = AtomicU64::new(0);
 static SHADOW_BATCHES: AtomicU64 = AtomicU64::new(0);
 static SHADOW_CONTEXT_LOADS: AtomicU64 = AtomicU64::new(0);
@@ -984,8 +985,14 @@ static ACTIVE_HW_SAT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_UNSAT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_ERROR: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRANSPORT_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_UNAVAILABLE_CALLS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UNAVAILABLE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRUSTED_SAT_INSTALLED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRUSTED_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRUSTED_SAT_STALE_REVALIDATED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_LIFT_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_LIFT_SUCCEEDED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_FULL_LITS: AtomicU64 = AtomicU64::new(0);
@@ -993,6 +1000,8 @@ static ACTIVE_SAT_LIFTED_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_LIFT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_CORE_USED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_CORE_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRUSTED_UNSAT_INSTALLED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRUSTED_UNSAT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_ASSUMPTION_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_HW_CORE_LITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_CPU_CORE_LITS: AtomicU64 = AtomicU64::new(0);
@@ -2437,10 +2446,10 @@ pub fn shadow_enabled() -> bool {
         && std::env::var_os("INDUCTOR_ACCEL").is_none()
 }
 
-/// Enable the proof-safe active path. Only complete SAT models that pass an
-/// exact CPU formula check may bypass GipSAT search; all other results fall
-/// back. Active and shadow modes are separate so one process never opens the
-/// singleton XRT bridge twice.
+/// Enable the proof-safe active path. The default validates device answers on
+/// GipSAT; qualified throughput mode may instead restore structurally complete
+/// SAT models and UNSAT cores directly. Active and shadow modes are separate so
+/// one process never opens the singleton XRT bridge twice.
 pub fn active_enabled() -> bool {
     std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some()
         && std::env::var_os("INDUCTOR_CDCL_PAIRED").is_none()
@@ -2464,17 +2473,20 @@ pub fn propagation_batch_enabled() -> bool {
     (active_enabled() || paired_enabled())
         && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
         && !push_prefetch_enabled()
+        && active_hardware_available()
 }
 
 /// Run lemma-push inquiries in the background after one pass and consume only
-/// live-validated answers in a later pass. Active mode defaults to the measured
-/// context-local short-query policy; an explicit false value restores the
-/// synchronous propagation scheduler for A/B.
+/// answers in a later pass. A prefetched SAT result is always revalidated after
+/// frame mutation; an old UNSAT result stays valid under monotonic strengthening.
+/// Active mode defaults to the measured context-local short-query policy; an
+/// explicit false value restores the synchronous propagation scheduler for A/B.
 pub fn push_prefetch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     active_enabled()
         && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
         && !crate::accel::cdcl_host::throughput_enabled()
+        && active_hardware_available()
         && *ENABLED.get_or_init(|| {
             std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH")
                 .ok()
@@ -2494,12 +2506,13 @@ pub fn active_skip_cpu_check() -> bool {
 
 /// Speculate over the first inductiveness check for several literal-drop
 /// candidates from the same MIC cube. This is deliberately opt-in while the
-/// proof-path effect is measured: all answers still cross the live GipSAT
-/// model/core validation boundary before they can affect generalization.
+/// proof-path effect is measured. The conservative mode validates on live
+/// GipSAT; qualified throughput mode may restore result state directly.
 pub fn mic_batch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         active_enabled()
+            && active_hardware_available()
             && std::env::var("INDUCTOR_CDCL_MIC_BATCH")
                 .ok()
                 .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
@@ -2513,6 +2526,7 @@ pub fn mic_chain_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         active_enabled()
+            && active_hardware_available()
             && std::env::var("INDUCTOR_CDCL_MIC_CHAIN")
                 .ok()
                 .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
@@ -2604,10 +2618,13 @@ pub fn mic_batch_window() -> usize {
 }
 
 /// Whether IC3 should speculate over the currently queued proof obligations.
-/// Every consumed answer is checked again against the live frame.
+/// Conservative mode checks every answer against the live frame. Qualified
+/// synchronous results may be restored directly; asynchronous SAT remains
+/// subject to live-frame validation.
 pub fn block_batch_enabled() -> bool {
     (active_enabled() || paired_enabled())
         && std::env::var_os("INDUCTOR_CDCL_BLOCK_BATCH").is_some()
+        && active_hardware_available()
 }
 
 fn shadow_state() -> &'static std::sync::Mutex<ShadowState> {
@@ -2636,6 +2653,26 @@ fn active_state() -> &'static std::sync::Mutex<ActiveState> {
             loaded_context: None,
         })
     })
+}
+
+/// Probe the process-lifetime transport once and fail over before manufacturing
+/// contexts or batches when the configured card/server could not be opened.
+/// `ACTIVE_STATE` is a `OnceLock`, so a missing device never triggers another
+/// XRT initialization attempt in the same rIC3 process.
+fn active_hardware_available() -> bool {
+    let available = *ACTIVE_HARDWARE_AVAILABLE.get_or_init(|| {
+        let wait_start = std::time::Instant::now();
+        let state = active_state().lock();
+        ACTIVE_STATE_WAIT_NS.fetch_add(
+            wait_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        state.is_ok_and(|state| state.hardware.is_some())
+    });
+    if !available {
+        ACTIVE_TRANSPORT_UNAVAILABLE.store(true, Ordering::Relaxed);
+    }
+    available
 }
 
 fn flush_batch_locked(state: &mut ShadowState, batch_index: usize) {
@@ -2738,6 +2775,11 @@ pub fn solve_active_mic_chain(
         || cube.len() < mic_chain_min_cube()
         || cube.len() > mic_chain_max_cube()
     {
+        return None;
+    }
+    if !active_hardware_available() {
+        ACTIVE_UNAVAILABLE_CALLS.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_UNAVAILABLE_QUERIES.fetch_add(cube.len() as u64, Ordering::Relaxed);
         return None;
     }
     let mut cache = BatchedSolverContext::new(solver);
@@ -2869,6 +2911,11 @@ pub fn solve_active_batch_with_min(
     let unknown = IncrementalResult::Unknown(super::cdcl::UnknownReason::BackendError);
     let mut output = vec![unknown.clone(); requests.len()];
     if requests.is_empty() || !(active_enabled() || paired_enabled()) {
+        return output;
+    }
+    if !active_hardware_available() {
+        ACTIVE_UNAVAILABLE_CALLS.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_UNAVAILABLE_QUERIES.fetch_add(requests.len() as u64, Ordering::Relaxed);
         return output;
     }
     let paired = paired_enabled();
@@ -3225,6 +3272,19 @@ pub fn note_active_sat_model(accepted: bool, validation_ns: u64) {
     }
 }
 
+pub fn note_active_trusted_sat(accepted: bool, install_ns: u64) {
+    if accepted {
+        ACTIVE_TRUSTED_SAT_INSTALLED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_TRUSTED_SAT_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+    note_active_sat_model(accepted, install_ns);
+}
+
+pub fn note_active_trusted_sat_stale() {
+    ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn note_active_sat_lift(
     attempted: bool,
     succeeded: bool,
@@ -3257,6 +3317,25 @@ pub fn note_active_unsat_core(
         ACTIVE_UNSAT_CORE_USED.fetch_add(1, Ordering::Relaxed);
         ACTIVE_UNSAT_CPU_CORE_LITS.fetch_add(cpu_core_lits as u64, Ordering::Relaxed);
     } else {
+        ACTIVE_UNSAT_CORE_REJECTED.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_active_trusted_unsat(
+    accepted: bool,
+    assumption_lits: usize,
+    hardware_core_lits: usize,
+    install_ns: u64,
+) {
+    ACTIVE_UNSAT_VALIDATE_NS.fetch_add(install_ns, Ordering::Relaxed);
+    ACTIVE_UNSAT_ASSUMPTION_LITS.fetch_add(assumption_lits as u64, Ordering::Relaxed);
+    ACTIVE_UNSAT_HW_CORE_LITS.fetch_add(hardware_core_lits as u64, Ordering::Relaxed);
+    if accepted {
+        ACTIVE_TRUSTED_UNSAT_INSTALLED.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_UNSAT_CORE_USED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_TRUSTED_UNSAT_REJECTED.fetch_add(1, Ordering::Relaxed);
         ACTIVE_UNSAT_CORE_REJECTED.fetch_add(1, Ordering::Relaxed);
         ACTIVE_CPU_FALLBACK.fetch_add(1, Ordering::Relaxed);
     }
@@ -3752,8 +3831,9 @@ pub fn flush_and_report() {
         let block_unconsumed =
             block_conclusive.saturating_sub(block_used.saturating_add(block_rejected));
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, context loads {}, appends {}/{} clauses (fallbacks {}), combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, validated SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, validated UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load/append {:.3}/{:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-validate {:.3} ms, UNSAT-validate {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, transport unavailable {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, unavailable calls/queries {}/{}, context loads {}, appends {}/{} clauses (fallbacks {}), combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load/append {:.3}/{:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-state {:.3} ms, UNSAT-state {:.3} ms",
             if pair_scheduler_enabled() { "on" } else { "off" },
+            ACTIVE_TRANSPORT_UNAVAILABLE.load(Ordering::Relaxed),
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
             ACTIVE_OFFERED_PASSES.load(Ordering::Relaxed),
@@ -3762,6 +3842,8 @@ pub fn flush_and_report() {
             ACTIVE_SKIPPED_SMALL_BATCH.load(Ordering::Relaxed),
             ACTIVE_OFFERED.load(Ordering::Relaxed),
             ACTIVE_BATCHES.load(Ordering::Relaxed),
+            ACTIVE_UNAVAILABLE_CALLS.load(Ordering::Relaxed),
+            ACTIVE_UNAVAILABLE_QUERIES.load(Ordering::Relaxed),
             ACTIVE_CONTEXT_LOADS.load(Ordering::Relaxed),
             ACTIVE_CONTEXT_APPENDS.load(Ordering::Relaxed),
             ACTIVE_CONTEXT_APPEND_CLAUSES.load(Ordering::Relaxed),
@@ -3841,6 +3923,16 @@ pub fn flush_and_report() {
             hw_used.saturating_sub(block_used),
             hw_rejected.saturating_sub(block_rejected),
         );
+        if active_skip_cpu_check() {
+            eprintln!(
+                "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, stale SAT revalidated {}, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
+                ACTIVE_TRUSTED_SAT_INSTALLED.load(Ordering::Relaxed),
+                ACTIVE_TRUSTED_SAT_REJECTED.load(Ordering::Relaxed),
+                ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.load(Ordering::Relaxed),
+                ACTIVE_TRUSTED_UNSAT_INSTALLED.load(Ordering::Relaxed),
+                ACTIVE_TRUSTED_UNSAT_REJECTED.load(Ordering::Relaxed),
+            );
+        }
         eprintln!(
             "inductor-cdcl: active push prefetch launched/harvested/busy {}/{}/{}, queries/ready/hits {}/{}/{}, used/rejected/evicted {}/{}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms",
             ACTIVE_PUSH_PREFETCH_LAUNCHED.load(Ordering::Relaxed),
