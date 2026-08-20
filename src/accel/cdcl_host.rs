@@ -2472,8 +2472,30 @@ pub fn paired_enabled() -> bool {
 pub fn propagation_batch_enabled() -> bool {
     (active_enabled() || paired_enabled())
         && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
+        && propagation_batch_requested()
         && !push_prefetch_enabled()
         && active_hardware_available()
+}
+
+fn propagation_batch_requested() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_PROPAGATION_BATCH")
+            .ok()
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or_else(|| {
+                let mic_chain_requested = std::env::var("INDUCTOR_CDCL_MIC_CHAIN")
+                    .ok()
+                    .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
+                // Board measurements show that combining aggressive
+                // propagation takeover with MIC-chain floods large designs
+                // with stale SAT models and lane-tail service. Throughput mode
+                // therefore defaults to the dependent short-chain path when
+                // it is explicitly requested. A/B runs can opt propagation
+                // back in with INDUCTOR_CDCL_PROPAGATION_BATCH=1.
+                !(throughput_enabled() && mic_chain_requested)
+            })
+    })
 }
 
 /// Run lemma-push inquiries in the background after one pass and consume only
@@ -2534,15 +2556,12 @@ pub fn mic_chain_enabled() -> bool {
 }
 
 pub fn mic_chain_min_cube() -> usize {
-    let fpga_throughput = std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
-        .ok()
-        .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         std::env::var("INDUCTOR_CDCL_MIC_CHAIN_MIN_CUBE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(if fpga_throughput { 1 } else { 2 })
+            .unwrap_or(2)
             .clamp(1, 4096)
     })
 }
@@ -2550,10 +2569,13 @@ pub fn mic_chain_min_cube() -> usize {
 pub fn mic_chain_max_cube() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
+        let fpga_throughput = std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
         std::env::var("INDUCTOR_CDCL_MIC_CHAIN_MAX_CUBE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4096)
+            .unwrap_or(if fpga_throughput { 4 } else { 4096 })
             .clamp(1, 4096)
     })
 }
@@ -2770,10 +2792,13 @@ pub fn solve_active_mic_chain(
     solver: &DagCnfSolver,
     cube: &[(Lit, Lit)],
     constraints: &[LitVec],
+    protected_suffix: usize,
 ) -> Option<MicChainResult> {
     if !mic_chain_enabled()
         || cube.len() < mic_chain_min_cube()
         || cube.len() > mic_chain_max_cube()
+        || protected_suffix == 0
+        || protected_suffix >= cube.len()
     {
         return None;
     }
@@ -2843,6 +2868,17 @@ pub fn solve_active_mic_chain(
         state.loaded_context = Some(LoadedContext::from(&context));
     }
 
+    // Literals in the protected suffix are part of every device inquiry but
+    // are never themselves drop candidates. `max_trials` counts completed
+    // candidates even as UNSAT drops compact the cube, so placing the suffix
+    // last makes this work without another command-5 ABI revision.
+    let eligible_trials = (cube.len() - protected_suffix) as u32;
+    let configured_trials = mic_chain_max_trials();
+    let max_trials = if configured_trials == 0 {
+        eligible_trials
+    } else {
+        configured_trials.min(eligible_trials)
+    };
     let started = std::time::Instant::now();
     let result = state
         .hardware
@@ -2854,13 +2890,25 @@ pub fn solve_active_mic_chain(
                 cube,
                 constraints,
                 mic_chain_conflict_budget(),
-                mic_chain_max_trials(),
+                max_trials,
             )
         });
     let service_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     ACTIVE_MIC_CHAIN_SERVICE_NS.fetch_add(service_ns, Ordering::Relaxed);
     match result {
-        Ok(result) => {
+        Ok(mut result) => {
+            // The kernel reports a max-trials stop as partial. When the limit
+            // exactly equals every eligible prefix literal, the protected
+            // suffix is deliberately not a candidate and the host traversal
+            // is nevertheless complete. An explicit smaller user cap remains
+            // partial and falls through to the CPU loop.
+            result.complete = mic_chain_effectively_complete(
+                result.complete,
+                result.reason,
+                result.trials,
+                max_trials,
+                eligible_trials,
+            );
             ACTIVE_MIC_CHAIN_COMMANDS.fetch_add(1, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_INPUT_LITS.fetch_add(cube.len() as u64, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_OUTPUT_LITS.fetch_add(result.cube.len() as u64, Ordering::Relaxed);
@@ -2885,6 +2933,19 @@ pub fn solve_active_mic_chain(
             None
         }
     }
+}
+
+fn mic_chain_effectively_complete(
+    device_complete: bool,
+    reason: UnknownReason,
+    trials: u32,
+    max_trials: u32,
+    eligible_trials: u32,
+) -> bool {
+    device_complete
+        || (reason == UnknownReason::None
+            && max_trials == eligible_trials
+            && trials == eligible_trials)
 }
 
 /// Solve a set of already-independent IC3 inquiries in as few XRT submissions
@@ -4002,7 +4063,7 @@ pub fn flush_and_report() {
             },
         );
         eprintln!(
-            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials {}, input/output lits {}/{}, device service {:.3} ms, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, CPU reproof accepted/rejected {}/{}, {:.3} ms, CPU MIC loops/trials replaced {}/{}",
+            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials {}, input/output lits {}/{}, device service {:.3} ms, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, adoption accepted/rejected {}/{}, CPU verify {:.3} ms, CPU MIC loops/trials replaced {}/{}",
             ACTIVE_MIC_CHAIN_COMMANDS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_COMPLETE.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_PARTIAL.load(Ordering::Relaxed),
@@ -4132,6 +4193,38 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn protected_mic_suffix_counts_as_complete_only_after_all_candidates() {
+        assert!(mic_chain_effectively_complete(
+            false,
+            UnknownReason::None,
+            7,
+            7,
+            7,
+        ));
+        assert!(!mic_chain_effectively_complete(
+            false,
+            UnknownReason::None,
+            4,
+            4,
+            7,
+        ));
+        assert!(!mic_chain_effectively_complete(
+            false,
+            UnknownReason::ConflictBudget,
+            7,
+            7,
+            7,
+        ));
+        assert!(mic_chain_effectively_complete(
+            true,
+            UnknownReason::None,
+            2,
+            4,
+            7,
+        ));
+    }
 
     #[test]
     fn cpu_sample_requires_cost_and_a_remaining_hardware_batch() {
