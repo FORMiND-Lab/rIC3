@@ -151,9 +151,8 @@ struct HardwareWork {
 pub struct MicChainResult {
     pub cube: LitVec,
     pub trials: u32,
-    /// Physical two-lane engine rounds reconstructed from the ordered input
-    /// and returned cube. This is smaller than `trials` exactly when a lane-0
-    /// SAT made lane 1's adjacent speculative inquiry consumable.
+    /// Physical engine rounds reported by command 5. This is smaller than
+    /// `trials` when adjacent speculative SAT answers were consumable.
     pub physical_rounds: u32,
     pub complete: bool,
     pub client_ns: u64,
@@ -163,42 +162,6 @@ pub struct MicChainResult {
     pub conflicts: u64,
     pub propagations: u64,
     pub learnt_clauses: u64,
-}
-
-fn mic_chain_physical_rounds(input: &[(Lit, Lit)], output: &LitVec, trials: u32) -> Option<u32> {
-    let trials = usize::try_from(trials).ok()?;
-    if trials > input.len() {
-        return None;
-    }
-    // The device preserves input order. Mark retained literals with a single
-    // subsequence walk so duplicate or reordered output is rejected here as
-    // well as by the transport decoder.
-    let mut retained = vec![false; input.len()];
-    let mut next_input = 0usize;
-    for literal in output {
-        let relative = input[next_input..]
-            .iter()
-            .position(|(current, _)| current == literal)?;
-        next_input += relative;
-        retained[next_input] = true;
-        next_input += 1;
-    }
-
-    let mut semantic = 0usize;
-    let mut rounds = 0u32;
-    while semantic < trials {
-        rounds = rounds.checked_add(1)?;
-        // A retained literal means lane 0 answered SAT, so the adjacent lane
-        // was the exact next inquiry and both semantic trials shared a round.
-        // A dropped literal means UNSAT; lane 1 ran speculatively but its
-        // stale answer was discarded and does not advance the traversal.
-        semantic += if retained[semantic] && semantic + 1 < trials {
-            2
-        } else {
-            1
-        };
-    }
-    Some(rounds)
 }
 
 fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<HardwareWork>> {
@@ -687,6 +650,9 @@ impl HardwareCdcl {
                 || n_output == 0
                 || n_output > cube.len()
                 || header.trials > header.n_input
+                || (header.trials == 0) != (header.physical_rounds == 0)
+                || header.physical_rounds > header.trials
+                || header.physical_rounds.saturating_mul(4) < header.trials
                 || header.complete > 1
                 || header.error != 0
                 || out_words != MIC_RESPONSE_HEADER_WORDS + n_output
@@ -712,12 +678,10 @@ impl HardwareCdcl {
                 next_input += relative + 1;
                 decoded.push(Lit::new(Var::from(word >> 1), word & 1 == 0));
             }
-            let physical_rounds = mic_chain_physical_rounds(cube, &decoded, header.trials)
-                .ok_or(HardwareError::InvalidResponse)?;
             Ok(MicChainResult {
                 cube: decoded,
                 trials: header.trials,
-                physical_rounds,
+                physical_rounds: header.physical_rounds,
                 complete: header.complete == 1,
                 client_ns: 0,
                 context_reused: false,
@@ -4334,28 +4298,6 @@ mod tests {
             4,
             7,
         ));
-    }
-
-    #[test]
-    fn mic_physical_rounds_count_only_consumable_second_lane_answers() {
-        let vars: Vec<_> = (0..4).map(Var::from).collect();
-        let current: Vec<_> = vars.iter().map(|var| Lit::new(*var, true)).collect();
-        let input: Vec<_> = current.iter().copied().map(|lit| (lit, !lit)).collect();
-
-        assert_eq!(
-            mic_chain_physical_rounds(&input, &LitVec::from_iter(current.iter().copied()), 4),
-            Some(2),
-        );
-        // The first UNSAT drop invalidates lane 1. The next two retained
-        // literals share a round, and the last one needs its own round.
-        assert_eq!(
-            mic_chain_physical_rounds(
-                &input,
-                &LitVec::from_iter(current.iter().copied().skip(1)),
-                4,
-            ),
-            Some(3),
-        );
     }
 
     #[test]

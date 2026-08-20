@@ -10,7 +10,7 @@
 //! be copied into the XRT host and HLS kernel without translating Rust layout.
 
 /// Increment when a header or payload changes incompatibly.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Return a sparse model over the variables assigned by the search.
 pub const WANT_MODEL: u32 = 1 << 0;
@@ -52,7 +52,7 @@ pub const PROFILE_OCCURRENCE_PAIRS: usize = 18;
 pub const QUERY_HEADER_WORDS: usize = 8;
 pub const RESPONSE_HEADER_WORDS: usize = 9;
 pub const MIC_HEADER_WORDS: usize = 9;
-pub const MIC_RESPONSE_HEADER_WORDS: usize = 11;
+pub const MIC_RESPONSE_HEADER_WORDS: usize = 12;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -346,6 +346,7 @@ pub struct MicResponseHeader {
     pub propagations: u32,
     pub learnt_clauses: u32,
     pub error: u32,
+    pub physical_rounds: u32,
 }
 
 impl MicResponseHeader {
@@ -363,6 +364,7 @@ impl MicResponseHeader {
             propagations: words[8],
             learnt_clauses: words[9],
             error: words[10],
+            physical_rounds: words[11],
         })
     }
 }
@@ -378,7 +380,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<BatchHeader>(), 4 * 4);
         assert_eq!(std::mem::size_of::<BatchResponseHeader>(), 4 * 4);
         assert_eq!(std::mem::size_of::<MicHeader>(), 9 * 4);
-        assert_eq!(std::mem::size_of::<MicResponseHeader>(), 11 * 4);
+        assert_eq!(std::mem::size_of::<MicResponseHeader>(), 12 * 4);
+
+        let mic_response = MicResponseHeader::from_words(&[
+            ABI_VERSION, 4, 4, 4, 1, 0, 7, 2, 19, 1, 0, 1,
+        ]).unwrap();
+        assert_eq!(mic_response.trials, 4);
+        assert_eq!(mic_response.physical_rounds, 1);
 
         let header = QueryHeader {
             version: ABI_VERSION,
