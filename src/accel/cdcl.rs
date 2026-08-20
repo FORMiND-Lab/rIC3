@@ -20,6 +20,15 @@ pub const WANT_CORE: u32 = 1 << 1;
 pub const KEEP_LEARNTS: u32 = 1 << 2;
 /// Ask a diagnostic image to append per-stage entry counters.
 pub const WANT_STAGE_PROFILE: u32 = 1 << 3;
+/// Let RUN_MIC_CHAIN use complete SAT models to continue GipSAT's `down`
+/// loop on the device instead of merely retaining the attempted literal.
+pub const MIC_MODEL_SHRINK: u32 = 1 << 4;
+/// The last MIC pair is an Init guard and participates in every inquiry but
+/// must never be removed by model-guided shrinking.
+pub const MIC_PROTECT_LAST: u32 = 1 << 5;
+/// Return a sparse SAT projection over the final temporary clause. This is an
+/// internal query flag used by model-guided RUN_MIC_CHAIN refinements.
+pub const WANT_LAST_CONSTRAINT_MODEL: u32 = 1 << 6;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
 pub const STAGE_PROFILE_VERSION: u32 = 3;

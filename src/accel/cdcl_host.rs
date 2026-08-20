@@ -11,7 +11,8 @@ use super::cdcl::{
     PROFILE_LEARN, PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_UPDATES,
     PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
     PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
-    PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES,
+    MIC_MODEL_SHRINK, MIC_PROTECT_LAST, PROFILE_SETUP,
+    PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES,
     PROFILE_UNIT_CANDIDATES, RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS,
     STAGE_PROFILE_MAGIC, STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION,
     STAGE_PROFILE_WORDS, Status, UnknownReason, WANT_STAGE_PROFILE,
@@ -388,7 +389,8 @@ fn pack_mic_chain_request(
     let header = MicHeader {
         version: ABI_VERSION,
         frame,
-        flags: 0,
+        flags: MIC_PROTECT_LAST
+            | if mic_chain_model_shrink() { MIC_MODEL_SHRINK } else { 0 },
         n_cube: cube.len() as u32,
         n_constraint_words: constraint_words as u32,
         n_domain: n_var,
@@ -651,7 +653,6 @@ impl HardwareCdcl {
                 || n_output > cube.len()
                 || header.trials > header.n_input
                 || (header.trials == 0) != (header.physical_rounds == 0)
-                || header.physical_rounds > header.trials
                 || header.physical_rounds.saturating_mul(4) < header.trials
                 || header.complete > 1
                 || header.error != 0
@@ -2614,6 +2615,15 @@ pub fn mic_chain_skip_cpu_check() -> bool {
                     .ok()
                     .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
             })
+    })
+}
+
+fn mic_chain_model_shrink() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_MODEL_SHRINK")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
     })
 }
 
