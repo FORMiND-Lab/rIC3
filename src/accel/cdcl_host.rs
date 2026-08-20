@@ -31,6 +31,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(has_cdcl_accel)]
 unsafe extern "C" {
     fn ind_cdcl_open(path: *const std::os::raw::c_char) -> i32;
+    fn ind_cdcl_open_with_device(
+        path: *const std::os::raw::c_char,
+        device_index: i32,
+    ) -> i32;
     fn ind_cdcl_connect(path: *const std::os::raw::c_char) -> i32;
     fn ind_cdcl_load_context(request: *const u32, request_words: u32) -> i32;
     fn ind_cdcl_add_frame_clauses(request: *const u32, request_words: u32) -> i32;
@@ -414,6 +418,19 @@ impl HardwareCdcl {
         cfg!(has_cdcl_accel)
     }
 
+    fn throughput_enabled() -> bool {
+        std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    }
+
+    fn selected_device() -> Option<i32> {
+        std::env::var("INDUCTOR_CDCL_DEVICE")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .and_then(|device| (device >= 0).then_some(device))
+    }
+
     /// Open the xclbin named explicitly by the caller.
     pub fn open(path: &str) -> Result<Self, HardwareError> {
         #[cfg(has_cdcl_accel)]
@@ -423,7 +440,11 @@ impl HardwareCdcl {
                 unsafe { ind_cdcl_connect(socket.as_ptr()) }
             } else {
                 let path = CString::new(path).map_err(|_| HardwareError::InvalidPath)?;
-                unsafe { ind_cdcl_open(path.as_ptr()) }
+                if let Some(device_index) = Self::selected_device() {
+                    unsafe { ind_cdcl_open_with_device(path.as_ptr(), device_index) }
+                } else {
+                    unsafe { ind_cdcl_open(path.as_ptr()) }
+                }
             };
             if rc != 0 {
                 return Err(HardwareError::Open(rc));
@@ -1222,6 +1243,10 @@ fn profile_every_batch() -> bool {
     *ENABLED.get_or_init(|| std::env::var("INDUCTOR_CDCL_PROFILE_EVERY_BATCH").is_ok())
 }
 
+fn throughput_enabled() -> bool {
+    HardwareCdcl::throughput_enabled()
+}
+
 fn profile_capacity_detail() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("INDUCTOR_CDCL_PROFILE_CAPACITY").is_ok())
@@ -1399,6 +1424,9 @@ fn active_batch_size() -> usize {
 }
 
 pub fn active_min_batch_size() -> usize {
+    let fpga_throughput = std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
+        .ok()
+        .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         std::env::var("INDUCTOR_CDCL_ACTIVE_MIN_BATCH")
@@ -1408,7 +1436,7 @@ pub fn active_min_batch_size() -> usize {
             // The measured batch-1 round trip is ~48 us while these GipSAT
             // push inquiries average only a few microseconds. Do not program
             // the card for a handful of queries by default.
-            .unwrap_or(32)
+            .unwrap_or(if fpga_throughput { 1 } else { 32 })
     })
 }
 
@@ -2446,11 +2474,22 @@ pub fn push_prefetch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     active_enabled()
         && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
+        && !crate::accel::cdcl_host::throughput_enabled()
         && *ENABLED.get_or_init(|| {
             std::env::var("INDUCTOR_CDCL_PUSH_PREFETCH")
                 .ok()
                 .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "off"))
         })
+}
+
+pub fn active_skip_cpu_check() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_SKIP_CPU_CHECK")
+            .ok()
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or_else(|| throughput_enabled())
+    })
 }
 
 /// Speculate over the first inductiveness check for several literal-drop
@@ -2481,13 +2520,41 @@ pub fn mic_chain_enabled() -> bool {
 }
 
 pub fn mic_chain_min_cube() -> usize {
+    let fpga_throughput = std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
+        .ok()
+        .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         std::env::var("INDUCTOR_CDCL_MIC_CHAIN_MIN_CUBE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4)
-            .clamp(2, 4096)
+            .unwrap_or(if fpga_throughput { 1 } else { 2 })
+            .clamp(1, 4096)
+    })
+}
+
+pub fn mic_chain_max_cube() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_CHAIN_MAX_CUBE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4096)
+            .clamp(1, 4096)
+    })
+}
+
+pub fn mic_chain_skip_cpu_check() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_CHAIN_SKIP_CPU_CHECK")
+            .ok()
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or_else(|| {
+                std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
+                    .ok()
+                    .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            })
     })
 }
 
@@ -2512,12 +2579,15 @@ fn mic_chain_max_trials() -> u32 {
 }
 
 pub fn mic_batch_min_size() -> usize {
+    let fpga_throughput = std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
+        .ok()
+        .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         std::env::var("INDUCTOR_CDCL_MIC_BATCH_MIN")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(8)
+            .unwrap_or(if fpga_throughput { 1 } else { 8 })
             .clamp(1, DEFAULT_SHADOW_BATCH_SIZE)
     })
 }
@@ -2664,7 +2734,10 @@ pub fn solve_active_mic_chain(
     cube: &[(Lit, Lit)],
     constraints: &[LitVec],
 ) -> Option<MicChainResult> {
-    if !mic_chain_enabled() || cube.len() < mic_chain_min_cube() {
+    if !mic_chain_enabled()
+        || cube.len() < mic_chain_min_cube()
+        || cube.len() > mic_chain_max_cube()
+    {
         return None;
     }
     let mut cache = BatchedSolverContext::new(solver);

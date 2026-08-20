@@ -983,10 +983,7 @@ impl IC3 {
             && crate::accel::cdcl_host::mic_chain_enabled()
             && cube.len() >= crate::accel::cdcl_host::mic_chain_min_cube()
         {
-            let pairs: Vec<_> = cube
-                .iter()
-                .map(|lit| (*lit, self.tsctx.next(*lit)))
-                .collect();
+            let pairs: Vec<_> = cube.iter().map(|lit| (*lit, self.tsctx.next(*lit))).collect();
             if let Some(chain) = crate::accel::cdcl_host::solve_active_mic_chain(
                 &self.solvers[frame - 1].dcs,
                 &pairs,
@@ -994,40 +991,21 @@ impl IC3 {
             ) {
                 mic_chain_answered = true;
                 // A complete chain may legitimately return the input cube:
-                // every attempted drop was SAT.  Prove that cube once as well
-                // so a successful complete command can replace, rather than
-                // precede, the CPU literal-by-literal traversal.
+                // every attempted drop was SAT. In stable mode we still
+                // re-check once in CPU so a successful complete command can
+                // replace, rather than precede, the CPU literal-by-literal
+                // traversal. After optional stabilisation, enabling
+                // INDUCTOR_CDCL_MIC_CHAIN_SKIP_CPU_CHECK lets this skip the
+                // exact replay.
                 if (chain.complete || chain.cube.len() < cube.len())
                     && !chain.cube.is_empty()
                     && !self.tsctx.cube_subsume_init(&chain.cube)
                 {
-                    let verify_start = Instant::now();
-                    let blocked = self
-                        .blocked(frame, &chain.cube)
-                        .in_phase(inductor_trace::Phase::Gen)
-                        .with_act_order(false)
-                        .with_strengthen()
-                        .with_constraint(constraint)
-                        .check();
-                    let verify_ns =
-                        verify_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     let mut adopted = false;
-                    if blocked {
-                        let exact = self.solvers[frame - 1]
-                            .inductive_core()
-                            .unwrap_or_else(|| chain.cube.clone());
-                        let exact = LitVec::from_iter(
-                            cube.iter().filter(|lit| exact.contains(lit)).copied(),
-                        );
-                        if !exact.is_empty() && !self.tsctx.cube_subsume_init(&exact) {
+                    if crate::accel::cdcl_host::mic_chain_skip_cpu_check() {
+                        if !chain.cube.is_empty() && !self.tsctx.cube_subsume_init(&chain.cube) {
                             adopted = true;
-                            cube = exact;
-                            // Once an exact solve proves the result of a
-                            // complete hardware traversal, repeating every
-                            // attempted drop on the CPU cannot improve
-                            // correctness.  Partial traversals still fall
-                            // through to the ordinary loop for the remaining
-                            // minimisation work.
+                            cube = chain.cube.clone();
                             mic_chain_finished = chain.complete;
                             if mic_chain_finished {
                                 crate::accel::cdcl_host::note_active_mic_chain_cpu_replaced(
@@ -1045,10 +1023,59 @@ impl IC3 {
                                 );
                             }
                         }
+                        crate::accel::cdcl_host::note_active_mic_chain_validation(adopted, 0);
+                    } else {
+                        let verify_start = Instant::now();
+                        let blocked = self
+                            .blocked(frame, &chain.cube)
+                            .in_phase(inductor_trace::Phase::Gen)
+                            .with_act_order(false)
+                            .with_strengthen()
+                            .with_constraint(constraint)
+                            .check();
+                        let verify_ns = verify_start
+                            .elapsed()
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64;
+                        if blocked {
+                            let exact = self.solvers[frame - 1]
+                                .inductive_core()
+                                .unwrap_or_else(|| chain.cube.clone());
+                            let exact = LitVec::from_iter(
+                                cube.iter().filter(|lit| exact.contains(lit)).copied(),
+                            );
+                            if !exact.is_empty() && !self.tsctx.cube_subsume_init(&exact) {
+                                adopted = true;
+                                cube = exact;
+                                // Once an exact solve proves the result of a
+                                // complete hardware traversal, repeating every
+                                // attempted drop on the CPU cannot improve
+                                // correctness.  Partial traversals still fall
+                                // through to the ordinary loop for the remaining
+                                // minimisation work.
+                                mic_chain_finished = chain.complete;
+                                if mic_chain_finished {
+                                    crate::accel::cdcl_host::note_active_mic_chain_cpu_replaced(
+                                        chain.trials,
+                                    );
+                                }
+                                if !mic_chain_finished {
+                                    self.solvers[frame - 1].unset_domain();
+                                    self.solvers[frame - 1].set_domain(
+                                        self.tsctx
+                                            .lits_next(&cube)
+                                            .iter()
+                                            .copied()
+                                            .chain(cube.iter().copied()),
+                                    );
+                                }
+                            }
+                        }
+                        crate::accel::cdcl_host::note_active_mic_chain_validation(
+                            adopted,
+                            verify_ns,
+                        );
                     }
-                    crate::accel::cdcl_host::note_active_mic_chain_validation(
-                        adopted, verify_ns,
-                    );
                 }
             }
         }

@@ -20,6 +20,20 @@ impl IC3 {
         query: &IncrementalQuery,
         result: &IncrementalResult,
     ) -> Option<bool> {
+        if crate::accel::cdcl_host::active_skip_cpu_check() {
+            return match result {
+                IncrementalResult::Sat { .. } => {
+                    Some(false)
+                }
+                IncrementalResult::Unsat { .. } => {
+                    Some(true)
+                }
+                IncrementalResult::Unknown(_) => {
+                    crate::accel::cdcl_host::note_active_cpu_fallback();
+                    None
+                }
+            };
+        }
         let answer = match result {
             IncrementalResult::Sat { model } => {
                 let validation_start = Instant::now();
