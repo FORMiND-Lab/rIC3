@@ -96,7 +96,12 @@ impl MicChainPolicy {
         *ENABLED.get_or_init(|| {
             std::env::var("INDUCTOR_CDCL_MIC_CHAIN_ECONOMICS")
                 .ok()
-                .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                .unwrap_or_else(|| {
+                    !std::env::var("INDUCTOR_CDCL_FPGA_THROUGHPUT")
+                        .ok()
+                        .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                })
         })
     }
 

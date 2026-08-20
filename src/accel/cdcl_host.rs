@@ -2634,7 +2634,7 @@ pub fn mic_chain_max_cube() -> usize {
         std::env::var("INDUCTOR_CDCL_MIC_CHAIN_MAX_CUBE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(if fpga_throughput { 8 } else { 4096 })
+            .unwrap_or(if fpga_throughput { 5 } else { 4096 })
             .clamp(1, 4096)
     })
 }
