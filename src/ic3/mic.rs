@@ -61,6 +61,168 @@ enum MicBatchRoute {
     Offload,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MicChainRoute {
+    Reject,
+    Probe,
+    Offload,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MicChainHardwareSample {
+    client_ns: u64,
+    replaceable: bool,
+}
+
+#[derive(Default)]
+struct MicChainBucket {
+    cpu_samples_ns: VecDeque<u64>,
+    hardware_samples: [VecDeque<MicChainHardwareSample>; 2],
+    cpu_since_probe: [usize; 2],
+}
+
+/// Learn crossover from complete IC3-visible cost. Warm exact-frame contexts
+/// and cold reloads keep independent histories; incomplete chains count as no
+/// whole-loop replacement.
+#[derive(Default)]
+pub(super) struct MicChainPolicy {
+    buckets: [MicChainBucket; 8],
+}
+
+impl MicChainPolicy {
+    fn economics_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_ECONOMICS")
+                .ok()
+                .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        })
+    }
+
+    fn cpu_window() -> usize {
+        use std::sync::OnceLock;
+        static WINDOW: OnceLock<usize> = OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_CPU_WINDOW").ok()
+                .and_then(|value| value.parse().ok()).unwrap_or(64).clamp(4, 4096)
+        })
+    }
+
+    fn min_cpu_samples() -> usize {
+        use std::sync::OnceLock;
+        static SAMPLES: OnceLock<usize> = OnceLock::new();
+        *SAMPLES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_CPU_SAMPLES").ok()
+                .and_then(|value| value.parse().ok()).unwrap_or(8)
+                .clamp(1, Self::cpu_window())
+        })
+    }
+
+    fn hardware_window() -> usize {
+        use std::sync::OnceLock;
+        static WINDOW: OnceLock<usize> = OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_HW_WINDOW").ok()
+                .and_then(|value| value.parse().ok()).unwrap_or(8).clamp(1, 64)
+        })
+    }
+
+    fn min_hardware_samples() -> usize {
+        use std::sync::OnceLock;
+        static SAMPLES: OnceLock<usize> = OnceLock::new();
+        *SAMPLES.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_HW_SAMPLES").ok()
+                .and_then(|value| value.parse().ok()).unwrap_or(4)
+                .clamp(1, Self::hardware_window())
+        })
+    }
+
+    fn speedup_percent() -> u64 {
+        use std::sync::OnceLock;
+        static PERCENT: OnceLock<u64> = OnceLock::new();
+        *PERCENT.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_SPEEDUP_PCT").ok()
+                .and_then(|value| value.parse().ok()).unwrap_or(125).clamp(100, 10_000)
+        })
+    }
+
+    fn reprobe_cpu_mics() -> usize {
+        use std::sync::OnceLock;
+        static MICS: OnceLock<usize> = OnceLock::new();
+        *MICS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_REPROBE_CPU_MICS").ok()
+                .and_then(|value| value.parse().ok()).unwrap_or(2048).clamp(1, 1 << 24)
+        })
+    }
+
+    fn bucket_index(cube_len: usize) -> usize { cube_len.saturating_sub(2).min(7) }
+    fn residency_index(context_reusable: bool) -> usize { usize::from(context_reusable) }
+
+    fn lower_median(values: impl Iterator<Item = u64>) -> Option<u64> {
+        let mut values: Vec<_> = values.collect();
+        values.sort_unstable();
+        values.get(values.len().saturating_sub(1) / 2).copied()
+    }
+
+    fn route(&self, cube_len: usize, context_reusable: bool)
+        -> (MicChainRoute, u64, Option<u64>)
+    {
+        if !Self::economics_enabled() {
+            return (MicChainRoute::Offload, 0, None);
+        }
+        self.route_at(cube_len, context_reusable, Self::min_cpu_samples(),
+            Self::min_hardware_samples(), Self::reprobe_cpu_mics(), Self::speedup_percent())
+    }
+
+    fn route_at(&self, cube_len: usize, context_reusable: bool, min_cpu_samples: usize,
+        min_hardware_samples: usize, reprobe_cpu_mics: usize, speedup_percent: u64)
+        -> (MicChainRoute, u64, Option<u64>)
+    {
+        let bucket = &self.buckets[Self::bucket_index(cube_len)];
+        let Some(cpu_ns) = (bucket.cpu_samples_ns.len() >= min_cpu_samples)
+            .then(|| Self::lower_median(bucket.cpu_samples_ns.iter().copied())).flatten()
+        else { return (MicChainRoute::Reject, 0, None); };
+        let residency = Self::residency_index(context_reusable);
+        let samples = &bucket.hardware_samples[residency];
+        if samples.len() < min_hardware_samples {
+            return (MicChainRoute::Probe, cpu_ns, None);
+        }
+        let Some(hardware_ns) = Self::lower_median(samples.iter().map(|s| s.client_ns))
+        else { return (MicChainRoute::Probe, cpu_ns, None); };
+        let replaceable_percent = samples.iter().filter(|s| s.replaceable).count()
+            .saturating_mul(100) / samples.len();
+        let replaceable_cpu_ns = cpu_ns.saturating_mul(replaceable_percent as u64) / 100;
+        if replaceable_cpu_ns.saturating_mul(100) >= hardware_ns.saturating_mul(speedup_percent) {
+            (MicChainRoute::Offload, replaceable_cpu_ns, Some(hardware_ns))
+        } else if bucket.cpu_since_probe[residency] >= reprobe_cpu_mics {
+            (MicChainRoute::Probe, replaceable_cpu_ns, Some(hardware_ns))
+        } else {
+            (MicChainRoute::Reject, replaceable_cpu_ns, Some(hardware_ns))
+        }
+    }
+
+    fn note_cpu(&mut self, cube_len: usize, context_reusable: bool, elapsed_ns: u64) {
+        let bucket = &mut self.buckets[Self::bucket_index(cube_len)];
+        if bucket.cpu_samples_ns.len() == Self::cpu_window() { bucket.cpu_samples_ns.pop_front(); }
+        bucket.cpu_samples_ns.push_back(elapsed_ns);
+        let residency = Self::residency_index(context_reusable);
+        bucket.cpu_since_probe[residency] = bucket.cpu_since_probe[residency].saturating_add(1);
+    }
+
+    fn note_hardware(&mut self, cube_len: usize, context_reusable: bool,
+        client_ns: u64, replaceable: bool)
+    {
+        let bucket = &mut self.buckets[Self::bucket_index(cube_len)];
+        let residency = Self::residency_index(context_reusable);
+        bucket.cpu_since_probe[residency] = 0;
+        if client_ns == 0 { return; }
+        let samples = &mut bucket.hardware_samples[residency];
+        if samples.len() == Self::hardware_window() { samples.pop_front(); }
+        samples.push_back(MicChainHardwareSample { client_ns, replaceable });
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MicHardwareSample {
     service_per_query_ns: u64,
@@ -1013,34 +1175,60 @@ impl IC3 {
         // reduced cube. Its output is still only a candidate: one ordinary,
         // unbudgeted live GipSAT solve proves the complete returned cube before
         // IC3 may adopt it.
+        let mic_chain_input_len = cube.len();
         let mut mic_chain_answered = false;
         let mut mic_chain_finished = false;
+        let mut mic_chain_adopted = false;
+        let mut mic_chain_cpu_sample = None;
         if parameter.level == 0
             && crate::accel::cdcl_host::mic_chain_enabled()
             && cube.len() >= crate::accel::cdcl_host::mic_chain_min_cube().max(2)
+            && cube.len() <= crate::accel::cdcl_host::mic_chain_max_cube()
             && let Some(init_guard_index) = cube
                 .iter()
                 .position(|lit| !self.tsctx.cube_subsume_init(std::slice::from_ref(lit)))
         {
+            let context_reusable = crate::accel::cdcl_host::active_mic_chain_context_reusable(
+                &self.solvers[frame - 1].dcs,
+            );
+            let (route, projected_cpu_ns, projected_hardware_ns) = self.mic_chain_policy
+                .route(mic_chain_input_len, context_reusable);
+            crate::accel::cdcl_host::note_active_mic_chain_economics(
+                match route {
+                    MicChainRoute::Reject => 0,
+                    MicChainRoute::Probe => 1,
+                    MicChainRoute::Offload => 2,
+                },
+                context_reusable, projected_cpu_ns, projected_hardware_ns,
+            );
+            mic_chain_answered = true;
+            if route != MicChainRoute::Offload {
+                mic_chain_cpu_sample = Some((mic_chain_input_len, context_reusable));
+            }
             // Keep one literal that contradicts the constant initial state in
             // every returned cube. The command processes pairs in order, so
             // moving this guard to a protected suffix and limiting trials to
             // the preceding pairs prevents an otherwise sound inductive cube
             // from being unusable merely because it subsumes Init.
-            let mut ordered_cube = cube.clone();
-            let init_guard = ordered_cube.remove(init_guard_index);
-            ordered_cube.push(init_guard);
-            let pairs: Vec<_> = ordered_cube
-                .iter()
-                .map(|lit| (*lit, self.tsctx.next(*lit)))
-                .collect();
-            if let Some(chain) = crate::accel::cdcl_host::solve_active_mic_chain(
-                &self.solvers[frame - 1].dcs,
-                &pairs,
-                constraint,
-                1,
-            ) {
-                mic_chain_answered = true;
+            if route != MicChainRoute::Reject {
+                let mut ordered_cube = cube.clone();
+                let init_guard = ordered_cube.remove(init_guard_index);
+                ordered_cube.push(init_guard);
+                let pairs: Vec<_> = ordered_cube.iter()
+                    .map(|lit| (*lit, self.tsctx.next(*lit))).collect();
+                if let Some(chain) = crate::accel::cdcl_host::solve_active_mic_chain(
+                    &self.solvers[frame - 1].dcs, &pairs, constraint, 1,
+                ) {
+                    let candidate_valid = (chain.complete || chain.cube.len() < cube.len())
+                        && !chain.cube.is_empty()
+                        && !self.tsctx.cube_subsume_init(&chain.cube);
+                    self.mic_chain_policy.note_hardware(
+                        mic_chain_input_len, chain.context_reused, chain.client_ns,
+                        chain.complete && candidate_valid,
+                    );
+                    if route == MicChainRoute::Probe {
+                        // Proof-neutral calibration: ignore the candidate.
+                    } else if candidate_valid {
                 // A complete chain may legitimately return the input cube:
                 // every attempted drop was SAT. In stable mode we still
                 // re-check once in CPU so a successful complete command can
@@ -1056,6 +1244,7 @@ impl IC3 {
                     if crate::accel::cdcl_host::mic_chain_skip_cpu_check() {
                         if !chain.cube.is_empty() && !self.tsctx.cube_subsume_init(&chain.cube) {
                             adopted = true;
+                            mic_chain_adopted = true;
                             cube = chain.cube.clone();
                             mic_chain_finished = chain.complete;
                             if mic_chain_finished {
@@ -1097,6 +1286,7 @@ impl IC3 {
                             );
                             if !exact.is_empty() && !self.tsctx.cube_subsume_init(&exact) {
                                 adopted = true;
+                                mic_chain_adopted = true;
                                 cube = exact;
                                 // Once an exact solve proves the result of a
                                 // complete hardware traversal, repeating every
@@ -1127,7 +1317,12 @@ impl IC3 {
                             verify_ns,
                         );
                     }
+                    }
                 }
+            }
+            }
+            if route == MicChainRoute::Offload && !mic_chain_adopted {
+                mic_chain_cpu_sample = Some((mic_chain_input_len, context_reusable));
             }
         }
         // Cache this once per MIC.  The default CPU path must not repeatedly
@@ -1188,6 +1383,7 @@ impl IC3 {
             }
         }
 
+        let cpu_loop_started = mic_chain_cpu_sample.map(|sample| (sample, Instant::now()));
         let mut i = 0;
         while !mic_chain_finished && i < cube.len() {
             if keep.contains(&cube[i]) {
@@ -1261,6 +1457,10 @@ impl IC3 {
             }
         }
         self.note_mic_wave_invalidated(&prefetched_wave);
+        if let Some(((cube_len, context_reusable), cpu_started)) = cpu_loop_started {
+            let elapsed_ns = cpu_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            self.mic_chain_policy.note_cpu(cube_len, context_reusable, elapsed_ns);
+        }
         if parameter.level == 0 {
             self.solvers[frame - 1].unset_domain();
         }
@@ -1288,7 +1488,8 @@ impl IC3 {
 
 #[cfg(test)]
 mod mic_batch_policy_tests {
-    use super::{MicBatchPolicy, MicBatchRoute, shrink_down_cube_from_model};
+    use super::{MicBatchPolicy, MicBatchRoute, MicChainHardwareSample, MicChainPolicy,
+        MicChainRoute, shrink_down_cube_from_model};
     use giputils::hash::GHashSet;
     use logicrs::{LitVec, Var};
 
@@ -1298,6 +1499,47 @@ mod mic_batch_policy_tests {
             policy.cpu_samples_ns.push_back(200_000);
         }
         policy
+    }
+
+    fn chain_cpu_trained(cube_len: usize) -> MicChainPolicy {
+        let mut policy = MicChainPolicy::default();
+        let bucket = &mut policy.buckets[MicChainPolicy::bucket_index(cube_len)];
+        for _ in 0..8 { bucket.cpu_samples_ns.push_back(200_000); }
+        policy
+    }
+
+    #[test]
+    fn mic_chain_economics_separates_warm_and_cold_contexts() {
+        let mut policy = chain_cpu_trained(4);
+        for _ in 0..4 {
+            policy.buckets[MicChainPolicy::bucket_index(4)].hardware_samples[0]
+                .push_back(MicChainHardwareSample { client_ns: 1_000_000, replaceable: true });
+        }
+        assert_eq!(policy.route_at(4, false, 8, 4, 2048, 125).0, MicChainRoute::Reject);
+        assert_eq!(policy.route_at(4, true, 8, 4, 2048, 125).0, MicChainRoute::Probe);
+        for _ in 0..4 {
+            policy.buckets[MicChainPolicy::bucket_index(4)].hardware_samples[1]
+                .push_back(MicChainHardwareSample { client_ns: 100_000, replaceable: true });
+        }
+        assert_eq!(policy.route_at(4, true, 8, 4, 2048, 125),
+            (MicChainRoute::Offload, 200_000, Some(100_000)));
+    }
+
+    #[test]
+    fn mic_chain_economics_charges_incomplete_chains_as_zero_replacement() {
+        let mut policy = chain_cpu_trained(3);
+        for replaceable in [true, false, false, false] {
+            policy.buckets[MicChainPolicy::bucket_index(3)].hardware_samples[1]
+                .push_back(MicChainHardwareSample { client_ns: 20_000, replaceable });
+        }
+        assert_eq!(policy.route_at(3, true, 8, 4, 2048, 125),
+            (MicChainRoute::Offload, 50_000, Some(20_000)));
+        for sample in &mut policy.buckets[MicChainPolicy::bucket_index(3)].hardware_samples[1] {
+            sample.replaceable = false;
+        }
+        assert_eq!(policy.route_at(3, true, 8, 4, 2048, 125).0, MicChainRoute::Reject);
+        policy.buckets[MicChainPolicy::bucket_index(3)].cpu_since_probe[1] = 2048;
+        assert_eq!(policy.route_at(3, true, 8, 4, 2048, 125).0, MicChainRoute::Probe);
     }
 
     #[test]

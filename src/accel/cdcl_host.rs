@@ -152,6 +152,8 @@ pub struct MicChainResult {
     pub cube: LitVec,
     pub trials: u32,
     pub complete: bool,
+    pub client_ns: u64,
+    pub context_reused: bool,
     pub reason: UnknownReason,
     pub decisions: u64,
     pub conflicts: u64,
@@ -674,6 +676,8 @@ impl HardwareCdcl {
                 cube: decoded,
                 trials: header.trials,
                 complete: header.complete == 1,
+                client_ns: 0,
+                context_reused: false,
                 reason,
                 decisions: u64::from(header.decisions),
                 conflicts: u64::from(header.conflicts),
@@ -1126,6 +1130,17 @@ static ACTIVE_MIC_CHAIN_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_CPU_LOOPS_REPLACED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_CPU_TRIALS_REPLACED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_PROBES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_OFFLOADS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_REJECTS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_WARM_PROBES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_WARM_OFFLOADS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_WARM_REJECTS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_HW_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_ECON_HW_VALID: AtomicBool = AtomicBool::new(false);
+static ACTIVE_MIC_CHAIN_CLIENT_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_CONTEXT_REUSED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -2575,7 +2590,7 @@ pub fn mic_chain_max_cube() -> usize {
         std::env::var("INDUCTOR_CDCL_MIC_CHAIN_MAX_CUBE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(if fpga_throughput { 4 } else { 4096 })
+            .unwrap_or(if fpga_throughput { 8 } else { 4096 })
             .clamp(1, 4096)
     })
 }
@@ -2794,6 +2809,7 @@ pub fn solve_active_mic_chain(
     constraints: &[LitVec],
     protected_suffix: usize,
 ) -> Option<MicChainResult> {
+    let client_started = std::time::Instant::now();
     if !mic_chain_enabled()
         || cube.len() < mic_chain_min_cube()
         || cube.len() > mic_chain_max_cube()
@@ -2825,6 +2841,7 @@ pub fn solve_active_mic_chain(
     };
 
     let update = plan_context_update(state.loaded_context.as_ref(), &context);
+    let context_reused = update != ContextUpdate::Reload;
     let mut ready = update == ContextUpdate::Ready;
     if let ContextUpdate::Append(clauses) = update {
         let started = std::time::Instant::now();
@@ -2909,6 +2926,8 @@ pub fn solve_active_mic_chain(
                 max_trials,
                 eligible_trials,
             );
+            result.client_ns = client_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            result.context_reused = context_reused;
             ACTIVE_MIC_CHAIN_COMMANDS.fetch_add(1, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_INPUT_LITS.fetch_add(cube.len() as u64, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_OUTPUT_LITS.fetch_add(result.cube.len() as u64, Ordering::Relaxed);
@@ -2922,6 +2941,10 @@ pub fn solve_active_mic_chain(
             ACTIVE_MIC_CHAIN_CONFLICTS.fetch_add(result.conflicts, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_PROPAGATIONS.fetch_add(result.propagations, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_LEARNTS.fetch_add(result.learnt_clauses, Ordering::Relaxed);
+            ACTIVE_MIC_CHAIN_CLIENT_NS.fetch_add(result.client_ns, Ordering::Relaxed);
+            if result.context_reused {
+                ACTIVE_MIC_CHAIN_CONTEXT_REUSED.fetch_add(1, Ordering::Relaxed);
+            }
             Some(result)
         }
         Err(error) => {
@@ -2933,6 +2956,13 @@ pub fn solve_active_mic_chain(
             None
         }
     }
+}
+
+pub fn active_mic_chain_context_reusable(solver: &DagCnfSolver) -> bool {
+    if !mic_chain_enabled() || !active_hardware_available() { return false; }
+    active_state().lock().ok()
+        .and_then(|state| state.loaded_context.as_ref().map(|context| context.scope))
+        == Some(ShadowContextScope::ExactFrame(solver.accel_level))
 }
 
 fn mic_chain_effectively_complete(
@@ -3490,6 +3520,22 @@ pub fn note_active_mic_chain_validation(accepted: bool, verify_ns: u64) {
 pub fn note_active_mic_chain_cpu_replaced(trials: u32) {
     ACTIVE_MIC_CHAIN_CPU_LOOPS_REPLACED.fetch_add(1, Ordering::Relaxed);
     ACTIVE_MIC_CHAIN_CPU_TRIALS_REPLACED.fetch_add(u64::from(trials), Ordering::Relaxed);
+}
+
+pub fn note_active_mic_chain_economics(route: u8, context_reusable: bool,
+    projected_cpu_ns: u64, projected_hardware_ns: Option<u64>)
+{
+    let (total, warm) = match route {
+        0 => (&ACTIVE_MIC_CHAIN_ECON_REJECTS, &ACTIVE_MIC_CHAIN_ECON_WARM_REJECTS),
+        1 => (&ACTIVE_MIC_CHAIN_ECON_PROBES, &ACTIVE_MIC_CHAIN_ECON_WARM_PROBES),
+        2 => (&ACTIVE_MIC_CHAIN_ECON_OFFLOADS, &ACTIVE_MIC_CHAIN_ECON_WARM_OFFLOADS),
+        _ => return,
+    };
+    total.fetch_add(1, Ordering::Relaxed);
+    if context_reusable { warm.fetch_add(1, Ordering::Relaxed); }
+    ACTIVE_MIC_CHAIN_ECON_CPU_NS.store(projected_cpu_ns, Ordering::Relaxed);
+    ACTIVE_MIC_CHAIN_ECON_HW_NS.store(projected_hardware_ns.unwrap_or(0), Ordering::Relaxed);
+    ACTIVE_MIC_CHAIN_ECON_HW_VALID.store(projected_hardware_ns.is_some(), Ordering::Relaxed);
 }
 
 pub fn note_active_block_cost_rejected() {
@@ -4063,7 +4109,7 @@ pub fn flush_and_report() {
             },
         );
         eprintln!(
-            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials {}, input/output lits {}/{}, device service {:.3} ms, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, adoption accepted/rejected {}/{}, CPU verify {:.3} ms, CPU MIC loops/trials replaced {}/{}",
+            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials {}, input/output lits {}/{}, device/client service {:.3}/{:.3} ms, context reused {}, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, adoption accepted/rejected {}/{}, CPU verify {:.3} ms, CPU MIC loops/trials replaced {}/{}",
             ACTIVE_MIC_CHAIN_COMMANDS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_COMPLETE.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_PARTIAL.load(Ordering::Relaxed),
@@ -4072,6 +4118,8 @@ pub fn flush_and_report() {
             ACTIVE_MIC_CHAIN_INPUT_LITS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_OUTPUT_LITS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_SERVICE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_MIC_CHAIN_CLIENT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_MIC_CHAIN_CONTEXT_REUSED.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_DECISIONS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_CONFLICTS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_PROPAGATIONS.load(Ordering::Relaxed),
@@ -4081,6 +4129,19 @@ pub fn flush_and_report() {
             ACTIVE_MIC_CHAIN_VERIFY_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_MIC_CHAIN_CPU_LOOPS_REPLACED.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_CPU_TRIALS_REPLACED.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "inductor-cdcl: active MIC chain economics probes/offloads/rejects {}/{}/{}, warm {}/{}/{}, projected replaceable CPU/HW {:.3}/{}",
+            ACTIVE_MIC_CHAIN_ECON_PROBES.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_ECON_OFFLOADS.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_ECON_REJECTS.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_ECON_WARM_PROBES.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_ECON_WARM_OFFLOADS.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_ECON_WARM_REJECTS.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_ECON_CPU_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            if ACTIVE_MIC_CHAIN_ECON_HW_VALID.load(Ordering::Relaxed) {
+                format!("{:.3} ms", ACTIVE_MIC_CHAIN_ECON_HW_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0)
+            } else { "untrained".to_string() },
         );
         eprintln!(
             "inductor-cdcl: active block preflight conclusive/selected/fallback {}/{}/{}, wave reserved/taken {}/{}",

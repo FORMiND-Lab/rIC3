@@ -186,6 +186,7 @@ pub struct IC3 {
     mab: mab::CtxMab,
     block_accel_policy: block::BlockAccelPolicy,
     mic_batch_policy: mic::MicBatchPolicy,
+    mic_chain_policy: mic::MicChainPolicy,
     push_prefetch: push_prefetch::PushPrefetchCache,
 
     rng: StdRng,
@@ -302,6 +303,7 @@ impl IC3 {
             mab,
             block_accel_policy: Default::default(),
             mic_batch_policy: Default::default(),
+            mic_chain_policy: Default::default(),
             push_prefetch: Default::default(),
             rng,
             filog: Default::default(),
