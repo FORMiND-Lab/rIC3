@@ -5,7 +5,8 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BatchHeader, MIC_RESPONSE_HEADER_WORDS, MicHeader,
+    ABI_VERSION, BatchHeader, MIC_BATCH_HEADER_WORDS,
+    MIC_BATCH_RESPONSE_HEADER_WORDS, MIC_RESPONSE_HEADER_WORDS, MicHeader,
     MicResponseHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
     PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS,
     PROFILE_LEARN, PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_UPDATES,
@@ -54,6 +55,13 @@ unsafe extern "C" {
         out_response_words: *mut u32,
     ) -> i32;
     fn ind_cdcl_solve_mic_chain(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
+    fn ind_cdcl_solve_mic_chains(
         request: *const u32,
         request_words: u32,
         response: *mut u32,
@@ -163,6 +171,15 @@ pub struct MicChainResult {
     pub conflicts: u64,
     pub propagations: u64,
     pub learnt_clauses: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MicChainQuery<'a> {
+    pub frame: u32,
+    pub cube: &'a [(Lit, Lit)],
+    pub constraints: &'a [LitVec],
+    pub conflict_budget: u32,
+    pub max_trials: u32,
 }
 
 fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<HardwareWork>> {
@@ -413,6 +430,128 @@ fn pack_mic_chain_request(
     Ok(request)
 }
 
+fn pack_mic_chains_request(
+    n_var: u32,
+    chains: &[MicChainQuery<'_>],
+) -> Result<(Vec<u32>, usize), HardwareError> {
+    if chains.is_empty() || chains.len() > 4 {
+        return Err(HardwareError::InvalidContext);
+    }
+    let frame = chains[0].frame;
+    if chains.iter().any(|chain| chain.frame != frame) {
+        return Err(HardwareError::InvalidContext);
+    }
+    let mut records = Vec::with_capacity(chains.len());
+    let mut request_words = 0usize;
+    let mut result_words = 0usize;
+    for chain in chains {
+        let record = pack_mic_chain_request(
+            n_var,
+            chain.frame,
+            chain.cube,
+            chain.constraints,
+            chain.conflict_budget,
+            chain.max_trials,
+        )?;
+        request_words = request_words
+            .checked_add(record.len())
+            .ok_or(HardwareError::Capacity)?;
+        result_words = result_words
+            .checked_add(MIC_RESPONSE_HEADER_WORDS)
+            .and_then(|words| words.checked_add(chain.cube.len()))
+            .ok_or(HardwareError::Capacity)?;
+        records.push(record);
+    }
+    let total_request = MIC_BATCH_HEADER_WORDS
+        .checked_add(request_words)
+        .ok_or(HardwareError::Capacity)?;
+    let response_capacity = MIC_BATCH_RESPONSE_HEADER_WORDS
+        .checked_add(result_words)
+        .ok_or(HardwareError::Capacity)?;
+    if total_request > KERNEL_MAX_REQUEST_WORDS
+        || total_request > u32::MAX as usize
+        || result_words > u32::MAX as usize
+    {
+        return Err(HardwareError::Capacity);
+    }
+    let header = BatchHeader {
+        version: ABI_VERSION,
+        n_queries: chains.len() as u32,
+        n_request_words: request_words as u32,
+        result_capacity_words: result_words as u32,
+    };
+    let mut request = Vec::with_capacity(total_request);
+    request.extend([
+        header.version,
+        header.n_queries,
+        header.n_request_words,
+        header.result_capacity_words,
+    ]);
+    for record in records {
+        request.extend(record);
+    }
+    Ok((request, response_capacity))
+}
+
+fn decode_mic_chain_record(
+    cube: &[(Lit, Lit)],
+    response: &[u32],
+) -> Result<(MicChainResult, usize), HardwareError> {
+    let header = response
+        .get(..MIC_RESPONSE_HEADER_WORDS)
+        .and_then(MicResponseHeader::from_words)
+        .ok_or(HardwareError::InvalidResponse)?;
+    let n_output = usize::try_from(header.n_output)
+        .map_err(|_| HardwareError::InvalidResponse)?;
+    let record_words = MIC_RESPONSE_HEADER_WORDS
+        .checked_add(n_output)
+        .ok_or(HardwareError::InvalidResponse)?;
+    if header.version != ABI_VERSION
+        || usize::try_from(header.n_input).ok() != Some(cube.len())
+        || n_output == 0
+        || n_output > cube.len()
+        || header.trials > header.n_input
+        || (header.trials == 0) != (header.physical_rounds == 0)
+        || header.physical_rounds.saturating_mul(4) < header.trials
+        || header.complete > 1
+        || header.error != 0
+        || record_words > response.len()
+    {
+        return Err(HardwareError::InvalidResponse);
+    }
+    let reason = UnknownReason::from_word(header.reason)
+        .ok_or(HardwareError::InvalidResponse)?;
+    if header.complete == 1 && reason != UnknownReason::None {
+        return Err(HardwareError::InvalidResponse);
+    }
+    let returned = &response[MIC_RESPONSE_HEADER_WORDS..record_words];
+    let mut next_input = 0usize;
+    let mut decoded = LitVec::new();
+    for &word in returned {
+        let Some(relative) = cube[next_input..]
+            .iter()
+            .position(|(current, _)| u32::from(*current) == word)
+        else {
+            return Err(HardwareError::InvalidResponse);
+        };
+        next_input += relative + 1;
+        decoded.push(Lit::new(Var::from(word >> 1), word & 1 == 0));
+    }
+    Ok((MicChainResult {
+        cube: decoded,
+        trials: header.trials,
+        physical_rounds: header.physical_rounds,
+        complete: header.complete == 1,
+        client_ns: 0,
+        context_reused: false,
+        reason,
+        decisions: u64::from(header.decisions),
+        conflicts: u64::from(header.conflicts),
+        propagations: u64::from(header.propagations),
+        learnt_clauses: u64::from(header.learnt_clauses),
+    }, record_words))
+}
+
 pub struct HardwareCdcl {
     n_var: u32,
     last_batch_work: HardwareWork,
@@ -641,57 +780,97 @@ impl HardwareCdcl {
                 return Err(HardwareError::Command(rc));
             }
             let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
-            let header = response
-                .get(..MIC_RESPONSE_HEADER_WORDS)
-                .and_then(MicResponseHeader::from_words)
-                .ok_or(HardwareError::InvalidResponse)?;
-            let n_output = usize::try_from(header.n_output)
-                .map_err(|_| HardwareError::InvalidResponse)?;
-            if header.version != ABI_VERSION
-                || usize::try_from(header.n_input).ok() != Some(cube.len())
-                || n_output == 0
-                || n_output > cube.len()
-                || header.trials > header.n_input
-                || (header.trials == 0) != (header.physical_rounds == 0)
-                || header.physical_rounds.saturating_mul(4) < header.trials
-                || header.complete > 1
-                || header.error != 0
-                || out_words != MIC_RESPONSE_HEADER_WORDS + n_output
-                || out_words > response.len()
+            if out_words > response.len() {
+                return Err(HardwareError::Capacity);
+            }
+            let (result, record_words) = decode_mic_chain_record(cube, &response[..out_words])?;
+            if record_words != out_words {
+                return Err(HardwareError::InvalidResponse);
+            }
+            Ok(result)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, response_capacity_u32, response);
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    /// Execute up to four independent dependent-drop traversals in one
+    /// physical command. Every chain names the same resident frame; mutable
+    /// cube/search state remains private to its fixed hardware lane.
+    pub fn solve_mic_chains(
+        &mut self,
+        chains: &[MicChainQuery<'_>],
+    ) -> Result<Vec<MicChainResult>, HardwareError> {
+        if self.n_var == 0 {
+            return Err(HardwareError::InvalidContext);
+        }
+        let (request, response_capacity) =
+            pack_mic_chains_request(self.n_var, chains)?;
+        let response_capacity_u32 =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        let mut response = vec![0u32; response_capacity];
+        #[cfg(not(has_cdcl_accel))]
+        let response = vec![0u32; response_capacity];
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_solve_mic_chains(
+                    request.as_ptr(),
+                    request.len() as u32,
+                    response.as_mut_ptr(),
+                    response_capacity_u32,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words)
+                .map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len()
+                || out_words < MIC_BATCH_RESPONSE_HEADER_WORDS
             {
                 return Err(HardwareError::InvalidResponse);
             }
-            let reason = UnknownReason::from_word(header.reason)
-                .ok_or(HardwareError::InvalidResponse)?;
-            if header.complete == 1 && reason != UnknownReason::None {
+            let prefix = &response[..MIC_BATCH_RESPONSE_HEADER_WORDS];
+            let result_words = usize::try_from(prefix[2])
+                .map_err(|_| HardwareError::InvalidResponse)?;
+            if prefix[0] != ABI_VERSION
+                || usize::try_from(prefix[1]).ok() != Some(chains.len())
+                || prefix[3] != 0
+                || MIC_BATCH_RESPONSE_HEADER_WORDS.checked_add(result_words)
+                    != Some(out_words)
+            {
                 return Err(HardwareError::InvalidResponse);
             }
-            let returned = &response[MIC_RESPONSE_HEADER_WORDS..out_words];
-            let mut next_input = 0usize;
-            let mut decoded = LitVec::new();
-            for &word in returned {
-                let Some(relative) = cube[next_input..]
-                    .iter()
-                    .position(|(current, _)| u32::from(*current) == word)
-                else {
-                    return Err(HardwareError::InvalidResponse);
-                };
-                next_input += relative + 1;
-                decoded.push(Lit::new(Var::from(word >> 1), word & 1 == 0));
+            let mut results = Vec::with_capacity(chains.len());
+            let mut at = MIC_BATCH_RESPONSE_HEADER_WORDS;
+            for (chain_index, chain) in chains.iter().enumerate() {
+                let decoded =
+                    decode_mic_chain_record(chain.cube, &response[at..out_words]);
+                let (result, words) = decoded.map_err(|error| {
+                    let header_end = at
+                        .saturating_add(MIC_RESPONSE_HEADER_WORDS)
+                        .min(out_words);
+                    eprintln!(
+                        "inductor-cdcl: invalid MIC batch record lane {chain_index}/{}, input {}, offset {at}/{out_words}, header {:?}",
+                        chains.len(),
+                        chain.cube.len(),
+                        &response[at..header_end],
+                    );
+                    error
+                })?;
+                results.push(result);
+                at = at.checked_add(words).ok_or(HardwareError::InvalidResponse)?;
             }
-            Ok(MicChainResult {
-                cube: decoded,
-                trials: header.trials,
-                physical_rounds: header.physical_rounds,
-                complete: header.complete == 1,
-                client_ns: 0,
-                context_reused: false,
-                reason,
-                decisions: u64::from(header.decisions),
-                conflicts: u64::from(header.conflicts),
-                propagations: u64::from(header.propagations),
-                learnt_clauses: u64::from(header.learnt_clauses),
-            })
+            if at != out_words {
+                return Err(HardwareError::InvalidResponse);
+            }
+            Ok(results)
         }
         #[cfg(not(has_cdcl_accel))]
         {
@@ -2627,6 +2806,26 @@ fn mic_chain_model_shrink() -> bool {
     })
 }
 
+fn mic_chain_parallel_lanes() -> usize {
+    static LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LANES.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_CHAIN_LANES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 4)
+    })
+}
+
+fn mic_chain_experimental_reorder() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_CHAIN_EXPERIMENTAL_REORDER")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
 fn mic_chain_conflict_budget() -> u32 {
     static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -2915,18 +3114,82 @@ pub fn solve_active_mic_chain(
         configured_trials.min(eligible_trials)
     };
     let started = std::time::Instant::now();
+    // Rotating the literal order explores different, independently sound MIC
+    // traversals, but it changes IC3's proof path and therefore cannot be used
+    // to claim stable hardware speedup. It also exposed a model-guided 3/4-lane
+    // BAD_QUERY response on the first routed command-6 image. Keep the ABI and
+    // board-qualified capacity path available for explicit experiments while
+    // the production path preserves the original GipSAT literal order.
+    let parallel_lanes = if mic_chain_experimental_reorder() {
+        mic_chain_parallel_lanes()
+            .min(eligible_trials as usize)
+            .max(1)
+    } else {
+        1
+    };
     let result = state
         .hardware
         .as_mut()
         .ok_or(HardwareError::Unavailable)
         .and_then(|hardware| {
-            hardware.solve_mic_chain(
-                frame,
-                cube,
-                constraints,
-                mic_chain_conflict_budget(),
-                max_trials,
-            )
+            if parallel_lanes == 1 || protected_suffix != 1 {
+                return hardware.solve_mic_chain(
+                    frame,
+                    cube,
+                    constraints,
+                    mic_chain_conflict_budget(),
+                    max_trials,
+                );
+            }
+
+            // The model-guided chain is order dependent. Launch rotated
+            // prefix orders on fixed lanes while leaving the protected Init
+            // suffix last. Every returned cube is independently proved by its
+            // own chain; choosing the smallest result is therefore a search
+            // policy, not a vote or CPU replay.
+            let eligible = cube.len() - protected_suffix;
+            let mut lane_cubes = Vec::with_capacity(parallel_lanes);
+            for lane in 0..parallel_lanes {
+                let mut reordered = cube.to_vec();
+                reordered[..eligible].rotate_left(lane * eligible / parallel_lanes);
+                lane_cubes.push(reordered);
+            }
+            let queries: Vec<_> = lane_cubes
+                .iter()
+                .map(|lane_cube| MicChainQuery {
+                    frame,
+                    cube: lane_cube,
+                    constraints,
+                    conflict_budget: mic_chain_conflict_budget(),
+                    max_trials,
+                })
+                .collect();
+            hardware.solve_mic_chains(&queries).and_then(|results| {
+                let decisions = results.iter().map(|result| result.decisions).sum();
+                let conflicts = results.iter().map(|result| result.conflicts).sum();
+                let propagations = results.iter().map(|result| result.propagations).sum();
+                let learnt_clauses = results.iter().map(|result| result.learnt_clauses).sum();
+                let physical_rounds = results
+                    .iter()
+                    .map(|result| result.physical_rounds)
+                    .max()
+                    .unwrap_or(0);
+                let mut selected = results
+                    .into_iter()
+                    .min_by_key(|result| {
+                        (u8::from(!result.complete), result.cube.len(),
+                         u32::MAX - result.trials)
+                    })
+                    .ok_or(HardwareError::InvalidResponse)?;
+                // Work counters describe the whole device command, while the
+                // semantic trial count/cube belong to the selected traversal.
+                selected.decisions = decisions;
+                selected.conflicts = conflicts;
+                selected.propagations = propagations;
+                selected.learnt_clauses = learnt_clauses;
+                selected.physical_rounds = physical_rounds;
+                Ok(selected)
+            })
         });
     let service_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     ACTIVE_MIC_CHAIN_SERVICE_NS.fetch_add(service_ns, Ordering::Relaxed);
@@ -4277,6 +4540,54 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn mic_chain_batch_wire_round_trip_keeps_records_independent() {
+        let l = |var: u32| Lit::new(Var::from(var), true);
+        let cube0 = [(l(0), l(3)), (l(1), l(4)), (l(2), l(5))];
+        let cube1 = [(l(6), l(9)), (l(7), l(10)), (l(8), l(11))];
+        let chains = [
+            MicChainQuery {
+                frame: 4,
+                cube: &cube0,
+                constraints: &[],
+                conflict_budget: 16,
+                max_trials: 2,
+            },
+            MicChainQuery {
+                frame: 4,
+                cube: &cube1,
+                constraints: &[],
+                conflict_budget: 16,
+                max_trials: 2,
+            },
+        ];
+        let (request, capacity) = pack_mic_chains_request(12, &chains).unwrap();
+        assert_eq!(request[0], ABI_VERSION);
+        assert_eq!(request[1], 2);
+        assert_eq!(request[2] as usize, request.len() - MIC_BATCH_HEADER_WORDS);
+        assert_eq!(capacity, MIC_BATCH_RESPONSE_HEADER_WORDS + 2 * 15);
+
+        let mut response = vec![ABI_VERSION, 2, 26, 0];
+        for protected in [l(2), l(8)] {
+            response.extend([
+                ABI_VERSION, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 2,
+                u32::from(protected),
+            ]);
+        }
+        let (result0, words0) =
+            decode_mic_chain_record(&cube0, &response[4..]).unwrap();
+        let (result1, words1) =
+            decode_mic_chain_record(&cube1, &response[4 + words0..]).unwrap();
+        assert_eq!(words0, 13);
+        assert_eq!(words1, 13);
+        assert_eq!(result0.cube.len(), 1);
+        assert_eq!(result1.cube.len(), 1);
+        assert_eq!(result0.cube[0], l(2));
+        assert_eq!(result1.cube[0], l(8));
+        assert_eq!(result0.physical_rounds, 2);
+        assert_eq!(result1.physical_rounds, 2);
+    }
 
     #[test]
     fn protected_mic_suffix_counts_as_complete_only_after_all_candidates() {

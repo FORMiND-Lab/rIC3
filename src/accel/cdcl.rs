@@ -62,6 +62,8 @@ pub const QUERY_HEADER_WORDS: usize = 8;
 pub const RESPONSE_HEADER_WORDS: usize = 9;
 pub const MIC_HEADER_WORDS: usize = 9;
 pub const MIC_RESPONSE_HEADER_WORDS: usize = 12;
+pub const MIC_BATCH_HEADER_WORDS: usize = 4;
+pub const MIC_BATCH_RESPONSE_HEADER_WORDS: usize = 4;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
