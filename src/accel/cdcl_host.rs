@@ -579,10 +579,6 @@ fn pack_mic_chains_request(
     if chains.is_empty() || chains.len() > 4 {
         return Err(HardwareError::InvalidContext);
     }
-    let frame = chains[0].frame;
-    if chains.iter().any(|chain| chain.frame != frame) {
-        return Err(HardwareError::InvalidContext);
-    }
     let mut records = Vec::with_capacity(chains.len());
     let mut request_words = 0usize;
     let mut result_words = 0usize;
@@ -1062,8 +1058,9 @@ impl HardwareCdcl {
     }
 
     /// Execute up to four independent dependent-drop traversals in one
-    /// physical command. Every chain names the same resident frame; mutable
-    /// cube/search state remains private to its fixed hardware lane.
+    /// physical command. Every chain selects its own frame from one resident
+    /// ranged-clause context; mutable frame/cube/search state remains private
+    /// to its fixed hardware lane.
     pub fn solve_mic_chains(
         &mut self,
         chains: &[MicChainQuery<'_>],
@@ -5038,7 +5035,7 @@ mod tests {
                 max_trials: 2,
             },
             MicChainQuery {
-                frame: 4,
+                frame: 5,
                 cube: &cube1,
                 constraints: &[],
                 protected_index: 2,
@@ -5052,6 +5049,13 @@ mod tests {
         assert_eq!(request[1], 2);
         assert_eq!(request[2] as usize, request.len() - MIC_BATCH_HEADER_WORDS);
         assert_eq!(capacity, MIC_BATCH_RESPONSE_HEADER_WORDS + 2 * 15);
+        let first = MIC_BATCH_HEADER_WORDS;
+        let first_words = MIC_HEADER_WORDS
+            + request[first + 4] as usize
+            + request[first + 5] as usize
+            + 2 * request[first + 3] as usize;
+        assert_eq!(request[first + 1], 4);
+        assert_eq!(request[first + first_words + 1], 5);
 
         let mut response = vec![ABI_VERSION, 2, 26, 0];
         for protected in [l(2), l(8)] {
