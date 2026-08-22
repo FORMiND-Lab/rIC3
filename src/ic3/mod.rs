@@ -521,6 +521,9 @@ impl Engine for IC3 {
             }
         }
         crate::inductor::init("", shape);
+        // Start one append-only frame-ranged resident formula before IC3 adds
+        // its first lemma. frame.rs records every subsequent solver interval.
+        crate::accel::cdcl_host::reset_frame_resident_context(&self.inf_solver.dcs);
         let t0 = Instant::now();
         let res = self.check_traced();
         let name = match res {

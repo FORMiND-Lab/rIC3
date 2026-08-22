@@ -256,7 +256,9 @@ impl IC3 {
             {
                 predprop.add_lemma(&lemma);
             }
-            self.solvers[0].add_clause(&!lemma.as_litvec());
+            let clause = !lemma.as_litvec();
+            crate::accel::cdcl_host::register_frame_resident_clause(&clause, 0, 0);
+            self.solvers[0].add_clause(&clause);
             self.frame.frames[0].push(FrameLemma::new(lemma, po, None));
             return false;
         }
@@ -273,6 +275,11 @@ impl IC3 {
                     if l.eq(&lemma) {
                         self.frame.frames[i].swap_remove(j);
                         let clause = !lemma.as_litvec();
+                        crate::accel::cdcl_host::register_frame_resident_clause(
+                            &clause,
+                            (i + 1) as u32,
+                            frame as u32,
+                        );
                         for k in i + 1..=frame {
                             self.solvers[k].add_clause(&clause);
                         }
@@ -302,6 +309,11 @@ impl IC3 {
         }
         let clause = !lemma.as_litvec();
         let begin = begin.unwrap_or(1);
+        crate::accel::cdcl_host::register_frame_resident_clause(
+            &clause,
+            begin as u32,
+            frame as u32,
+        );
         // Mirrored once, with the frames it belongs to. The card holds one
         // clause set and each query names its frame, so `begin..=frame` is
         // exactly what the engine needs to decide whether this lemma applies.
@@ -349,6 +361,11 @@ impl IC3 {
         lastf.retain(|l| !l.eq(&lemma));
         assert_eq!(lastf.len() + 1, olen);
         let clause = !lemma.as_litvec();
+        crate::accel::cdcl_host::register_frame_resident_clause(
+            &clause,
+            0,
+            u32::MAX,
+        );
         // Mirror at every frame. An infinity lemma holds unconditionally, and
         // every frame solver is a clone of `inf_solver`, so a card that never
         // saw these holds strictly less than the solver it is shadowing. That

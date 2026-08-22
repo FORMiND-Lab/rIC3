@@ -1211,18 +1211,16 @@ impl IC3 {
                 mic_chain_cpu_sample = Some((mic_chain_input_len, context_reusable));
             }
             // Keep one literal that contradicts the constant initial state in
-            // every returned cube. The command processes pairs in order, so
-            // moving this guard to a protected suffix and limiting trials to
-            // the preceding pairs prevents an otherwise sound inductive cube
-            // from being unusable merely because it subsumes Init.
+            // every returned cube. Its original index is carried to the
+            // device, so protecting it does not reorder GipSAT's drop loop.
             if route != MicChainRoute::Reject {
-                let mut ordered_cube = cube.clone();
-                let init_guard = ordered_cube.remove(init_guard_index);
-                ordered_cube.push(init_guard);
-                let pairs: Vec<_> = ordered_cube.iter()
+                let pairs: Vec<_> = cube.iter()
                     .map(|lit| (*lit, self.tsctx.next(*lit))).collect();
                 if let Some(chain) = crate::accel::cdcl_host::solve_active_mic_chain(
-                    &self.solvers[frame - 1].dcs, &pairs, constraint, 1,
+                    &self.solvers[frame - 1].dcs,
+                    &pairs,
+                    constraint,
+                    init_guard_index,
                 ) {
                     let candidate_valid = (chain.complete || chain.cube.len() < cube.len())
                         && !chain.cube.is_empty()

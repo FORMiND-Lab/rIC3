@@ -5,25 +5,23 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BatchHeader, MIC_BATCH_HEADER_WORDS,
-    MIC_BATCH_RESPONSE_HEADER_WORDS, MIC_RESPONSE_HEADER_WORDS, MicHeader,
-    MicResponseHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
-    PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS,
-    PROFILE_LEARN, PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_UPDATES,
-    PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
-    PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
-    MIC_MODEL_SHRINK, MIC_PROTECT_LAST, PROFILE_SETUP,
-    PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES,
-    PROFILE_UNIT_CANDIDATES, RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS,
-    STAGE_PROFILE_MAGIC, STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION,
-    STAGE_PROFILE_WORDS, Status, UnknownReason, WANT_STAGE_PROFILE,
+    ABI_VERSION, BatchHeader, MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
+    MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
+    MicHeader, MicResponseHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
+    PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS, PROFILE_LEARN,
+    PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
+    PROFILE_OCCURRENCE_UPDATES, PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
+    PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
+    RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS, STAGE_PROFILE_MAGIC,
+    STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
+    UnknownReason, WANT_STAGE_PROFILE,
 };
+#[cfg(has_cdcl_accel)]
+use crate::gipsat::decode_batch_results;
 use crate::gipsat::{
     BatchDecodeError, DagCnfSolver, IncrementalCdcl, IncrementalQuery, IncrementalResult,
     pack_batch, solve_on_cpu_after_hardware_unknown,
 };
-#[cfg(has_cdcl_accel)]
-use crate::gipsat::decode_batch_results;
 use logicrs::{Lit, LitVec, Var};
 #[cfg(has_cdcl_accel)]
 use std::ffi::CString;
@@ -33,13 +31,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(has_cdcl_accel)]
 unsafe extern "C" {
     fn ind_cdcl_open(path: *const std::os::raw::c_char) -> i32;
-    fn ind_cdcl_open_with_device(
-        path: *const std::os::raw::c_char,
-        device_index: i32,
-    ) -> i32;
+    fn ind_cdcl_open_with_device(path: *const std::os::raw::c_char, device_index: i32) -> i32;
     fn ind_cdcl_connect(path: *const std::os::raw::c_char) -> i32;
     fn ind_cdcl_load_context(request: *const u32, request_words: u32) -> i32;
     fn ind_cdcl_add_frame_clauses(request: *const u32, request_words: u32) -> i32;
+    fn ind_cdcl_append_and_solve_mic_chain(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
+    fn ind_cdcl_materialize_frame(frame: u32) -> i32;
     fn ind_cdcl_solve_batch(
         request: *const u32,
         request_words: u32,
@@ -68,6 +71,19 @@ unsafe extern "C" {
         response_capacity_words: u32,
         out_response_words: *mut u32,
     ) -> i32;
+    fn ind_cdcl_total_kernel_ns() -> u64;
+}
+
+#[cfg(has_cdcl_accel)]
+fn direct_kernel_ns() -> u64 {
+    // The bridge serializes commands and owns this process's XRT context, so
+    // the cumulative value is a coherent kernel-busy counter at report time.
+    unsafe { ind_cdcl_total_kernel_ns() }
+}
+
+#[cfg(not(has_cdcl_accel))]
+fn direct_kernel_ns() -> u64 {
+    0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +101,104 @@ impl ResidentClause {
             literals: literals.into(),
         }
     }
+}
+
+#[derive(Default)]
+struct FrameRangeRegistry {
+    n_var: u32,
+    transition: Vec<LitVec>,
+    clauses: Vec<ResidentClause>,
+}
+
+static FRAME_RANGE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<FrameRangeRegistry>> =
+    std::sync::OnceLock::new();
+
+fn frame_range_registry() -> &'static std::sync::Mutex<FrameRangeRegistry> {
+    FRAME_RANGE_REGISTRY.get_or_init(|| std::sync::Mutex::new(FrameRangeRegistry::default()))
+}
+
+/// Start one IC3 run's append-only, frame-ranged resident formula. The
+/// transition relation is permanent; subsequent calls record the exact frame
+/// intervals into which IC3 inserts each lemma.
+pub fn reset_frame_resident_context(solver: &DagCnfSolver) {
+    if !active_frame_ranges() {
+        return;
+    }
+    let (n_var, _, transition, _) = solver.incremental_resident_partition();
+    if let Ok(mut registry) = frame_range_registry().lock() {
+        registry.n_var = n_var;
+        registry.transition = transition;
+        registry.clauses.clear();
+    }
+}
+
+/// Record only interval portions not already covered by an identical clause.
+/// The log stays append-only so the card normally advances with
+/// ADD_FRAME_CLAUSES instead of replacing the whole resident context.
+pub fn register_frame_resident_clause(literals: &[Lit], lo: u32, hi: u32) {
+    if !active_frame_ranges() || lo > hi || literals.is_empty() {
+        return;
+    }
+    let Ok(mut registry) = frame_range_registry().lock() else {
+        return;
+    };
+    let literals = LitVec::from(literals);
+    let mut covered: Vec<_> = registry
+        .clauses
+        .iter()
+        .filter(|clause| clause.literals == literals)
+        .map(|clause| (clause.lo, clause.hi))
+        .collect();
+    covered.sort_unstable();
+
+    let mut cursor = lo;
+    for (begin, end) in covered {
+        if end < cursor || begin > hi {
+            continue;
+        }
+        if begin > cursor {
+            registry.clauses.push(ResidentClause::new(
+                cursor,
+                hi.min(begin - 1),
+                literals.clone(),
+            ));
+        }
+        if end == u32::MAX {
+            return;
+        }
+        cursor = cursor.max(end + 1);
+        if cursor > hi {
+            return;
+        }
+    }
+    registry
+        .clauses
+        .push(ResidentClause::new(cursor, hi, literals));
+}
+
+fn frame_ranged_context(n_var: u32, transition: &[LitVec]) -> Option<ShadowContext> {
+    if !active_frame_ranges() {
+        return None;
+    }
+    let registry = frame_range_registry().lock().ok()?;
+    if registry.n_var != n_var || registry.transition != transition {
+        return None;
+    }
+    // Preserve registration order exactly. IC3 revisits lower frames, so `hi`
+    // is not globally monotonic; sorting would insert new clauses into the
+    // loaded prefix and force a full reload. The kernel's frame buckets skip
+    // expired ranges without changing this physical append order.
+    let clauses = transition
+        .iter()
+        .cloned()
+        .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+        .chain(registry.clauses.iter().cloned())
+        .collect();
+    Some(ShadowContext {
+        n_var,
+        clauses,
+        scope: ShadowContextScope::FrameRanged,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,7 +232,8 @@ fn pack_clauses(
     }
     let mut capacity = prefix.len();
     for clause in clauses {
-        if clause.lo > clause.hi || clause.literals.is_empty()
+        if clause.lo > clause.hi
+            || clause.literals.is_empty()
             || clause.literals.len() > u32::MAX as usize
             || clause
                 .literals
@@ -178,6 +293,8 @@ pub struct MicChainQuery<'a> {
     pub frame: u32,
     pub cube: &'a [(Lit, Lit)],
     pub constraints: &'a [LitVec],
+    pub protected_index: usize,
+    pub decision_budget: u32,
     pub conflict_budget: u32,
     pub max_trials: u32,
 }
@@ -200,7 +317,8 @@ fn decode_batch_work_records(words: &[u32], n_queries: usize) -> Option<Vec<Hard
             learnt_clauses: u64::from(header[7]),
             profile_counters: [0; STAGE_PROFILE_COUNTERS],
         });
-        let payload_words = usize::try_from(header[2]).ok()?
+        let payload_words = usize::try_from(header[2])
+            .ok()?
             .checked_add(usize::try_from(header[3]).ok()?)?;
         offset = offset
             .checked_add(RESPONSE_HEADER_WORDS)?
@@ -246,7 +364,8 @@ fn decode_profiled_batch_wire(
             learnt_clauses: u64::from(header[7]),
             profile_counters: [0; STAGE_PROFILE_COUNTERS],
         };
-        let payload_words = usize::try_from(header[2]).ok()?
+        let payload_words = usize::try_from(header[2])
+            .ok()?
             .checked_add(usize::try_from(header[3]).ok()?)?;
         let semantic_end = offset
             .checked_add(RESPONSE_HEADER_WORDS)?
@@ -283,11 +402,7 @@ fn sum_hardware_work(records: &[HardwareWork]) -> HardwareWork {
             total.conflicts = total.conflicts.saturating_add(work.conflicts);
             total.propagations = total.propagations.saturating_add(work.propagations);
             total.learnt_clauses = total.learnt_clauses.saturating_add(work.learnt_clauses);
-            for (sum, value) in total
-                .profile_counters
-                .iter_mut()
-                .zip(work.profile_counters)
-            {
+            for (sum, value) in total.profile_counters.iter_mut().zip(work.profile_counters) {
                 *sum = sum.saturating_add(value);
             }
             total
@@ -308,13 +423,10 @@ fn pack_batch_request(
                 } else {
                     0
                 })?;
-            total.checked_add(
-                record,
-            )
+            total.checked_add(record)
         })
         .ok_or(HardwareError::Capacity)?;
-    let result_words_u32 =
-        u32::try_from(result_words).map_err(|_| HardwareError::Capacity)?;
+    let result_words_u32 = u32::try_from(result_words).map_err(|_| HardwareError::Capacity)?;
     let (batch, mut payload) = pack_batch(queries, result_words_u32);
     if want_stage_profile {
         let mut offset = 0usize;
@@ -370,10 +482,17 @@ fn pack_mic_chain_request(
     frame: u32,
     cube: &[(Lit, Lit)],
     constraints: &[LitVec],
+    protected_index: usize,
+    decision_budget: u32,
     conflict_budget: u32,
     max_trials: u32,
 ) -> Result<Vec<u32>, HardwareError> {
-    if n_var == 0 || cube.len() < 2 || cube.len() > u32::MAX as usize {
+    if n_var == 0
+        || cube.len() < 2
+        || cube.len() > u32::MAX as usize
+        || protected_index >= cube.len()
+        || protected_index > u16::MAX as usize
+    {
         return Err(HardwareError::InvalidContext);
     }
     let mut constraint_words = 0usize;
@@ -393,8 +512,26 @@ fn pack_mic_chain_request(
     }) {
         return Err(HardwareError::InvalidContext);
     }
+    // Match GipSAT's MIC-local decision domain exactly: next-state cube
+    // variables first, then current-state cube variables, with stable
+    // first-occurrence deduplication.  Sending 0..n_var here lets the FPGA
+    // branch on hundreds of unrelated transition variables and turns the
+    // otherwise short SAT inquiries into long, low-conflict searches.
+    let mut domain = Vec::with_capacity(2 * cube.len());
+    let mut seen = vec![false; n_var as usize];
+    for literal in cube
+        .iter()
+        .map(|(_, next)| *next)
+        .chain(cube.iter().map(|(current, _)| *current))
+    {
+        let var = (u32::from(literal) >> 1) as usize;
+        if !seen[var] {
+            seen[var] = true;
+            domain.push(var as u32);
+        }
+    }
     let payload_words = constraint_words
-        .checked_add(n_var as usize)
+        .checked_add(domain.len())
         .and_then(|words| words.checked_add(2 * cube.len()))
         .ok_or(HardwareError::Capacity)?;
     let total_words = super::cdcl::MIC_HEADER_WORDS
@@ -406,12 +543,17 @@ fn pack_mic_chain_request(
     let header = MicHeader {
         version: ABI_VERSION,
         frame,
-        flags: MIC_PROTECT_LAST
-            | if mic_chain_model_shrink() { MIC_MODEL_SHRINK } else { 0 },
+        flags: MIC_PROTECT_INDEX
+            | ((protected_index as u32) << MIC_PROTECTED_INDEX_SHIFT)
+            | if mic_chain_model_shrink() {
+                MIC_MODEL_SHRINK
+            } else {
+                0
+            },
         n_cube: cube.len() as u32,
         n_constraint_words: constraint_words as u32,
-        n_domain: n_var,
-        decision_budget: 0,
+        n_domain: domain.len() as u32,
+        decision_budget,
         conflict_budget,
         max_trials,
     };
@@ -421,7 +563,7 @@ fn pack_mic_chain_request(
         request.push(clause.len() as u32);
         request.extend(clause.iter().map(|lit| u32::from(*lit)));
     }
-    request.extend(0..n_var);
+    request.extend(domain);
     for &(current, next) in cube {
         request.push(current.into());
         request.push(next.into());
@@ -450,6 +592,8 @@ fn pack_mic_chains_request(
             chain.frame,
             chain.cube,
             chain.constraints,
+            chain.protected_index,
+            chain.decision_budget,
             chain.conflict_budget,
             chain.max_trials,
         )?;
@@ -501,8 +645,7 @@ fn decode_mic_chain_record(
         .get(..MIC_RESPONSE_HEADER_WORDS)
         .and_then(MicResponseHeader::from_words)
         .ok_or(HardwareError::InvalidResponse)?;
-    let n_output = usize::try_from(header.n_output)
-        .map_err(|_| HardwareError::InvalidResponse)?;
+    let n_output = usize::try_from(header.n_output).map_err(|_| HardwareError::InvalidResponse)?;
     let record_words = MIC_RESPONSE_HEADER_WORDS
         .checked_add(n_output)
         .ok_or(HardwareError::InvalidResponse)?;
@@ -519,8 +662,7 @@ fn decode_mic_chain_record(
     {
         return Err(HardwareError::InvalidResponse);
     }
-    let reason = UnknownReason::from_word(header.reason)
-        .ok_or(HardwareError::InvalidResponse)?;
+    let reason = UnknownReason::from_word(header.reason).ok_or(HardwareError::InvalidResponse)?;
     if header.complete == 1 && reason != UnknownReason::None {
         return Err(HardwareError::InvalidResponse);
     }
@@ -537,23 +679,27 @@ fn decode_mic_chain_record(
         next_input += relative + 1;
         decoded.push(Lit::new(Var::from(word >> 1), word & 1 == 0));
     }
-    Ok((MicChainResult {
-        cube: decoded,
-        trials: header.trials,
-        physical_rounds: header.physical_rounds,
-        complete: header.complete == 1,
-        client_ns: 0,
-        context_reused: false,
-        reason,
-        decisions: u64::from(header.decisions),
-        conflicts: u64::from(header.conflicts),
-        propagations: u64::from(header.propagations),
-        learnt_clauses: u64::from(header.learnt_clauses),
-    }, record_words))
+    Ok((
+        MicChainResult {
+            cube: decoded,
+            trials: header.trials,
+            physical_rounds: header.physical_rounds,
+            complete: header.complete == 1,
+            client_ns: 0,
+            context_reused: false,
+            reason,
+            decisions: u64::from(header.decisions),
+            conflicts: u64::from(header.conflicts),
+            propagations: u64::from(header.propagations),
+            learnt_clauses: u64::from(header.learnt_clauses),
+        },
+        record_words,
+    ))
 }
 
 pub struct HardwareCdcl {
     n_var: u32,
+    materialized_frame: Option<u32>,
     last_batch_work: HardwareWork,
     last_batch_records: Vec<HardwareWork>,
     stage_profile: bool,
@@ -600,6 +746,7 @@ impl HardwareCdcl {
             }
             Ok(Self {
                 n_var: 0,
+                materialized_frame: None,
                 last_batch_work: HardwareWork::default(),
                 last_batch_records: Vec::new(),
                 stage_profile: stage_profile_enabled(),
@@ -615,8 +762,7 @@ impl HardwareCdcl {
     /// `INDUCTOR_CDCL_ACCEL` is separate from the older propagation-only
     /// xclbin so an incompatible bitstream cannot be selected accidentally.
     pub fn open_from_env() -> Result<Self, HardwareError> {
-        let path = std::env::var("INDUCTOR_CDCL_ACCEL")
-            .map_err(|_| HardwareError::Unavailable)?;
+        let path = std::env::var("INDUCTOR_CDCL_ACCEL").map_err(|_| HardwareError::Unavailable)?;
         Self::open(&path)
     }
 
@@ -632,9 +778,11 @@ impl HardwareCdcl {
         {
             let rc = unsafe { ind_cdcl_load_context(words.as_ptr(), words.len() as u32) };
             if rc != 0 {
+                self.materialized_frame = None;
                 return Err(HardwareError::Command(rc));
             }
             self.n_var = n_var;
+            self.materialized_frame = None;
             Ok(())
         }
         #[cfg(not(has_cdcl_accel))]
@@ -647,22 +795,16 @@ impl HardwareCdcl {
     /// Load the transition CNF and current frame lemmas from a real GipSAT
     /// instance. Learnts remain backend-local and temporary constraints remain
     /// query-local, matching `DagCnfSolver::incremental_resident_snapshot`.
-    pub fn load_solver_context(
-        &mut self,
-        solver: &DagCnfSolver,
-    ) -> Result<(), HardwareError> {
-        let (n_var, frame, snapshot) = solver.incremental_resident_snapshot();
+    pub fn load_solver_context(&mut self, solver: &DagCnfSolver) -> Result<(), HardwareError> {
+        let (n_var, _frame, snapshot) = solver.incremental_resident_snapshot();
         let clauses: Vec<_> = snapshot
             .into_iter()
-            .map(|literals| ResidentClause::new(frame, frame, literals))
+            .map(|literals| ResidentClause::new(0, u32::MAX, literals))
             .collect();
         self.load_context(n_var, &clauses)
     }
 
-    pub fn add_frame_clauses(
-        &mut self,
-        clauses: &[ResidentClause],
-    ) -> Result<(), HardwareError> {
+    pub fn add_frame_clauses(&mut self, clauses: &[ResidentClause]) -> Result<(), HardwareError> {
         if self.n_var == 0 {
             return Err(HardwareError::InvalidContext);
         }
@@ -670,17 +812,46 @@ impl HardwareCdcl {
         let words = pack_clauses(&[n_clause], self.n_var, clauses)?;
         #[cfg(has_cdcl_accel)]
         {
-            let rc = unsafe {
-                ind_cdcl_add_frame_clauses(words.as_ptr(), words.len() as u32)
-            };
+            let rc = unsafe { ind_cdcl_add_frame_clauses(words.as_ptr(), words.len() as u32) };
             if rc != 0 {
+                self.materialized_frame = None;
                 return Err(HardwareError::Command(rc));
             }
+            // The device adds the resident suffix to its range-checked delta
+            // occurrence overlay.  An already materialized frame therefore
+            // remains valid; periodic overlay merges rematerialize that same
+            // frame inside the append command.
             Ok(())
         }
         #[cfg(not(has_cdcl_accel))]
         {
             let _ = words;
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    /// Rebuild the hot occurrence view for one resident frame. Queries still
+    /// perform the same check on device, so this is a timing/accounting split,
+    /// not a semantic dependency on host state.
+    pub fn materialize_frame(&mut self, frame: u32) -> Result<bool, HardwareError> {
+        if self.n_var == 0 {
+            return Err(HardwareError::InvalidContext);
+        }
+        if self.materialized_frame == Some(frame) {
+            return Ok(false);
+        }
+        #[cfg(has_cdcl_accel)]
+        {
+            let rc = unsafe { ind_cdcl_materialize_frame(frame) };
+            if rc != 0 {
+                return Err(HardwareError::Command(rc));
+            }
+            self.materialized_frame = Some(frame);
+            Ok(true)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = frame;
             Err(HardwareError::Unavailable)
         }
     }
@@ -724,6 +895,10 @@ impl HardwareCdcl {
                 return Err(HardwareError::Capacity);
             }
             response.truncate(out_words);
+            // Lane zero may now hold the last frame assigned by the batch.
+            // Do not let a later explicit MIC materialization rely on stale
+            // host-side knowledge of the on-card hot view.
+            self.materialized_frame = None;
             self.decode_batch_response(queries, &response)
         }
         #[cfg(not(has_cdcl_accel))]
@@ -741,6 +916,8 @@ impl HardwareCdcl {
         frame: u32,
         cube: &[(Lit, Lit)],
         constraints: &[LitVec],
+        protected_index: usize,
+        decision_budget: u32,
         conflict_budget: u32,
         max_trials: u32,
     ) -> Result<MicChainResult, HardwareError> {
@@ -752,6 +929,8 @@ impl HardwareCdcl {
             frame,
             cube,
             constraints,
+            protected_index,
+            decision_budget,
             conflict_budget,
             max_trials,
         )?;
@@ -777,6 +956,7 @@ impl HardwareCdcl {
                 )
             };
             if rc != 0 {
+                self.materialized_frame = None;
                 return Err(HardwareError::Command(rc));
             }
             let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
@@ -787,6 +967,91 @@ impl HardwareCdcl {
             if record_words != out_words {
                 return Err(HardwareError::InvalidResponse);
             }
+            self.materialized_frame = Some(frame);
+            Ok(result)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, response_capacity_u32, response);
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    /// Atomically append the next resident lemma suffix and execute the
+    /// immediately following dependent MIC traversal in one XRT submission.
+    /// The device validates both payloads before committing the append, and
+    /// the MIC command itself selects/materializes `frame` when necessary.
+    pub fn append_and_solve_mic_chain(
+        &mut self,
+        clauses: &[ResidentClause],
+        frame: u32,
+        cube: &[(Lit, Lit)],
+        constraints: &[LitVec],
+        protected_index: usize,
+        decision_budget: u32,
+        conflict_budget: u32,
+        max_trials: u32,
+    ) -> Result<MicChainResult, HardwareError> {
+        if self.n_var == 0 || clauses.is_empty() {
+            return Err(HardwareError::InvalidContext);
+        }
+        let n_clause = u32::try_from(clauses.len()).map_err(|_| HardwareError::Capacity)?;
+        let append = pack_clauses(&[n_clause], self.n_var, clauses)?;
+        let append_words = u32::try_from(append.len()).map_err(|_| HardwareError::Capacity)?;
+        let mic = pack_mic_chain_request(
+            self.n_var,
+            frame,
+            cube,
+            constraints,
+            protected_index,
+            decision_budget,
+            conflict_budget,
+            max_trials,
+        )?;
+        let request_words = 1usize
+            .checked_add(append.len())
+            .and_then(|words| words.checked_add(mic.len()))
+            .ok_or(HardwareError::Capacity)?;
+        u32::try_from(request_words).map_err(|_| HardwareError::Capacity)?;
+        let mut request = Vec::with_capacity(request_words);
+        request.push(append_words);
+        request.extend(append);
+        request.extend(mic);
+
+        let response_capacity = MIC_RESPONSE_HEADER_WORDS
+            .checked_add(cube.len())
+            .ok_or(HardwareError::Capacity)?;
+        let response_capacity_u32 =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        let mut response = vec![0u32; response_capacity];
+        #[cfg(not(has_cdcl_accel))]
+        let response = vec![0u32; response_capacity];
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_append_and_solve_mic_chain(
+                    request.as_ptr(),
+                    request.len() as u32,
+                    response.as_mut_ptr(),
+                    response_capacity_u32,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                self.materialized_frame = None;
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() {
+                return Err(HardwareError::Capacity);
+            }
+            let (result, record_words) = decode_mic_chain_record(cube, &response[..out_words])?;
+            if record_words != out_words {
+                return Err(HardwareError::InvalidResponse);
+            }
+            self.materialized_frame = Some(frame);
             Ok(result)
         }
         #[cfg(not(has_cdcl_accel))]
@@ -806,8 +1071,7 @@ impl HardwareCdcl {
         if self.n_var == 0 {
             return Err(HardwareError::InvalidContext);
         }
-        let (request, response_capacity) =
-            pack_mic_chains_request(self.n_var, chains)?;
+        let (request, response_capacity) = pack_mic_chains_request(self.n_var, chains)?;
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
         #[cfg(has_cdcl_accel)]
@@ -827,31 +1091,27 @@ impl HardwareCdcl {
                 )
             };
             if rc != 0 {
+                self.materialized_frame = None;
                 return Err(HardwareError::Command(rc));
             }
-            let out_words = usize::try_from(out_words)
-                .map_err(|_| HardwareError::Capacity)?;
-            if out_words > response.len()
-                || out_words < MIC_BATCH_RESPONSE_HEADER_WORDS
-            {
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() || out_words < MIC_BATCH_RESPONSE_HEADER_WORDS {
                 return Err(HardwareError::InvalidResponse);
             }
             let prefix = &response[..MIC_BATCH_RESPONSE_HEADER_WORDS];
-            let result_words = usize::try_from(prefix[2])
-                .map_err(|_| HardwareError::InvalidResponse)?;
+            let result_words =
+                usize::try_from(prefix[2]).map_err(|_| HardwareError::InvalidResponse)?;
             if prefix[0] != ABI_VERSION
                 || usize::try_from(prefix[1]).ok() != Some(chains.len())
                 || prefix[3] != 0
-                || MIC_BATCH_RESPONSE_HEADER_WORDS.checked_add(result_words)
-                    != Some(out_words)
+                || MIC_BATCH_RESPONSE_HEADER_WORDS.checked_add(result_words) != Some(out_words)
             {
                 return Err(HardwareError::InvalidResponse);
             }
             let mut results = Vec::with_capacity(chains.len());
             let mut at = MIC_BATCH_RESPONSE_HEADER_WORDS;
             for (chain_index, chain) in chains.iter().enumerate() {
-                let decoded =
-                    decode_mic_chain_record(chain.cube, &response[at..out_words]);
+                let decoded = decode_mic_chain_record(chain.cube, &response[at..out_words]);
                 let (result, words) = decoded.map_err(|error| {
                     let header_end = at
                         .saturating_add(MIC_RESPONSE_HEADER_WORDS)
@@ -865,11 +1125,14 @@ impl HardwareCdcl {
                     error
                 })?;
                 results.push(result);
-                at = at.checked_add(words).ok_or(HardwareError::InvalidResponse)?;
+                at = at
+                    .checked_add(words)
+                    .ok_or(HardwareError::InvalidResponse)?;
             }
             if at != out_words {
                 return Err(HardwareError::InvalidResponse);
             }
+            self.materialized_frame = chains.first().map(|chain| chain.frame);
             Ok(results)
         }
         #[cfg(not(has_cdcl_accel))]
@@ -891,9 +1154,7 @@ impl HardwareCdcl {
         self.last_batch_work = HardwareWork::default();
         self.last_batch_records.clear();
         let (request, response_capacity) =
-            pack_load_context_and_batch_request(
-                n_var, clauses, queries, self.stage_profile,
-            )?;
+            pack_load_context_and_batch_request(n_var, clauses, queries, self.stage_profile)?;
         profile_resident_context(n_var, clauses);
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
@@ -923,6 +1184,7 @@ impl HardwareCdcl {
             response.truncate(out_words);
             let results = self.decode_batch_response(queries, &response)?;
             self.n_var = n_var;
+            self.materialized_frame = None;
             Ok(results)
         }
         #[cfg(not(has_cdcl_accel))]
@@ -1005,11 +1267,14 @@ enum ShadowContextScope {
     /// Transition clauses are shared across all frames and every remaining
     /// clause is active only at this exact frame.
     ExactFrame(u32),
+    /// One append-only formula contains permanent clauses and exact IC3 lemma
+    /// validity intervals; the query header selects the active frame on chip.
+    FrameRanged,
 }
 
-/// Exact physical context currently resident on the FPGA. Incremental updates
-/// are kept within one frame: retaining inactive clauses from many frames is
-/// logically valid, but bloats the occurrence lists that every BCP scans.
+/// Exact physical context currently resident on the FPGA. FrameRanged mode is
+/// indexed on chip so expired frame buckets can be skipped without replacing
+/// the physical clause store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedContext {
     n_var: u32,
@@ -1039,10 +1304,7 @@ enum ContextUpdate {
 /// needs an exact reload. This is deliberately strict: any transition change,
 /// frame change, lemma deletion/reordering, or unexpected clause range forces
 /// a reload.
-fn plan_context_update(
-    loaded: Option<&LoadedContext>,
-    target: &ShadowContext,
-) -> ContextUpdate {
+fn plan_context_update(loaded: Option<&LoadedContext>, target: &ShadowContext) -> ContextUpdate {
     let Some(loaded) = loaded else {
         return ContextUpdate::Reload;
     };
@@ -1055,6 +1317,20 @@ fn plan_context_update(
         } else {
             ContextUpdate::Reload
         };
+    }
+    if target.scope == ShadowContextScope::FrameRanged {
+        if loaded.scope != ShadowContextScope::FrameRanged {
+            return ContextUpdate::Reload;
+        }
+        if target.clauses.starts_with(&loaded.clauses) {
+            let delta = target.clauses[loaded.clauses.len()..].to_vec();
+            return if delta.is_empty() {
+                ContextUpdate::Ready
+            } else {
+                ContextUpdate::Append(delta)
+            };
+        }
+        return ContextUpdate::Reload;
     }
     let ShadowContextScope::ExactFrame(frame) = target.scope else {
         unreachable!();
@@ -1072,11 +1348,9 @@ fn plan_context_update(
         return ContextUpdate::Reload;
     }
     if target.clauses.iter().any(|clause| {
-        !(clause.lo == 0 && clause.hi == u32::MAX)
-            && !(clause.lo == frame && clause.hi == frame)
+        !(clause.lo == 0 && clause.hi == u32::MAX) && !(clause.lo == frame && clause.hi == frame)
     }) || loaded.clauses.iter().any(|clause| {
-        !(clause.lo == 0 && clause.hi == u32::MAX)
-            && !(clause.lo == frame && clause.hi == frame)
+        !(clause.lo == 0 && clause.hi == u32::MAX) && !(clause.lo == frame && clause.hi == frame)
     }) {
         return ContextUpdate::Reload;
     }
@@ -1309,6 +1583,14 @@ static ACTIVE_MIC_CHAIN_COMPLETE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_PARTIAL: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_ERRORS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MIC_CHAIN_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_FUSED_APPEND_MIC_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_FUSED_APPEND_MIC_CLAUSES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_FUSED_APPEND_MIC_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_FUSED_APPEND_MIC_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_FRAME_MATERIALIZATIONS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_FRAME_MATERIALIZE_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_FRAME_MATERIALIZE_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MIC_CHAIN_PROPAGATIONS: AtomicU64 = AtomicU64::new(0);
@@ -1333,9 +1615,18 @@ static ACTIVE_INIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_APPEND_NS: AtomicU64 = AtomicU64::new(0);
+// Direct-XRT kernel intervals are recorded separately from the end-to-end
+// command timers above.  This keeps DMA/packing/lock time out of the FPGA
+// occupancy numerator and makes resident maintenance directly comparable with
+// useful CDCL execution. RPC mode reports zero because the kernel is owned by
+// the server process.
+static ACTIVE_CONTEXT_LOAD_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CONTEXT_APPEND_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_COMBINED_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_FALLBACK_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCH_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BATCH_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNSAT_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_HW_DECISIONS: AtomicU64 = AtomicU64::new(0);
@@ -1379,9 +1670,8 @@ static PAIRED_PREFLIGHT_SELECTED: AtomicU64 = AtomicU64::new(0);
 static PAIRED_PREFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_PREFLIGHT_CLONE_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_PREFLIGHT_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
-static PAIRED_WRITER: std::sync::OnceLock<
-    Option<std::sync::Mutex<BufWriter<std::fs::File>>>,
-> = std::sync::OnceLock::new();
+static PAIRED_WRITER: std::sync::OnceLock<Option<std::sync::Mutex<BufWriter<std::fs::File>>>> =
+    std::sync::OnceLock::new();
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_ZERO_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CONFLICT_0: AtomicU64 = AtomicU64::new(0);
@@ -1559,7 +1849,9 @@ fn profile_hardware_batch(queries: &[IncrementalQuery], work: &[HardwareWork]) {
     }
     for (batch_index, (query, work)) in queries.iter().zip(work).enumerate() {
         let assumptions = query.assumptions.len() as u64;
-        let constraint_literals = query.constraints.iter()
+        let constraint_literals = query
+            .constraints
+            .iter()
             .map(|clause| clause.len() as u64)
             .sum::<u64>();
         let domain = query.domain.len() as u64;
@@ -1579,7 +1871,8 @@ fn profile_hardware_batch(queries: &[IncrementalQuery], work: &[HardwareWork]) {
             2..=3 => &PROFILE_CONFLICT_2_3,
             4..=15 => &PROFILE_CONFLICT_4_15,
             _ => &PROFILE_CONFLICT_16_PLUS,
-        }.fetch_add(1, Ordering::Relaxed);
+        }
+        .fetch_add(1, Ordering::Relaxed);
         if work.status == Status::Unknown as u32 {
             PROFILE_UNKNOWN.fetch_add(1, Ordering::Relaxed);
             match work.reason {
@@ -1768,8 +2061,8 @@ fn representative_sample_positions(n_candidates: usize, n_sample: usize) -> Vec<
     // the arithmetic defined even for an adversarially large host vector.
     (0..n_sample)
         .map(|sample| {
-            (((2u128 * sample as u128 + 1) * n_candidates as u128)
-                / (2u128 * n_sample as u128)) as usize
+            (((2u128 * sample as u128 + 1) * n_candidates as u128) / (2u128 * n_sample as u128))
+                as usize
         })
         .collect()
 }
@@ -1792,9 +2085,8 @@ fn sample_keeps_fpga(
     else {
         return false;
     };
-    let aggregate_profitable = min_batch_cpu_ns.is_some_and(|minimum| {
-        representative_ns.saturating_mul(n_remaining as u64) >= minimum
-    });
+    let aggregate_profitable = min_batch_cpu_ns
+        .is_some_and(|minimum| representative_ns.saturating_mul(n_remaining as u64) >= minimum);
     all_conclusive
         && n_remaining >= min_batch
         && (representative_ns >= min_cpu_ns || aggregate_profitable)
@@ -1871,7 +2163,7 @@ pub fn active_sample_select_pass(
     }
 
     let plan_start = std::time::Instant::now();
-    let prefer_query_lemmas = !active_resident_lemmas();
+    let prefer_query_lemmas = !(active_resident_lemmas() || active_frame_ranges());
     let mut caches = Vec::new();
     let mut groups: Vec<SampleGroup> = Vec::new();
     for (index, ((solver, query), decision)) in
@@ -1888,7 +2180,10 @@ pub fn active_sample_select_pass(
             ACTIVE_SAMPLE_UNDERSIZED_REJECTED.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        if words.checked_add(4).is_none_or(|total| total > KERNEL_MAX_REQUEST_WORDS) {
+        if words
+            .checked_add(4)
+            .is_none_or(|total| total > KERNEL_MAX_REQUEST_WORDS)
+        {
             *decision = ActivePreflight::CpuFallback;
             ACTIVE_SAMPLE_UNDERSIZED_REJECTED.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -1920,8 +2215,7 @@ pub fn active_sample_select_pass(
             continue;
         }
 
-        let sample_positions =
-            representative_sample_positions(group.candidates.len(), n_sample);
+        let sample_positions = representative_sample_positions(group.candidates.len(), n_sample);
         let mut sampled = vec![false; group.candidates.len()];
         let mut sample_ns = 0u64;
         let mut sample_clone_ns = 0u64;
@@ -2009,8 +2303,7 @@ pub fn active_sample_select_pass(
 /// observable query class packs into profitable FPGA batches without changing
 /// the result used by IC3. Production active mode intentionally ignores it.
 fn paired_static_selected(query: &IncrementalQuery) -> bool {
-    query.frame >= paired_min_frame()
-        && query.assumptions.len() <= paired_max_assumptions()
+    query.frame >= paired_min_frame() && query.assumptions.len() <= paired_max_assumptions()
 }
 
 fn pair_scheduler_enabled() -> bool {
@@ -2038,6 +2331,15 @@ fn active_resident_lemmas() -> bool {
     })
 }
 
+fn active_frame_ranges() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_FRAME_RANGES")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
 fn query_lemma_word_limit() -> usize {
     static WORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WORDS.get_or_init(|| {
@@ -2059,12 +2361,9 @@ fn query_lemma_word_limit() -> usize {
 /// variables may participate in decision selection. The score is only used to
 /// pair independent inquiries; it cannot change their formula or answer.
 fn query_work_score(query: &IncrementalQuery) -> u64 {
-    let constraint_literals = query
-        .constraints
-        .iter()
-        .fold(0u64, |total, clause| {
-            total.saturating_add(clause.len() as u64)
-        });
+    let constraint_literals = query.constraints.iter().fold(0u64, |total, clause| {
+        total.saturating_add(clause.len() as u64)
+    });
     (query.assumptions.len() as u64)
         .saturating_mul(16)
         .saturating_add(constraint_literals.saturating_mul(4))
@@ -2075,19 +2374,15 @@ fn query_work_score(query: &IncrementalQuery) -> u64 {
 /// estimates together minimizes the sum of pair maxima for a fixed set of
 /// scores. The caller keeps an original index alongside each active query and
 /// restores result order after the FPGA returns.
-fn schedule_query_pairs<T>(
-    pending: &mut [T],
-    query_of: impl Fn(&T) -> &IncrementalQuery,
-) {
-    pending.sort_by_cached_key(|item| {
-        std::cmp::Reverse(query_work_score(query_of(item)))
-    });
+fn schedule_query_pairs<T>(pending: &mut [T], query_of: impl Fn(&T) -> &IncrementalQuery) {
+    pending.sort_by_cached_key(|item| std::cmp::Reverse(query_work_score(query_of(item))));
 }
 
 fn query_request_words(query: &IncrementalQuery) -> Option<usize> {
-    let constraints = query.constraints.iter().try_fold(0usize, |words, clause| {
-        words.checked_add(1 + clause.len())
-    })?;
+    let constraints = query
+        .constraints
+        .iter()
+        .try_fold(0usize, |words, clause| words.checked_add(1 + clause.len()))?;
     8usize
         .checked_add(query.assumptions.len())?
         .checked_add(constraints)?
@@ -2175,6 +2470,7 @@ struct BatchedSolverContext {
     lemma_words: usize,
     shared: Option<ShadowContext>,
     exact: Option<ShadowContext>,
+    ranged: Option<ShadowContext>,
 }
 
 impl BatchedSolverContext {
@@ -2192,6 +2488,7 @@ impl BatchedSolverContext {
             lemma_words,
             shared: None,
             exact: None,
+            ranged: None,
         }
     }
 
@@ -2241,6 +2538,29 @@ impl BatchedSolverContext {
                     .collect(),
                 scope: ShadowContextScope::SharedTransition,
             })
+        } else if active_frame_ranges() {
+            if let Some(context) = frame_ranged_context(self.n_var, &self.trans) {
+                // Refresh because IC3 can append a ranged lemma after this
+                // per-pass solver cache was built.
+                self.ranged = Some(context);
+                return self.ranged.as_ref().unwrap();
+            }
+            self.exact.get_or_insert_with(|| ShadowContext {
+                n_var: self.n_var,
+                clauses: self
+                    .trans
+                    .iter()
+                    .cloned()
+                    .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+                    .chain(
+                        self.lemmas
+                            .iter()
+                            .cloned()
+                            .map(|literals| ResidentClause::new(0, u32::MAX, literals)),
+                    )
+                    .collect(),
+                scope: ShadowContextScope::ExactFrame(self.frame),
+            })
         } else {
             self.exact.get_or_insert_with(|| ShadowContext {
                 n_var: self.n_var,
@@ -2253,9 +2573,7 @@ impl BatchedSolverContext {
                         self.lemmas
                             .iter()
                             .cloned()
-                            .map(|literals| {
-                                ResidentClause::new(self.frame, self.frame, literals)
-                            }),
+                            .map(|literals| ResidentClause::new(0, u32::MAX, literals)),
                     )
                     .collect(),
                 scope: ShadowContextScope::ExactFrame(self.frame),
@@ -2295,8 +2613,7 @@ fn prepare_batched_query(
         let fits = query_request_words(&query)
             .and_then(|words| words.checked_add(4))
             .is_some_and(|words| {
-                words <= KERNEL_MAX_REQUEST_WORDS
-                    && words <= query_lemma_word_limit()
+                words <= KERNEL_MAX_REQUEST_WORDS && words <= query_lemma_word_limit()
             });
         if fits {
             let clauses = trans
@@ -2316,13 +2633,17 @@ fn prepare_batched_query(
         query.constraints.truncate(n_existing_constraints);
     }
 
+    if let Some(context) = frame_ranged_context(n_var, &trans) {
+        return (context, query, false);
+    }
+
     let clauses = trans
         .into_iter()
         .map(|literals| ResidentClause::new(0, u32::MAX, literals))
         .chain(
             lemmas
                 .into_iter()
-                .map(|literals| ResidentClause::new(frame, frame, literals)),
+                .map(|literals| ResidentClause::new(0, u32::MAX, literals)),
         )
         .collect();
     (
@@ -2571,11 +2892,8 @@ fn record_comparison_batch(
         .map(|clause| clause.literals.len() as u64)
         .sum::<u64>();
     let init_ns = ACTIVE_INIT_NS.load(Ordering::Relaxed);
-    for (position, (((index, _), query), work)) in pending
-        .iter()
-        .zip(queries)
-        .zip(hardware)
-        .enumerate()
+    for (position, (((index, _), query), work)) in
+        pending.iter().zip(queries).zip(hardware).enumerate()
     {
         let Some(cpu_work) = cpu.get(*index) else {
             continue;
@@ -2836,6 +3154,16 @@ fn mic_chain_conflict_budget() -> u32 {
     })
 }
 
+fn mic_chain_decision_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_MIC_CHAIN_DECISION_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn mic_chain_max_trials() -> u32 {
     static TRIALS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *TRIALS.get_or_init(|| {
@@ -2953,7 +3281,11 @@ fn flush_batch_locked(state: &mut ShadowState, batch_index: usize) {
         SHADOW_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
         state.loaded_context = Some(batch.context.clone());
     }
-    let queries: Vec<_> = batch.pending.iter().map(|(query, _)| query.clone()).collect();
+    let queries: Vec<_> = batch
+        .pending
+        .iter()
+        .map(|(query, _)| query.clone())
+        .collect();
     let cpu: Vec<_> = batch.pending.iter().map(|(_, result)| *result).collect();
     SHADOW_BATCHES.fetch_add(1, Ordering::Relaxed);
     let result = state
@@ -3024,14 +3356,13 @@ pub fn solve_active_mic_chain(
     solver: &DagCnfSolver,
     cube: &[(Lit, Lit)],
     constraints: &[LitVec],
-    protected_suffix: usize,
+    protected_index: usize,
 ) -> Option<MicChainResult> {
     let client_started = std::time::Instant::now();
     if !mic_chain_enabled()
         || cube.len() < mic_chain_min_cube()
         || cube.len() > mic_chain_max_cube()
-        || protected_suffix == 0
-        || protected_suffix >= cube.len()
+        || protected_index >= cube.len()
     {
         return None;
     }
@@ -3042,8 +3373,10 @@ pub fn solve_active_mic_chain(
     }
     let mut cache = BatchedSolverContext::new(solver);
     let context = cache.context(false).clone();
-    let ShadowContextScope::ExactFrame(frame) = context.scope else {
-        return None;
+    let frame = match context.scope {
+        ShadowContextScope::ExactFrame(frame) => frame,
+        ShadowContextScope::FrameRanged => solver.accel_level,
+        ShadowContextScope::SharedTransition => return None,
     };
 
     let wait_start = std::time::Instant::now();
@@ -3060,37 +3393,60 @@ pub fn solve_active_mic_chain(
     let update = plan_context_update(state.loaded_context.as_ref(), &context);
     let context_reused = update != ContextUpdate::Reload;
     let mut ready = update == ContextUpdate::Ready;
+    let mut fused_append_clauses = None;
     if let ContextUpdate::Append(clauses) = update {
-        let started = std::time::Instant::now();
-        let appended = state
-            .hardware
-            .as_mut()
-            .ok_or(HardwareError::Unavailable)
-            .and_then(|hardware| hardware.add_frame_clauses(&clauses));
-        let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        ACTIVE_CONTEXT_APPEND_NS.fetch_add(elapsed, Ordering::Relaxed);
-        match appended {
-            Ok(()) => {
-                ACTIVE_CONTEXT_APPENDS.fetch_add(1, Ordering::Relaxed);
-                ACTIVE_CONTEXT_APPEND_CLAUSES.fetch_add(clauses.len() as u64, Ordering::Relaxed);
-                if let Some(loaded) = state.loaded_context.as_mut() {
-                    loaded.clauses.extend(clauses);
-                    ready = true;
+        // The production traversal is one order-dependent chain. Fuse its
+        // monotonic resident append with the immediately following MIC so the
+        // hundreds of tiny lemma updates do not each pay an XRT submission.
+        // Explicit reordered multi-chain experiments retain the standalone
+        // append path because command 8 deliberately preserves one chain's
+        // exact caller order.
+        if !mic_chain_experimental_reorder() {
+            ready = true;
+            fused_append_clauses = Some(clauses);
+        } else {
+            let started = std::time::Instant::now();
+            let kernel_before = direct_kernel_ns();
+            let appended = state
+                .hardware
+                .as_mut()
+                .ok_or(HardwareError::Unavailable)
+                .and_then(|hardware| hardware.add_frame_clauses(&clauses));
+            ACTIVE_CONTEXT_APPEND_KERNEL_NS.fetch_add(
+                direct_kernel_ns().saturating_sub(kernel_before),
+                Ordering::Relaxed,
+            );
+            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            ACTIVE_CONTEXT_APPEND_NS.fetch_add(elapsed, Ordering::Relaxed);
+            match appended {
+                Ok(()) => {
+                    ACTIVE_CONTEXT_APPENDS.fetch_add(1, Ordering::Relaxed);
+                    ACTIVE_CONTEXT_APPEND_CLAUSES
+                        .fetch_add(clauses.len() as u64, Ordering::Relaxed);
+                    if let Some(loaded) = state.loaded_context.as_mut() {
+                        loaded.clauses.extend(clauses);
+                        ready = true;
+                    }
                 }
-            }
-            Err(_) => {
-                ACTIVE_CONTEXT_APPEND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                state.loaded_context = None;
+                Err(_) => {
+                    ACTIVE_CONTEXT_APPEND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    state.loaded_context = None;
+                }
             }
         }
     }
     if !ready {
         let started = std::time::Instant::now();
+        let kernel_before = direct_kernel_ns();
         let loaded = state
             .hardware
             .as_mut()
             .ok_or(HardwareError::Unavailable)
             .and_then(|hardware| hardware.load_context(context.n_var, &context.clauses));
+        ACTIVE_CONTEXT_LOAD_KERNEL_NS.fetch_add(
+            direct_kernel_ns().saturating_sub(kernel_before),
+            Ordering::Relaxed,
+        );
         let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         ACTIVE_CONTEXT_LOAD_NS.fetch_add(elapsed, Ordering::Relaxed);
         if loaded.is_err() {
@@ -3102,11 +3458,45 @@ pub fn solve_active_mic_chain(
         state.loaded_context = Some(LoadedContext::from(&context));
     }
 
-    // Literals in the protected suffix are part of every device inquiry but
-    // are never themselves drop candidates. `max_trials` counts completed
-    // candidates even as UNSAT drops compact the cube, so placing the suffix
-    // last makes this work without another command-5 ABI revision.
-    let eligible_trials = (cube.len() - protected_suffix) as u32;
+    // Select the active frame in a separate device command. The query retains
+    // an on-card guard and would materialize automatically if this call were
+    // ever omitted, but the split prevents frame maintenance from being
+    // mislabeled as useful MIC/CDCL occupancy.
+    if fused_append_clauses.is_none() {
+        let materialize_started = std::time::Instant::now();
+        let materialize_kernel_before = direct_kernel_ns();
+        let materialized = state
+            .hardware
+            .as_mut()
+            .ok_or(HardwareError::Unavailable)
+            .and_then(|hardware| hardware.materialize_frame(frame));
+        let materialize_kernel_ns = direct_kernel_ns().saturating_sub(materialize_kernel_before);
+        let materialize_service_ns = materialize_started
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        match materialized {
+            Ok(true) => {
+                ACTIVE_FRAME_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+                ACTIVE_FRAME_MATERIALIZE_KERNEL_NS
+                    .fetch_add(materialize_kernel_ns, Ordering::Relaxed);
+                ACTIVE_FRAME_MATERIALIZE_SERVICE_NS
+                    .fetch_add(materialize_service_ns, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("inductor-cdcl: frame materialization failed: {error}");
+                state.loaded_context = None;
+                ACTIVE_MIC_CHAIN_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+    }
+
+    // The Init guard stays at its original position. The ABI carries its index
+    // in the flag word and the kernel skips that one drop in place, preserving
+    // GipSAT's existing literal order and proof path.
+    let eligible_trials = (cube.len() - 1) as u32;
     let configured_trials = mic_chain_max_trials();
     let max_trials = if configured_trials == 0 {
         eligible_trials
@@ -3114,6 +3504,7 @@ pub fn solve_active_mic_chain(
         configured_trials.min(eligible_trials)
     };
     let started = std::time::Instant::now();
+    let kernel_before = direct_kernel_ns();
     // Rotating the literal order explores different, independently sound MIC
     // traversals, but it changes IC3's proof path and therefore cannot be used
     // to claim stable hardware speedup. It also exposed a model-guided 3/4-lane
@@ -3132,11 +3523,25 @@ pub fn solve_active_mic_chain(
         .as_mut()
         .ok_or(HardwareError::Unavailable)
         .and_then(|hardware| {
-            if parallel_lanes == 1 || protected_suffix != 1 {
+            if parallel_lanes == 1 {
+                if let Some(clauses) = fused_append_clauses.as_deref() {
+                    return hardware.append_and_solve_mic_chain(
+                        clauses,
+                        frame,
+                        cube,
+                        constraints,
+                        protected_index,
+                        mic_chain_decision_budget(),
+                        mic_chain_conflict_budget(),
+                        max_trials,
+                    );
+                }
                 return hardware.solve_mic_chain(
                     frame,
                     cube,
                     constraints,
+                    protected_index,
+                    mic_chain_decision_budget(),
                     mic_chain_conflict_budget(),
                     max_trials,
                 );
@@ -3144,14 +3549,16 @@ pub fn solve_active_mic_chain(
 
             // The model-guided chain is order dependent. Launch rotated
             // prefix orders on fixed lanes while leaving the protected Init
-            // suffix last. Every returned cube is independently proved by its
+            // literal at its original index. Every returned cube is independently proved by its
             // own chain; choosing the smallest result is therefore a search
             // policy, not a vote or CPU replay.
-            let eligible = cube.len() - protected_suffix;
+            let eligible = cube.len() - 1;
             let mut lane_cubes = Vec::with_capacity(parallel_lanes);
             for lane in 0..parallel_lanes {
                 let mut reordered = cube.to_vec();
-                reordered[..eligible].rotate_left(lane * eligible / parallel_lanes);
+                let protected = reordered.remove(protected_index);
+                reordered.rotate_left(lane * eligible / parallel_lanes);
+                reordered.insert(protected_index, protected);
                 lane_cubes.push(reordered);
             }
             let queries: Vec<_> = lane_cubes
@@ -3160,6 +3567,8 @@ pub fn solve_active_mic_chain(
                     frame,
                     cube: lane_cube,
                     constraints,
+                    protected_index,
+                    decision_budget: mic_chain_decision_budget(),
                     conflict_budget: mic_chain_conflict_budget(),
                     max_trials,
                 })
@@ -3177,8 +3586,11 @@ pub fn solve_active_mic_chain(
                 let mut selected = results
                     .into_iter()
                     .min_by_key(|result| {
-                        (u8::from(!result.complete), result.cube.len(),
-                         u32::MAX - result.trials)
+                        (
+                            u8::from(!result.complete),
+                            result.cube.len(),
+                            u32::MAX - result.trials,
+                        )
                     })
                     .ok_or(HardwareError::InvalidResponse)?;
                 // Work counters describe the whole device command, while the
@@ -3192,7 +3604,29 @@ pub fn solve_active_mic_chain(
             })
         });
     let service_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-    ACTIVE_MIC_CHAIN_SERVICE_NS.fetch_add(service_ns, Ordering::Relaxed);
+    // Read the direct-XRT command interval while the active-state lock still
+    // excludes another hardware command. RPC mode deliberately reports zero:
+    // its kernel lives in the server process and cannot be inferred from
+    // client wall time.
+    let kernel_elapsed_ns = direct_kernel_ns().saturating_sub(kernel_before);
+    if let Some(clauses) = fused_append_clauses.as_ref() {
+        ACTIVE_FUSED_APPEND_MIC_COMMANDS.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_FUSED_APPEND_MIC_CLAUSES.fetch_add(clauses.len() as u64, Ordering::Relaxed);
+        ACTIVE_FUSED_APPEND_MIC_KERNEL_NS.fetch_add(kernel_elapsed_ns, Ordering::Relaxed);
+        ACTIVE_FUSED_APPEND_MIC_SERVICE_NS.fetch_add(service_ns, Ordering::Relaxed);
+        if result.is_ok() {
+            ACTIVE_CONTEXT_APPENDS.fetch_add(1, Ordering::Relaxed);
+            ACTIVE_CONTEXT_APPEND_CLAUSES.fetch_add(clauses.len() as u64, Ordering::Relaxed);
+            if let Some(loaded) = state.loaded_context.as_mut() {
+                loaded.clauses.extend(clauses.iter().cloned());
+            }
+        } else {
+            ACTIVE_CONTEXT_APPEND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        ACTIVE_MIC_CHAIN_KERNEL_NS.fetch_add(kernel_elapsed_ns, Ordering::Relaxed);
+        ACTIVE_MIC_CHAIN_SERVICE_NS.fetch_add(service_ns, Ordering::Relaxed);
+    }
     match result {
         Ok(mut result) => {
             // The kernel reports a max-trials stop as partial. When the limit
@@ -3213,10 +3647,8 @@ pub fn solve_active_mic_chain(
             ACTIVE_MIC_CHAIN_INPUT_LITS.fetch_add(cube.len() as u64, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_OUTPUT_LITS.fetch_add(result.cube.len() as u64, Ordering::Relaxed);
             ACTIVE_MIC_CHAIN_TRIALS.fetch_add(u64::from(result.trials), Ordering::Relaxed);
-            ACTIVE_MIC_CHAIN_PHYSICAL_ROUNDS.fetch_add(
-                u64::from(result.physical_rounds),
-                Ordering::Relaxed,
-            );
+            ACTIVE_MIC_CHAIN_PHYSICAL_ROUNDS
+                .fetch_add(u64::from(result.physical_rounds), Ordering::Relaxed);
             if result.complete {
                 ACTIVE_MIC_CHAIN_COMPLETE.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -3244,10 +3676,23 @@ pub fn solve_active_mic_chain(
 }
 
 pub fn active_mic_chain_context_reusable(solver: &DagCnfSolver) -> bool {
-    if !mic_chain_enabled() || !active_hardware_available() { return false; }
-    active_state().lock().ok()
-        .and_then(|state| state.loaded_context.as_ref().map(|context| context.scope))
-        == Some(ShadowContextScope::ExactFrame(solver.accel_level))
+    if !mic_chain_enabled() || !active_hardware_available() {
+        return false;
+    }
+    active_state()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .loaded_context
+                .as_ref()
+                .map(|context| match context.scope {
+                    ShadowContextScope::FrameRanged => true,
+                    ShadowContextScope::ExactFrame(frame) => frame == solver.accel_level,
+                    ShadowContextScope::SharedTransition => false,
+                })
+        })
+        .unwrap_or(false)
 }
 
 fn mic_chain_effectively_complete(
@@ -3330,7 +3775,7 @@ pub fn solve_active_batch_with_min(
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut caches = Vec::new();
-    let prefer_query_lemmas = !active_resident_lemmas();
+    let prefer_query_lemmas = !(active_resident_lemmas() || active_frame_ranges());
     for (index, (solver, query)) in requests.iter().enumerate() {
         if !selected[index] {
             continue;
@@ -3398,8 +3843,7 @@ pub fn solve_active_batch_with_min(
     }
     ACTIVE_OFFERED_PASSES.fetch_add(1, Ordering::Relaxed);
     ACTIVE_OFFERED.fetch_add(planned_count as u64, Ordering::Relaxed);
-    let reference_cpu =
-        compare_cpu.then(|| measure_reference_cpu(&requests, &planned, paired));
+    let reference_cpu = compare_cpu.then(|| measure_reference_cpu(&requests, &planned, paired));
     if let Some(cpu) = reference_cpu.as_ref() {
         PAIRED_BASELINE_CPU_NS.fetch_add(
             cpu.iter().map(|work| work.elapsed_ns).sum(),
@@ -3410,10 +3854,7 @@ pub fn solve_active_batch_with_min(
     let state_wait_start = std::time::Instant::now();
     let state = active_state().lock();
     ACTIVE_STATE_WAIT_NS.fetch_add(
-        state_wait_start
-            .elapsed()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64,
+        state_wait_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
         Ordering::Relaxed,
     );
     let Ok(mut state) = state else {
@@ -3442,15 +3883,17 @@ pub fn solve_active_batch_with_min(
             let mut result = None;
             if !context_ready && let Some(clauses) = append_clauses.take() {
                 let append_start = std::time::Instant::now();
+                let kernel_before = direct_kernel_ns();
                 let appended = state
                     .hardware
                     .as_mut()
                     .ok_or(HardwareError::Unavailable)
                     .and_then(|hardware| hardware.add_frame_clauses(&clauses));
-                let append_ns = append_start
-                    .elapsed()
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64;
+                ACTIVE_CONTEXT_APPEND_KERNEL_NS.fetch_add(
+                    direct_kernel_ns().saturating_sub(kernel_before),
+                    Ordering::Relaxed,
+                );
+                let append_ns = append_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 ACTIVE_CONTEXT_APPEND_NS.fetch_add(append_ns, Ordering::Relaxed);
                 match appended {
                     Ok(()) => {
@@ -3465,16 +3908,12 @@ pub fn solve_active_batch_with_min(
                             // The planner can only return Append for a loaded
                             // context. Keep this defensive branch exact if the
                             // state representation changes later.
-                            ACTIVE_CONTEXT_APPEND_FALLBACKS
-                                .fetch_add(1, Ordering::Relaxed);
+                            ACTIVE_CONTEXT_APPEND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Err(error) => {
-                        eprintln!(
-                            "inductor-cdcl: incremental context append failed: {error}"
-                        );
-                        ACTIVE_CONTEXT_APPEND_FALLBACKS
-                            .fetch_add(1, Ordering::Relaxed);
+                        eprintln!("inductor-cdcl: incremental context append failed: {error}");
+                        ACTIVE_CONTEXT_APPEND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                         // ADD_FRAME_CLAUSES is atomic in the kernel, but a
                         // transport/server failure also invalidates the lease.
                         state.loaded_context = None;
@@ -3483,6 +3922,7 @@ pub fn solve_active_batch_with_min(
             }
             if !context_ready {
                 let combined_start = std::time::Instant::now();
+                let kernel_before = direct_kernel_ns();
                 let combined = state
                     .hardware
                     .as_mut()
@@ -3494,10 +3934,11 @@ pub fn solve_active_batch_with_min(
                             &queries,
                         )
                     });
-                let combined_ns = combined_start
-                    .elapsed()
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64;
+                ACTIVE_COMBINED_KERNEL_NS.fetch_add(
+                    direct_kernel_ns().saturating_sub(kernel_before),
+                    Ordering::Relaxed,
+                );
+                let combined_ns = combined_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 ACTIVE_COMBINED_NS.fetch_add(combined_ns, Ordering::Relaxed);
                 match combined {
                     Ok(results) => {
@@ -3509,35 +3950,28 @@ pub fn solve_active_batch_with_min(
                         result = Some(Ok(results));
                     }
                     Err(error) => {
-                        eprintln!(
-                            "inductor-cdcl: combined load/run failed: {error}"
-                        );
+                        eprintln!("inductor-cdcl: combined load/run failed: {error}");
                         ACTIVE_COMBINED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                        ACTIVE_COMBINED_FALLBACK_NS.fetch_add(
-                            combined_ns,
-                            Ordering::Relaxed,
-                        );
+                        ACTIVE_COMBINED_FALLBACK_NS.fetch_add(combined_ns, Ordering::Relaxed);
                         state.loaded_context = None;
                         let load_start = std::time::Instant::now();
+                        let kernel_before = direct_kernel_ns();
                         let loaded = state
                             .hardware
                             .as_mut()
                             .ok_or(HardwareError::Unavailable)
                             .and_then(|hardware| {
-                                hardware.load_context(
-                                    group.context.n_var,
-                                    &group.context.clauses,
-                                )
+                                hardware.load_context(group.context.n_var, &group.context.clauses)
                             });
-                        context_load_ns = load_start
-                            .elapsed()
-                            .as_nanos()
-                            .min(u64::MAX as u128) as u64;
+                        ACTIVE_CONTEXT_LOAD_KERNEL_NS.fetch_add(
+                            direct_kernel_ns().saturating_sub(kernel_before),
+                            Ordering::Relaxed,
+                        );
+                        context_load_ns =
+                            load_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                         ACTIVE_CONTEXT_LOAD_NS.fetch_add(context_load_ns, Ordering::Relaxed);
                         if let Err(error) = loaded {
-                            eprintln!(
-                                "inductor-cdcl: fallback context load failed: {error}"
-                            );
+                            eprintln!("inductor-cdcl: fallback context load failed: {error}");
                             ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
                             continue;
                         }
@@ -3551,15 +3985,17 @@ pub fn solve_active_batch_with_min(
                 Some(result) => result,
                 None => {
                     let batch_start = std::time::Instant::now();
+                    let kernel_before = direct_kernel_ns();
                     let result = state
                         .hardware
                         .as_mut()
                         .ok_or(HardwareError::Unavailable)
                         .and_then(|hardware| hardware.solve_batch(&queries));
-                    batch_ns = batch_start
-                        .elapsed()
-                        .as_nanos()
-                        .min(u64::MAX as u128) as u64;
+                    ACTIVE_BATCH_KERNEL_NS.fetch_add(
+                        direct_kernel_ns().saturating_sub(kernel_before),
+                        Ordering::Relaxed,
+                    );
+                    batch_ns = batch_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     result
                 }
             };
@@ -3575,22 +4011,14 @@ pub fn solve_active_batch_with_min(
             if result.is_ok() {
                 if let Some(hardware) = state.hardware.as_ref() {
                     profile_hardware_batch(&queries, &hardware.last_batch_records);
-                    ACTIVE_HW_DECISIONS.fetch_add(
-                        hardware.last_batch_work.decisions,
-                        Ordering::Relaxed,
-                    );
-                    ACTIVE_HW_CONFLICTS.fetch_add(
-                        hardware.last_batch_work.conflicts,
-                        Ordering::Relaxed,
-                    );
-                    ACTIVE_HW_PROPAGATIONS.fetch_add(
-                        hardware.last_batch_work.propagations,
-                        Ordering::Relaxed,
-                    );
-                    ACTIVE_HW_LEARNTS.fetch_add(
-                        hardware.last_batch_work.learnt_clauses,
-                        Ordering::Relaxed,
-                    );
+                    ACTIVE_HW_DECISIONS
+                        .fetch_add(hardware.last_batch_work.decisions, Ordering::Relaxed);
+                    ACTIVE_HW_CONFLICTS
+                        .fetch_add(hardware.last_batch_work.conflicts, Ordering::Relaxed);
+                    ACTIVE_HW_PROPAGATIONS
+                        .fetch_add(hardware.last_batch_work.propagations, Ordering::Relaxed);
+                    ACTIVE_HW_LEARNTS
+                        .fetch_add(hardware.last_batch_work.learnt_clauses, Ordering::Relaxed);
                     if let Some(cpu) = reference_cpu.as_ref() {
                         record_comparison_batch(
                             pass_id,
@@ -3608,10 +4036,7 @@ pub fn solve_active_batch_with_min(
             }
             match result {
                 Ok(results) => {
-                    for ((index, _), result) in group.pending[start..end]
-                        .iter()
-                        .zip(results)
-                    {
+                    for ((index, _), result) in group.pending[start..end].iter().zip(results) {
                         match &result {
                             IncrementalResult::Sat { .. } => {
                                 ACTIVE_HW_SAT.fetch_add(1, Ordering::Relaxed);
@@ -3778,12 +4203,8 @@ pub fn note_active_mic_batch_economics(
     selected: bool,
 ) {
     ACTIVE_MIC_BATCH_ECON_CPU_NS.store(projected_cpu_ns, Ordering::Relaxed);
-    ACTIVE_MIC_BATCH_ECON_HW_NS.store(
-        projected_hardware_ns.unwrap_or(0),
-        Ordering::Relaxed,
-    );
-    ACTIVE_MIC_BATCH_ECON_HW_VALID
-        .store(projected_hardware_ns.is_some(), Ordering::Relaxed);
+    ACTIVE_MIC_BATCH_ECON_HW_NS.store(projected_hardware_ns.unwrap_or(0), Ordering::Relaxed);
+    ACTIVE_MIC_BATCH_ECON_HW_VALID.store(projected_hardware_ns.is_some(), Ordering::Relaxed);
     if probe {
         ACTIVE_MIC_BATCH_ECON_PROBES.fetch_add(1, Ordering::Relaxed);
     } else if selected {
@@ -3807,17 +4228,31 @@ pub fn note_active_mic_chain_cpu_replaced(trials: u32) {
     ACTIVE_MIC_CHAIN_CPU_TRIALS_REPLACED.fetch_add(u64::from(trials), Ordering::Relaxed);
 }
 
-pub fn note_active_mic_chain_economics(route: u8, context_reusable: bool,
-    projected_cpu_ns: u64, projected_hardware_ns: Option<u64>)
-{
+pub fn note_active_mic_chain_economics(
+    route: u8,
+    context_reusable: bool,
+    projected_cpu_ns: u64,
+    projected_hardware_ns: Option<u64>,
+) {
     let (total, warm) = match route {
-        0 => (&ACTIVE_MIC_CHAIN_ECON_REJECTS, &ACTIVE_MIC_CHAIN_ECON_WARM_REJECTS),
-        1 => (&ACTIVE_MIC_CHAIN_ECON_PROBES, &ACTIVE_MIC_CHAIN_ECON_WARM_PROBES),
-        2 => (&ACTIVE_MIC_CHAIN_ECON_OFFLOADS, &ACTIVE_MIC_CHAIN_ECON_WARM_OFFLOADS),
+        0 => (
+            &ACTIVE_MIC_CHAIN_ECON_REJECTS,
+            &ACTIVE_MIC_CHAIN_ECON_WARM_REJECTS,
+        ),
+        1 => (
+            &ACTIVE_MIC_CHAIN_ECON_PROBES,
+            &ACTIVE_MIC_CHAIN_ECON_WARM_PROBES,
+        ),
+        2 => (
+            &ACTIVE_MIC_CHAIN_ECON_OFFLOADS,
+            &ACTIVE_MIC_CHAIN_ECON_WARM_OFFLOADS,
+        ),
         _ => return,
     };
     total.fetch_add(1, Ordering::Relaxed);
-    if context_reusable { warm.fetch_add(1, Ordering::Relaxed); }
+    if context_reusable {
+        warm.fetch_add(1, Ordering::Relaxed);
+    }
     ACTIVE_MIC_CHAIN_ECON_CPU_NS.store(projected_cpu_ns, Ordering::Relaxed);
     ACTIVE_MIC_CHAIN_ECON_HW_NS.store(projected_hardware_ns.unwrap_or(0), Ordering::Relaxed);
     ACTIVE_MIC_CHAIN_ECON_HW_VALID.store(projected_hardware_ns.is_some(), Ordering::Relaxed);
@@ -3873,12 +4308,8 @@ pub fn note_active_block_batch_economics(
     selected: bool,
 ) {
     ACTIVE_BLOCK_BATCH_ECON_CPU_NS.store(projected_cpu_ns, Ordering::Relaxed);
-    ACTIVE_BLOCK_BATCH_ECON_HW_NS.store(
-        projected_hardware_ns.unwrap_or(0),
-        Ordering::Relaxed,
-    );
-    ACTIVE_BLOCK_BATCH_ECON_HW_VALID
-        .store(projected_hardware_ns.is_some(), Ordering::Relaxed);
+    ACTIVE_BLOCK_BATCH_ECON_HW_NS.store(projected_hardware_ns.unwrap_or(0), Ordering::Relaxed);
+    ACTIVE_BLOCK_BATCH_ECON_HW_VALID.store(projected_hardware_ns.is_some(), Ordering::Relaxed);
     ACTIVE_BLOCK_BATCH_ECON_ROUTE.store(selected && !probe, Ordering::Relaxed);
     if probe {
         ACTIVE_BLOCK_BATCH_ECON_PROBES.fetch_add(1, Ordering::Relaxed);
@@ -4036,11 +4467,7 @@ pub fn note_active_push_prefetch_busy() {
     ACTIVE_PUSH_PREFETCH_BUSY.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn note_active_preflight_result(
-    unsat: bool,
-    accepted: bool,
-    restore_ns: u64,
-) {
+pub fn note_active_preflight_result(unsat: bool, accepted: bool, restore_ns: u64) {
     ACTIVE_PREFLIGHT_RESTORE_NS.fetch_add(restore_ns, Ordering::Relaxed);
     if accepted {
         if unsat {
@@ -4058,17 +4485,12 @@ pub fn note_active_preflight_result(
 /// exact resident snapshot rather than flushed when IC3 switches frames. This
 /// exposes the batching available to a future multi-context scheduler while
 /// shadow mode remains independent of the CPU control flow.
-pub fn queue_shadow(
-    solver: &DagCnfSolver,
-    query: IncrementalQuery,
-    cpu_result: Option<bool>,
-) {
+pub fn queue_shadow(solver: &DagCnfSolver, query: IncrementalQuery, cpu_result: Option<bool>) {
     if !shadow_enabled() || query.domain.is_empty() {
         return;
     }
     SHADOW_OFFERED.fetch_add(1, Ordering::Relaxed);
-    let prefer_query_lemmas =
-        std::env::var_os("INDUCTOR_CDCL_SHADOW_RESIDENT_LEMMAS").is_none();
+    let prefer_query_lemmas = std::env::var_os("INDUCTOR_CDCL_SHADOW_RESIDENT_LEMMAS").is_none();
     let (context, query, used_query_lemmas) =
         prepare_batched_query(solver, query, prefer_query_lemmas);
     if used_query_lemmas {
@@ -4176,8 +4598,7 @@ pub fn flush_and_report() {
             ACTIVE_COMBINED_FALLBACKS.load(Ordering::Relaxed),
             ACTIVE_COMBINED_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_ERROR.load(Ordering::Relaxed),
-            std::env::var("INDUCTOR_CDCL_PAIRED_CSV")
-                .unwrap_or_else(|_| "disabled".to_string()),
+            std::env::var("INDUCTOR_CDCL_PAIRED_CSV").unwrap_or_else(|_| "disabled".to_string()),
         );
         if let Some(conflict_limit) = paired_preflight_conflicts() {
             let baseline_ns = PAIRED_BASELINE_CPU_NS.load(Ordering::Relaxed);
@@ -4222,9 +4643,59 @@ pub fn flush_and_report() {
         let block_rejected = ACTIVE_BLOCK_RESULT_REJECTED.load(Ordering::Relaxed);
         let block_unconsumed =
             block_conclusive.saturating_sub(block_used.saturating_add(block_rejected));
+        let kernel_ns = direct_kernel_ns();
+        if kernel_ns != 0 {
+            let load_kernel_ns = ACTIVE_CONTEXT_LOAD_KERNEL_NS.load(Ordering::Relaxed);
+            let append_kernel_ns = ACTIVE_CONTEXT_APPEND_KERNEL_NS.load(Ordering::Relaxed);
+            let combined_kernel_ns = ACTIVE_COMBINED_KERNEL_NS.load(Ordering::Relaxed);
+            let batch_kernel_ns = ACTIVE_BATCH_KERNEL_NS.load(Ordering::Relaxed);
+            let mic_kernel_ns = ACTIVE_MIC_CHAIN_KERNEL_NS.load(Ordering::Relaxed);
+            let fused_append_mic_kernel_ns =
+                ACTIVE_FUSED_APPEND_MIC_KERNEL_NS.load(Ordering::Relaxed);
+            let materialize_kernel_ns = ACTIVE_FRAME_MATERIALIZE_KERNEL_NS.load(Ordering::Relaxed);
+            let useful_kernel_ns = batch_kernel_ns.saturating_add(mic_kernel_ns);
+            let maintenance_kernel_ns = load_kernel_ns
+                .saturating_add(append_kernel_ns)
+                .saturating_add(materialize_kernel_ns);
+            let attributed_kernel_ns = load_kernel_ns
+                .saturating_add(append_kernel_ns)
+                .saturating_add(combined_kernel_ns)
+                .saturating_add(batch_kernel_ns)
+                .saturating_add(materialize_kernel_ns)
+                .saturating_add(mic_kernel_ns)
+                .saturating_add(fused_append_mic_kernel_ns);
+            eprintln!(
+                "inductor-cdcl: direct XRT kernel busy {:.3} ms (kernel start-to-completion only; excludes host packing and DMA)",
+                kernel_ns as f64 / 1_000_000.0,
+            );
+            eprintln!(
+                "inductor-cdcl: direct XRT kernel split load/append/combined-load-run/batch/frame-materialize/useful-MIC/fused-append+MIC-mixed/unattributed {:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
+                load_kernel_ns as f64 / 1_000_000.0,
+                append_kernel_ns as f64 / 1_000_000.0,
+                combined_kernel_ns as f64 / 1_000_000.0,
+                batch_kernel_ns as f64 / 1_000_000.0,
+                materialize_kernel_ns as f64 / 1_000_000.0,
+                mic_kernel_ns as f64 / 1_000_000.0,
+                fused_append_mic_kernel_ns as f64 / 1_000_000.0,
+                kernel_ns.saturating_sub(attributed_kernel_ns) as f64 / 1_000_000.0,
+            );
+            eprintln!(
+                "inductor-cdcl: direct XRT classified busy useful-CDCL {:.3} ms ({:.1}%), resident/frame maintenance {:.3} ms ({:.1}%), fused append+MIC mixed {:.3} ms ({:.1}%); mixed commands are not counted as useful or maintenance",
+                useful_kernel_ns as f64 / 1_000_000.0,
+                100.0 * useful_kernel_ns as f64 / kernel_ns.max(1) as f64,
+                maintenance_kernel_ns as f64 / 1_000_000.0,
+                100.0 * maintenance_kernel_ns as f64 / kernel_ns.max(1) as f64,
+                fused_append_mic_kernel_ns as f64 / 1_000_000.0,
+                100.0 * fused_append_mic_kernel_ns as f64 / kernel_ns.max(1) as f64,
+            );
+        }
         eprintln!(
             "inductor-cdcl: active pair-scheduler {}, transport unavailable {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, unavailable calls/queries {}/{}, context loads {}, appends {}/{} clauses (fallbacks {}), combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load/append {:.3}/{:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-state {:.3} ms, UNSAT-state {:.3} ms",
-            if pair_scheduler_enabled() { "on" } else { "off" },
+            if pair_scheduler_enabled() {
+                "on"
+            } else {
+                "off"
+            },
             ACTIVE_TRANSPORT_UNAVAILABLE.load(Ordering::Relaxed),
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
@@ -4394,7 +4865,7 @@ pub fn flush_and_report() {
             },
         );
         eprintln!(
-            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials/physical rounds {}/{}, input/output lits {}/{}, device/client service {:.3}/{:.3} ms, context reused {}, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, adoption accepted/rejected {}/{}, CPU verify {:.3} ms, CPU MIC loops/trials replaced {}/{}",
+            "inductor-cdcl: active MIC chain commands complete/partial/errors {}/{}/{}/{}, trials/physical rounds {}/{}, input/output lits {}/{}, standalone useful kernel/service {:.3}/{:.3} ms, fused append+MIC commands/clauses kernel/service {}/{} {:.3}/{:.3} ms, client service {:.3} ms, frame materializations {} kernel/service {:.3}/{:.3} ms, context reused {}, work decisions/conflicts/propagations/learnts {}/{}/{}/{}, adoption accepted/rejected {}/{}, CPU verify {:.3} ms, CPU MIC loops/trials replaced {}/{}",
             ACTIVE_MIC_CHAIN_COMMANDS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_COMPLETE.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_PARTIAL.load(Ordering::Relaxed),
@@ -4403,8 +4874,16 @@ pub fn flush_and_report() {
             ACTIVE_MIC_CHAIN_PHYSICAL_ROUNDS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_INPUT_LITS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_OUTPUT_LITS.load(Ordering::Relaxed),
+            ACTIVE_MIC_CHAIN_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_MIC_CHAIN_SERVICE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_FUSED_APPEND_MIC_COMMANDS.load(Ordering::Relaxed),
+            ACTIVE_FUSED_APPEND_MIC_CLAUSES.load(Ordering::Relaxed),
+            ACTIVE_FUSED_APPEND_MIC_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_FUSED_APPEND_MIC_SERVICE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_MIC_CHAIN_CLIENT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_FRAME_MATERIALIZATIONS.load(Ordering::Relaxed),
+            ACTIVE_FRAME_MATERIALIZE_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_FRAME_MATERIALIZE_SERVICE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_MIC_CHAIN_CONTEXT_REUSED.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_DECISIONS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_CONFLICTS.load(Ordering::Relaxed),
@@ -4426,8 +4905,13 @@ pub fn flush_and_report() {
             ACTIVE_MIC_CHAIN_ECON_WARM_REJECTS.load(Ordering::Relaxed),
             ACTIVE_MIC_CHAIN_ECON_CPU_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             if ACTIVE_MIC_CHAIN_ECON_HW_VALID.load(Ordering::Relaxed) {
-                format!("{:.3} ms", ACTIVE_MIC_CHAIN_ECON_HW_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0)
-            } else { "untrained".to_string() },
+                format!(
+                    "{:.3} ms",
+                    ACTIVE_MIC_CHAIN_ECON_HW_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0
+                )
+            } else {
+                "untrained".to_string()
+            },
         );
         eprintln!(
             "inductor-cdcl: active block preflight conclusive/selected/fallback {}/{}/{}, wave reserved/taken {}/{}",
@@ -4447,8 +4931,7 @@ pub fn flush_and_report() {
             if batch_hw_valid {
                 format!(
                     "{:.3} ms",
-                    ACTIVE_BLOCK_BATCH_ECON_HW_NS.load(Ordering::Relaxed) as f64
-                        / 1_000_000.0
+                    ACTIVE_BLOCK_BATCH_ECON_HW_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0
                 )
             } else {
                 "untrained".to_string()
@@ -4473,8 +4956,7 @@ pub fn flush_and_report() {
                 ACTIVE_PREFLIGHT_UNSAT_REUSED.load(Ordering::Relaxed),
                 ACTIVE_PREFLIGHT_REJECTED.load(Ordering::Relaxed),
                 ACTIVE_PREFLIGHT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-                ACTIVE_PREFLIGHT_RESTORE_NS.load(Ordering::Relaxed) as f64
-                    / 1_000_000.0,
+                ACTIVE_PREFLIGHT_RESTORE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
                 ACTIVE_PREFLIGHT_CONFLICTS.load(Ordering::Relaxed) as f64
                     / candidates.max(1) as f64,
             );
@@ -4487,9 +4969,7 @@ pub fn flush_and_report() {
                 ACTIVE_SAMPLE_CONTEXT_GROUPS.load(Ordering::Relaxed),
                 ACTIVE_SAMPLE_PLAN_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
                 sampled,
-                ACTIVE_SAMPLE_NS.load(Ordering::Relaxed) as f64
-                    / sampled.max(1) as f64
-                    / 1_000.0,
+                ACTIVE_SAMPLE_NS.load(Ordering::Relaxed) as f64 / sampled.max(1) as f64 / 1_000.0,
                 ACTIVE_SAMPLE_CLONE_NS.load(Ordering::Relaxed) as f64
                     / sampled.max(1) as f64
                     / 1_000.0,
@@ -4537,6 +5017,7 @@ pub fn flush_and_report() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accel::cdcl::MIC_HEADER_WORDS;
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
@@ -4551,6 +5032,8 @@ mod tests {
                 frame: 4,
                 cube: &cube0,
                 constraints: &[],
+                protected_index: 2,
+                decision_budget: 32,
                 conflict_budget: 16,
                 max_trials: 2,
             },
@@ -4558,6 +5041,8 @@ mod tests {
                 frame: 4,
                 cube: &cube1,
                 constraints: &[],
+                protected_index: 2,
+                decision_budget: 32,
                 conflict_budget: 16,
                 max_trials: 2,
             },
@@ -4571,14 +5056,23 @@ mod tests {
         let mut response = vec![ABI_VERSION, 2, 26, 0];
         for protected in [l(2), l(8)] {
             response.extend([
-                ABI_VERSION, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 2,
+                ABI_VERSION,
+                3,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
                 u32::from(protected),
             ]);
         }
-        let (result0, words0) =
-            decode_mic_chain_record(&cube0, &response[4..]).unwrap();
-        let (result1, words1) =
-            decode_mic_chain_record(&cube1, &response[4 + words0..]).unwrap();
+        let (result0, words0) = decode_mic_chain_record(&cube0, &response[4..]).unwrap();
+        let (result1, words1) = decode_mic_chain_record(&cube1, &response[4 + words0..]).unwrap();
         assert_eq!(words0, 13);
         assert_eq!(words1, 13);
         assert_eq!(result0.cube.len(), 1);
@@ -4590,7 +5084,30 @@ mod tests {
     }
 
     #[test]
-    fn protected_mic_suffix_counts_as_complete_only_after_all_candidates() {
+    fn mic_chain_wire_protects_a_middle_literal_without_reordering() {
+        let l = |var: u32| Lit::new(Var::from(var), true);
+        let cube = [(l(0), l(3)), (l(1), l(4)), (l(2), l(5))];
+        let request = pack_mic_chain_request(6, 4, &cube, &[], 1, 32, 16, 2).unwrap();
+        assert_eq!(request[6], 32);
+        assert_eq!(request[2] & MIC_PROTECT_INDEX, MIC_PROTECT_INDEX);
+        assert_eq!(request[2] >> MIC_PROTECTED_INDEX_SHIFT, 1);
+        assert_eq!(request[5], 6);
+        let pairs_at = MIC_HEADER_WORDS + 6;
+        assert_eq!(
+            &request[pairs_at..],
+            &[
+                u32::from(l(0)),
+                u32::from(l(3)),
+                u32::from(l(1)),
+                u32::from(l(4)),
+                u32::from(l(2)),
+                u32::from(l(5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn protected_mic_entry_counts_as_complete_only_after_all_candidates() {
         assert!(mic_chain_effectively_complete(
             false,
             UnknownReason::None,
@@ -4627,22 +5144,47 @@ mod tests {
         assert_eq!(representative_sample_positions(10, 3), vec![1, 5, 8]);
         assert_eq!(representative_sample_positions(3, 8), vec![0, 1, 2]);
         assert!(sample_keeps_fpga(
-            &[250_000, 300_000, 900_000], 16, 8, 200_000, None, true
+            &[250_000, 300_000, 900_000],
+            16,
+            8,
+            200_000,
+            None,
+            true
         ));
         assert!(!sample_keeps_fpga(
-            &[50_000, 100_000, 900_000], 16, 8, 200_000, None, true
+            &[50_000, 100_000, 900_000],
+            16,
+            8,
+            200_000,
+            None,
+            true
         ));
         // With an even sample the lower median prevents one expensive half
         // from routing a frame whose other half is cheap.
         assert!(!sample_keeps_fpga(
-            &[150_000, 600_000], 16, 8, 200_000, None, true
+            &[150_000, 600_000],
+            16,
+            8,
+            200_000,
+            None,
+            true
         ));
         assert!(!sample_keeps_fpga(
-            &[250_000, 300_000], 7, 8, 200_000, None, true
+            &[250_000, 300_000],
+            7,
+            8,
+            200_000,
+            None,
+            true
         ));
         assert!(!sample_keeps_fpga(&[], 16, 8, 200_000, None, true));
         assert!(!sample_keeps_fpga(
-            &[250_000, 300_000], 16, 8, 200_000, None, false
+            &[250_000, 300_000],
+            16,
+            8,
+            200_000,
+            None,
+            false
         ));
         // Many individually cheap inquiries can still amortize one FPGA
         // submission; a genuinely cheap aggregate remains on the CPU.
@@ -4701,7 +5243,11 @@ mod tests {
         );
         let outside = Lit::new(Var::from(1), true);
         assert_eq!(
-            pack_clauses(&[1], 1, &[ResidentClause::new(0, 0, LitVec::from([outside]))]),
+            pack_clauses(
+                &[1],
+                1,
+                &[ResidentClause::new(0, 0, LitVec::from([outside]))]
+            ),
             Err(HardwareError::InvalidContext),
         );
     }
@@ -4719,7 +5265,10 @@ mod tests {
         let (combined, combined_capacity) =
             pack_load_context_and_batch_request(1, &clauses, &queries, false).unwrap();
 
-        assert_eq!(profile_batch[4 + 2] & WANT_STAGE_PROFILE, WANT_STAGE_PROFILE);
+        assert_eq!(
+            profile_batch[4 + 2] & WANT_STAGE_PROFILE,
+            WANT_STAGE_PROFILE
+        );
         assert_eq!(profile_capacity, response_capacity + STAGE_PROFILE_WORDS);
         assert_eq!(combined[0] as usize, context.len());
         assert_eq!(&combined[1..1 + context.len()], context.as_slice());
@@ -4850,7 +5399,10 @@ mod tests {
 
         let (header, payload) = query.pack();
         assert_eq!(query_request_words(&query), Some(14));
-        assert_eq!(query_request_words(&query), Some(header.as_words().len() + payload.len()));
+        assert_eq!(
+            query_request_words(&query),
+            Some(header.as_words().len() + payload.len())
+        );
     }
 
     #[test]
@@ -4869,23 +5421,31 @@ mod tests {
 
         let (shared, expanded, used) = prepare_batched_query(&solver, query.clone(), true);
         assert!(used);
-        assert!(shared
-            .clauses
-            .iter()
-            .all(|clause| clause.lo == 0 && clause.hi == u32::MAX));
-        assert!(shared
-            .clauses
-            .iter()
-            .any(|clause| clause.literals.as_slice() == [a, b]));
-        assert!(!shared
-            .clauses
-            .iter()
-            .any(|clause| clause.literals.as_slice() == [!a, b]));
+        assert!(
+            shared
+                .clauses
+                .iter()
+                .all(|clause| clause.lo == 0 && clause.hi == u32::MAX)
+        );
+        assert!(
+            shared
+                .clauses
+                .iter()
+                .any(|clause| clause.literals.as_slice() == [a, b])
+        );
+        assert!(
+            !shared
+                .clauses
+                .iter()
+                .any(|clause| clause.literals.as_slice() == [!a, b])
+        );
         assert_eq!(expanded.constraints.len(), 2);
-        assert!(expanded
-            .constraints
-            .iter()
-            .any(|clause| clause.as_slice() == [!a, b]));
+        assert!(
+            expanded
+                .constraints
+                .iter()
+                .any(|clause| clause.as_slice() == [!a, b])
+        );
 
         let mut cache = BatchedSolverContext::new(&solver);
         let (cached_uses_lemmas, cached_words) = cache.query_plan(&query, true).unwrap();
@@ -4900,18 +5460,24 @@ mod tests {
         assert!(!used);
         assert_eq!(unchanged.constraints, query.constraints);
         assert_eq!(exact.scope, ShadowContextScope::ExactFrame(7));
-        assert!(exact.clauses.iter().all(|clause| {
-            clause.lo == 0 && clause.hi == u32::MAX
-                || clause.lo == 7 && clause.hi == 7
-        }));
-        assert!(exact
-            .clauses
-            .iter()
-            .any(|clause| clause.lo == 0 && clause.hi == u32::MAX));
-        assert!(exact
-            .clauses
-            .iter()
-            .any(|clause| clause.lo == 7 && clause.literals.as_slice() == [!a, b]));
+        assert!(
+            exact
+                .clauses
+                .iter()
+                .all(|clause| clause.lo == 0 && clause.hi == u32::MAX)
+        );
+        assert!(
+            exact
+                .clauses
+                .iter()
+                .any(|clause| clause.lo == 0 && clause.hi == u32::MAX)
+        );
+        assert!(
+            exact
+                .clauses
+                .iter()
+                .any(|clause| clause.literals.as_slice() == [!a, b])
+        );
 
         let mut later_solver = solver.clone();
         later_solver.accel_level = 8;
@@ -4922,10 +5488,12 @@ mod tests {
             prepare_batched_query(&later_solver, later_query, true);
         assert!(later_used);
         assert_eq!(shared, later_shared);
-        assert!(later_expanded
-            .constraints
-            .iter()
-            .any(|clause| clause.as_slice() == [a, !b]));
+        assert!(
+            later_expanded
+                .constraints
+                .iter()
+                .any(|clause| clause.as_slice() == [a, !b])
+        );
     }
 
     #[test]
@@ -4944,18 +5512,19 @@ mod tests {
         }
 
         let query = IncrementalQuery::new(5, LitVec::new());
-        let (context, unchanged, used) =
-            prepare_batched_query(&solver, query.clone(), true);
+        let (context, unchanged, used) = prepare_batched_query(&solver, query.clone(), true);
         assert!(!used);
         assert_eq!(unchanged.frame, query.frame);
         assert_eq!(unchanged.assumptions, query.assumptions);
         assert_eq!(unchanged.constraints, query.constraints);
         assert_eq!(unchanged.domain, query.domain);
         assert_eq!(context.scope, ShadowContextScope::ExactFrame(5));
-        assert!(context.clauses.iter().all(|clause| {
-            clause.lo == 0 && clause.hi == u32::MAX
-                || clause.lo == 5 && clause.hi == 5
-        }));
+        assert!(
+            context
+                .clauses
+                .iter()
+                .all(|clause| clause.lo == 0 && clause.hi == u32::MAX)
+        );
         assert!(context.clauses.len() > query_lemma_word_limit() / 5);
     }
 
@@ -4970,9 +5539,7 @@ mod tests {
         let frame_two = ResidentClause::new(2, 2, LitVec::from([c]));
         let frame_one = |lemmas: Vec<ResidentClause>| ShadowContext {
             n_var: 3,
-            clauses: std::iter::once(transition.clone())
-                .chain(lemmas)
-                .collect(),
+            clauses: std::iter::once(transition.clone()).chain(lemmas).collect(),
             scope: ShadowContextScope::ExactFrame(1),
         };
         let target_one = frame_one(vec![frame_one_a.clone(), frame_one_b.clone()]);
@@ -5020,6 +5587,39 @@ mod tests {
     }
 
     #[test]
+    fn frame_ranged_context_appends_only_physical_prefix_deltas() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), true);
+        let transition = ResidentClause::new(0, u32::MAX, LitVec::from([a, b]));
+        let early = ResidentClause::new(1, 4, LitVec::from([!a]));
+        let later = ResidentClause::new(3, 8, LitVec::from([!b]));
+        let context = |clauses| ShadowContext {
+            n_var: 2,
+            clauses,
+            scope: ShadowContextScope::FrameRanged,
+        };
+        let loaded = LoadedContext::from(&context(vec![transition.clone(), early.clone()]));
+        let target = context(vec![transition.clone(), early.clone(), later.clone()]);
+
+        assert_eq!(
+            plan_context_update(Some(&loaded), &target),
+            ContextUpdate::Append(vec![later.clone()]),
+        );
+        assert_eq!(
+            plan_context_update(Some(&LoadedContext::from(&target)), &target),
+            ContextUpdate::Ready,
+        );
+
+        // Frame selection happens in the query header, so changing frames does
+        // not reorder physical clauses. Any actual reordering still reloads.
+        let reordered = context(vec![transition, later, early]);
+        assert_eq!(
+            plan_context_update(Some(&loaded), &reordered),
+            ContextUpdate::Reload,
+        );
+    }
+
+    #[test]
     fn pair_scheduler_places_similar_heavy_queries_in_the_same_round() {
         let query_with_domain = |n: u32| {
             let mut query = IncrementalQuery::new(0, LitVec::new());
@@ -5046,10 +5646,7 @@ mod tests {
         assert_eq!(pair_cost(&pending), 15);
         schedule_query_pairs(&mut pending, |(_, query)| query);
         assert_eq!(
-            pending
-                .iter()
-                .map(|(index, _)| *index)
-                .collect::<Vec<_>>(),
+            pending.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
             [0, 2, 3, 1]
         );
         assert_eq!(pair_cost(&pending), 10);
