@@ -68,6 +68,9 @@ pub const MIC_HEADER_WORDS: usize = 9;
 pub const MIC_RESPONSE_HEADER_WORDS: usize = 12;
 pub const MIC_BATCH_HEADER_WORDS: usize = 4;
 pub const MIC_BATCH_RESPONSE_HEADER_WORDS: usize = 4;
+/// Each lane-affine portfolio record starts with its physical lane id and
+/// optional append extent, followed by the append and one complete MIC record.
+pub const PORTFOLIO_MIC_RECORD_PREFIX_WORDS: usize = 2;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
