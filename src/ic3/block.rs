@@ -1858,36 +1858,54 @@ impl IC3 {
                         let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check()
                             && entry.cache_age == 0
                             && !BlockBatchCache::async_enabled();
-                        if crate::accel::cdcl_host::active_skip_cpu_check() && !direct_trust {
+                        let stale_trusted = crate::accel::cdcl_host::active_skip_cpu_check()
+                            && !direct_trust;
+                        if stale_trusted {
                             crate::accel::cdcl_host::note_active_trusted_sat_stale();
                         }
-                        let accepted = if direct_trust {
-                            self.solvers[po.frame - 1]
-                                .trusted_incremental_sat_model_shape(&entry.query, &model)
-                        } else {
-                            self.solvers[po.frame - 1]
-                                .validate_incremental_sat_model(&entry.query, &model)
-                        };
-                        speculative_pred = accepted
-                            .then(|| self.pred_from_incremental_model(&entry.query, &model))
-                            .flatten();
-                        let accepted = speculative_pred.is_some();
-                        if direct_trust {
+                        if stale_trusted {
+                            // A strengthened frame can invalidate an older SAT
+                            // model. In qualified no-replay mode discard it and
+                            // run the ordinary CPU inquiry below; do not turn
+                            // FPGA validation into a second CPU solve.
                             crate::accel::cdcl_host::note_active_trusted_sat(
-                                accepted,
+                                false,
                                 validation_start.elapsed().as_nanos() as u64,
                             );
+                            crate::accel::cdcl_host::note_active_block_result_consumed(
+                                false,
+                                entry.cache_age,
+                            );
+                            None
                         } else {
-                            crate::accel::cdcl_host::note_active_sat_model(
+                            let accepted = if direct_trust {
+                                self.solvers[po.frame - 1]
+                                    .trusted_incremental_sat_model_shape(&entry.query, &model)
+                            } else {
+                                self.solvers[po.frame - 1]
+                                    .validate_incremental_sat_model(&entry.query, &model)
+                            };
+                            speculative_pred = accepted
+                                .then(|| self.pred_from_incremental_model(&entry.query, &model))
+                                .flatten();
+                            let accepted = speculative_pred.is_some();
+                            if direct_trust {
+                                crate::accel::cdcl_host::note_active_trusted_sat(
+                                    accepted,
+                                    validation_start.elapsed().as_nanos() as u64,
+                                );
+                            } else {
+                                crate::accel::cdcl_host::note_active_sat_model(
+                                    accepted,
+                                    validation_start.elapsed().as_nanos() as u64,
+                                );
+                            }
+                            crate::accel::cdcl_host::note_active_block_result_consumed(
                                 accepted,
-                                validation_start.elapsed().as_nanos() as u64,
+                                entry.cache_age,
                             );
+                            accepted.then_some(false)
                         }
-                        crate::accel::cdcl_host::note_active_block_result_consumed(
-                            accepted,
-                            entry.cache_age,
-                        );
-                        accepted.then_some(false)
                     }
                     (
                         false,

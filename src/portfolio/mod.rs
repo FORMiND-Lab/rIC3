@@ -207,7 +207,12 @@ impl Portfolio {
         let rst = Restore::new(&ts);
         let ots = ts.clone();
         let (ts, rst) = ts.preproc(&cfg.preproc, rst);
-        let temp_dir = tempfile::TempDir::new_in("/tmp/rIC3/").unwrap();
+        // Let tempfile choose a private directory instead of relying on one
+        // shared, pre-created path. The old /tmp/rIC3 parent could be left
+        // owned by another account and make every portfolio run fail before
+        // any worker started.
+        let temp_dir = tempfile::TempDir::new()
+            .context("failed to create portfolio temporary directory")?;
         let mut engines = Vec::new();
         let mut new_engine = |name, args: &str| {
             let argv: Vec<_> = iter::once("").chain(args.split_whitespace()).collect();

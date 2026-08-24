@@ -4785,7 +4785,7 @@ pub fn flush_and_report() {
         );
         if active_skip_cpu_check() {
             eprintln!(
-                "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, stale SAT revalidated {}, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
+                "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, stale SAT discarded {}, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
                 ACTIVE_TRUSTED_SAT_INSTALLED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_SAT_REJECTED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.load(Ordering::Relaxed),

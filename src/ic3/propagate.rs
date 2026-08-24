@@ -67,10 +67,14 @@ impl IC3 {
                 }
                 // SAT is not monotonic under frame strengthening: a model that
                 // was valid for the submitted snapshot may violate a new live
-                // lemma. Fall through to the exact clause validator. UNSAT is
-                // monotonic and can always use direct core restoration above.
+                // lemma. Qualified no-replay mode discards that stale answer
+                // and takes the ordinary CPU path; it does not double-check an
+                // FPGA result. UNSAT remains monotonic and uses direct core
+                // restoration above.
                 IncrementalResult::Sat { .. } => {
                     crate::accel::cdcl_host::note_active_trusted_sat_stale();
+                    crate::accel::cdcl_host::note_active_trusted_sat(false, 0);
+                    return None;
                 }
             }
         }
