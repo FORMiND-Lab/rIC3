@@ -4706,6 +4706,29 @@ pub fn flush_and_report() {
         let block_rejected = ACTIVE_BLOCK_RESULT_REJECTED.load(Ordering::Relaxed);
         let block_unconsumed =
             block_conclusive.saturating_sub(block_used.saturating_add(block_rejected));
+        // Keep this line comfortably below PIPE_BUF. Portfolio workers share
+        // one redirected stderr; the detailed multi-kilobyte report can be
+        // interleaved at a write boundary and is not a reliable qualification
+        // record. The matrix runner aggregates one compact line per selected
+        // FPGA worker.
+        let qualification = format!(
+            "inductor-cdcl: qualification worker={} transport_attempted={} transport_unavailable={} hardware_disabled={} disable_count={} candidates={} batches={} hw_sat={} hw_unsat={} hw_unknown={} hw_errors={} batch_service_ms={:.3} mic_service_ms={:.3}\n",
+            std::env::var("INDUCTOR_CDCL_PORTFOLIO_WORKER")
+                .unwrap_or_else(|_| "standalone".to_string()),
+            ACTIVE_INIT_NS.load(Ordering::Relaxed) != 0,
+            ACTIVE_TRANSPORT_UNAVAILABLE.load(Ordering::Relaxed),
+            ACTIVE_HARDWARE_DISABLED.load(Ordering::Relaxed),
+            ACTIVE_HARDWARE_DISABLES.load(Ordering::Relaxed),
+            ACTIVE_CANDIDATES.load(Ordering::Relaxed),
+            ACTIVE_BATCHES.load(Ordering::Relaxed),
+            ACTIVE_HW_SAT.load(Ordering::Relaxed),
+            ACTIVE_HW_UNSAT.load(Ordering::Relaxed),
+            ACTIVE_UNKNOWN.load(Ordering::Relaxed),
+            ACTIVE_ERROR.load(Ordering::Relaxed),
+            ACTIVE_BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_MIC_CHAIN_CLIENT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        );
+        let _ = std::io::stderr().lock().write_all(qualification.as_bytes());
         let kernel_ns = direct_kernel_ns();
         if kernel_ns != 0 {
             let load_kernel_ns = ACTIVE_CONTEXT_LOAD_KERNEL_NS.load(Ordering::Relaxed);

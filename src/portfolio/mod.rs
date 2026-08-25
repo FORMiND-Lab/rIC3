@@ -134,20 +134,29 @@ impl Worker {
         let mut engine = create_bl_engine(self.cfg.clone(), ts, sym);
         engine.add_tracer(Box::new(tracer));
         extractor.map(|e| engine.set_extractor(Box::new(e)));
+        // The portfolio parent stops losing or timed-out workers with SIGTERM.
+        // Only FPGA-selected workers need a graceful path: their IC3 check
+        // reports the compact per-process qualification counters before
+        // returning, while all other workers retain the immediate termination
+        // behavior. The ctrlc `termination` feature maps SIGTERM here.
+        let _fpga_interrupt = selected_fpga.then(|| install_interrupt_handler(engine.get_ctrl()));
         let res = engine.check();
         if let Some(cert_tx) = self.cert_tx.as_ref() {
             let certificate = match res {
                 McResult::UNSAT => {
                     let cert = rst.restore_proof(engine.proof(), ots);
-                    McBlCertificate::UNSAT(cert)
+                    Some(McBlCertificate::UNSAT(cert))
                 }
                 McResult::SAT(_) => {
                     let cert = rst.restore_cex(&engine.cex());
-                    McBlCertificate::SAT(cert)
+                    Some(McBlCertificate::SAT(cert))
                 }
-                McResult::Unknown(_) => panic!(),
+                // A gracefully terminated FPGA worker has no certificate.
+                McResult::Unknown(_) => None,
             };
-            let _ = cert_tx.send(certificate);
+            if let Some(certificate) = certificate {
+                let _ = cert_tx.send(certificate);
+            }
         };
         exit(0);
     }
