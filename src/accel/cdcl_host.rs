@@ -1448,6 +1448,8 @@ static ACTIVE_HW_UNSAT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_ERROR: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TRANSPORT_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_HARDWARE_DISABLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_HARDWARE_DISABLES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNAVAILABLE_CALLS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_UNAVAILABLE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_USED: AtomicU64 = AtomicU64::new(0);
@@ -3239,6 +3241,9 @@ fn active_state() -> &'static std::sync::Mutex<ActiveState> {
 /// `ACTIVE_STATE` is a `OnceLock`, so a missing device never triggers another
 /// XRT initialization attempt in the same rIC3 process.
 fn active_hardware_available() -> bool {
+    if ACTIVE_HARDWARE_DISABLED.load(Ordering::Relaxed) {
+        return false;
+    }
     let available = *ACTIVE_HARDWARE_AVAILABLE.get_or_init(|| {
         let wait_start = std::time::Instant::now();
         let state = active_state().lock();
@@ -3252,6 +3257,27 @@ fn active_hardware_available() -> bool {
         ACTIVE_TRANSPORT_UNAVAILABLE.store(true, Ordering::Relaxed);
     }
     available
+}
+
+fn deterministic_active_failure(error: &HardwareError) -> bool {
+    matches!(
+        error,
+        // The command completed and returned a semantic backend error; the
+        // same frontier shape will not become supported on a retry.
+        HardwareError::Decode(_)
+            | HardwareError::Capacity
+            // The C++ bridge maps kernel TOP_CAPACITY (3) to -103.
+            | HardwareError::Command(-103)
+    )
+}
+
+fn disable_active_hardware(error: &HardwareError) {
+    if !ACTIVE_HARDWARE_DISABLED.swap(true, Ordering::Relaxed) {
+        ACTIVE_HARDWARE_DISABLES.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "inductor-cdcl: disabling active hardware for this solver after deterministic failure: {error}"
+        );
+    }
 }
 
 fn flush_batch_locked(state: &mut ShadowState, batch_index: usize) {
@@ -3859,7 +3885,7 @@ pub fn solve_active_batch_with_min(
         ACTIVE_ERROR.fetch_add(n_pending as u64, Ordering::Relaxed);
         return output;
     };
-    for mut group in groups {
+    'groups: for mut group in groups {
         let mut context_load_ns = 0u64;
         let context_update = plan_context_update(state.loaded_context.as_ref(), &group.context);
         let mut context_ready = context_update == ContextUpdate::Ready;
@@ -3951,6 +3977,42 @@ pub fn solve_active_batch_with_min(
                         ACTIVE_COMBINED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                         ACTIVE_COMBINED_FALLBACK_NS.fetch_add(combined_ns, Ordering::Relaxed);
                         state.loaded_context = None;
+                        if deterministic_active_failure(&error) {
+                            if let Some(query) = queries.first() {
+                                let max_lit_var = query
+                                    .assumptions
+                                    .iter()
+                                    .chain(query.constraints.iter().flatten())
+                                    .map(|lit| u32::from(*lit) >> 1)
+                                    .max()
+                                    .unwrap_or(0);
+                                let max_domain_var = query
+                                    .domain
+                                    .iter()
+                                    .map(|var| u32::from(*var))
+                                    .max()
+                                    .unwrap_or(0);
+                                let constraint_words: usize = query
+                                    .constraints
+                                    .iter()
+                                    .map(|clause| 1 + clause.len())
+                                    .sum();
+                                eprintln!(
+                                    "inductor-cdcl: rejected context/query shape vars {} clauses {} assumptions {} constraint-words {} domain {} max-lit-var {} max-domain-var {} frame {}",
+                                    group.context.n_var,
+                                    group.context.clauses.len(),
+                                    query.assumptions.len(),
+                                    constraint_words,
+                                    query.domain.len(),
+                                    max_lit_var,
+                                    max_domain_var,
+                                    query.frame,
+                                );
+                            }
+                            ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                            disable_active_hardware(&error);
+                            break 'groups;
+                        }
                         let load_start = std::time::Instant::now();
                         let kernel_before = direct_kernel_ns();
                         let loaded = state
@@ -3970,7 +4032,11 @@ pub fn solve_active_batch_with_min(
                         if let Err(error) = loaded {
                             eprintln!("inductor-cdcl: fallback context load failed: {error}");
                             ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
-                            continue;
+                            // One solver process owns one transition system.
+                            // Repeating an exact-load failure for every block
+                            // frontier only manufactures RPC/stale-lease work.
+                            disable_active_hardware(&error);
+                            break 'groups;
                         }
                         ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
                         context_ready = true;
@@ -4687,13 +4753,15 @@ pub fn flush_and_report() {
             );
         }
         eprintln!(
-            "inductor-cdcl: active pair-scheduler {}, transport unavailable {}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, unavailable calls/queries {}/{}, context loads {}, appends {}/{} clauses (fallbacks {}), combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load/append {:.3}/{:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-state {:.3} ms, UNSAT-state {:.3} ms",
+            "inductor-cdcl: active pair-scheduler {}, transport unavailable {}, hardware disabled {}/{}, passes {} (skipped {}, offered {}, max-ready {}), candidates {}, skipped-small-batch {}, offered {}, batches {}, unavailable calls/queries {}/{}, context loads {}, appends {}/{} clauses (fallbacks {}), combined ok/fallback {}/{}, hw SAT {}, hw UNSAT {}, unknown {}, errors {}, effective conclusive used/generated {}/{}, validation rejected {}, unconsumed {}, hw work decisions/conflicts/propagations/learnts {}/{}/{}/{}, SAT used {}, rejected SAT {}, model lift succeeded/attempted {}/{}, predecessor lits full/result {}/{}, lift {:.3} ms, UNSAT cores used {}, rejected {}, UNSAT lits assumptions/hw-core/cpu-core {}/{}/{}, CPU fallbacks executed {}, block cost-gate rejected {}, block CPU samples {} mean {:.3} us, calibrations above-threshold/total {}/{}, route enable/disable {}/{}, latest representative {:.3} us route {}, calibration {:.3} ms, async harvested/launched {}/{}, prepare/wall/join {:.3}/{:.3}/{:.3} ms, init/wait {:.3}/{:.3} ms, load/append {:.3}/{:.3} ms, combined attempts {:.3} ms, batches {:.3} ms, SAT-state {:.3} ms, UNSAT-state {:.3} ms",
             if pair_scheduler_enabled() {
                 "on"
             } else {
                 "off"
             },
             ACTIVE_TRANSPORT_UNAVAILABLE.load(Ordering::Relaxed),
+            ACTIVE_HARDWARE_DISABLED.load(Ordering::Relaxed),
+            ACTIVE_HARDWARE_DISABLES.load(Ordering::Relaxed),
             ACTIVE_PASSES.load(Ordering::Relaxed),
             ACTIVE_SKIPPED_PASSES.load(Ordering::Relaxed),
             ACTIVE_OFFERED_PASSES.load(Ordering::Relaxed),
@@ -5018,6 +5086,17 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn deterministic_device_failures_trip_the_solver_run_circuit_breaker() {
+        assert!(deterministic_active_failure(&HardwareError::Capacity));
+        assert!(deterministic_active_failure(&HardwareError::Command(-103)));
+        assert!(deterministic_active_failure(&HardwareError::Decode(
+            BatchDecodeError::Backend(1),
+        )));
+        assert!(!deterministic_active_failure(&HardwareError::Command(-32)));
+        assert!(!deterministic_active_failure(&HardwareError::Unavailable));
+    }
 
     #[test]
     fn mic_chain_batch_wire_round_trip_keeps_records_independent() {
