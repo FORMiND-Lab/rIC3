@@ -46,6 +46,13 @@ ic3_inn_noctg = "ic3 --inn --ctg=false"
 bmc = "bmc --step 1"
 bmc_kissat_10 = "bmc --kissat --step 10"
 
+# A narrow CPU/FPGA A/B. These are the same two workers selected by the
+# automatic FPGA allowlist, without the fourteen CPU/BMC workers that usually
+# finish first and reduce accelerator activity to a few startup inquiries.
+[fpga_pair]
+ic3 = "ic3"
+ic3_ctg_limit = "ic3 --ctg-max 5 --ctg-limit 15 --drop-po=false"
+
 [bl_hwmcc]
 ic3 = "ic3"
 ic3_no_preproc = "ic3 --ctg=false --frts=false --scorr=false --drop-po=false"
