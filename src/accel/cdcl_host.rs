@@ -2305,19 +2305,24 @@ fn paired_static_selected(query: &IncrementalQuery) -> bool {
     query.frame >= paired_min_frame() && query.assumptions.len() <= paired_max_assumptions()
 }
 
+fn pair_scheduler_setting(value: Option<&str>, throughput: bool) -> bool {
+    value
+        .map(|value| !matches!(value, "0" | "false" | "off"))
+        .unwrap_or(throughput)
+}
+
 fn pair_scheduler_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("INDUCTOR_CDCL_PAIR_SCHEDULER")
-            .ok()
-            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-            // Static size is not a stable predictor once each physical lane
-            // retains phase/activity history.  On the repaired loader the
-            // identical 229-query multiplier campaign repeatedly took
-            // ~54.66 ms sorted versus 47.8--48.1 ms in IC3 order.  Preserve
-            // caller order by default; keep sorting as an explicit research
-            // switch while a history-aware scheduler is developed.
-            .unwrap_or(false)
+        let setting = std::env::var("INDUCTOR_CDCL_PAIR_SCHEDULER").ok();
+        // A single multiplier diagnostic originally regressed, so this
+        // remained research-only. The fixed ten-AIGER qualification then
+        // reproduced lower completed-model wall time on both the 125 MHz
+        // production image (-8.1%) and the widened 120 MHz candidate (-12.4%).
+        // Enable it only for the explicitly qualified throughput profile;
+        // ordinary active/shadow diagnostics preserve caller order, and the
+        // explicit switch remains an exact opt-out.
+        pair_scheduler_setting(setting.as_deref(), HardwareCdcl::throughput_enabled())
     })
 }
 
@@ -5756,5 +5761,15 @@ mod tests {
             [0, 2, 3, 1]
         );
         assert_eq!(pair_cost(&pending), 10);
+    }
+
+    #[test]
+    fn pair_scheduler_defaults_only_in_throughput_mode() {
+        assert!(!pair_scheduler_setting(None, false));
+        assert!(pair_scheduler_setting(None, true));
+        assert!(pair_scheduler_setting(Some("1"), false));
+        assert!(!pair_scheduler_setting(Some("0"), true));
+        assert!(!pair_scheduler_setting(Some("false"), true));
+        assert!(!pair_scheduler_setting(Some("off"), true));
     }
 }
