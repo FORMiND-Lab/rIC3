@@ -1457,6 +1457,7 @@ static ACTIVE_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TRUSTED_SAT_INSTALLED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TRUSTED_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TRUSTED_SAT_STALE_REVALIDATED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRUSTED_SAT_REVISION_REUSED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_LIFT_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_LIFT_SUCCEEDED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_FULL_LITS: AtomicU64 = AtomicU64::new(0);
@@ -4154,6 +4155,10 @@ pub fn note_active_trusted_sat_stale() {
     ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn note_active_trusted_sat_revision_reused() {
+    ACTIVE_TRUSTED_SAT_REVISION_REUSED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn note_active_sat_lift(
     attempted: bool,
     succeeded: bool,
@@ -4881,9 +4886,10 @@ pub fn flush_and_report() {
         );
         if active_skip_cpu_check() {
             eprintln!(
-                "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, stale SAT discarded {}, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
+                "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, revision-fresh SAT reused {}, stale SAT discarded {}, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
                 ACTIVE_TRUSTED_SAT_INSTALLED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_SAT_REJECTED.load(Ordering::Relaxed),
+                ACTIVE_TRUSTED_SAT_REVISION_REUSED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_UNSAT_INSTALLED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_UNSAT_REJECTED.load(Ordering::Relaxed),

@@ -20,6 +20,7 @@ struct CachedBlockInquiry {
     frame: usize,
     state: LitOrdVec,
     query: IncrementalQuery,
+    context_revision: u64,
     result: IncrementalResult,
     trusted_cpu: bool,
     hardware_selected: bool,
@@ -911,6 +912,7 @@ mod block_accel_policy_tests {
             frame,
             state: LitOrdVec::new(LitVec::from([lit])),
             query: IncrementalQuery::new(frame as u32, LitVec::from([lit])),
+            context_revision: 7,
             result,
             trusted_cpu: false,
             hardware_selected: true,
@@ -955,6 +957,23 @@ mod block_accel_policy_tests {
     }
 
     #[test]
+    fn revision_trust_requires_the_exact_captured_formula() {
+        assert!(BlockBatchCache::trusted_sat_snapshot_fresh(0, 7, 8, false));
+        assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 7, false));
+        assert!(BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 7, true));
+        assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 8, true));
+    }
+
+    #[test]
+    fn block_window_defaults_to_the_multi_aiger_optimum() {
+        assert_eq!(BlockBatchCache::window_setting(None), 8);
+        assert_eq!(BlockBatchCache::window_setting(Some("16")), 16);
+        assert_eq!(BlockBatchCache::window_setting(Some("0")), 1);
+        assert_eq!(BlockBatchCache::window_setting(Some("100")), 64);
+        assert_eq!(BlockBatchCache::window_setting(Some("bad")), 8);
+    }
+
+    #[test]
     fn block_cache_does_not_retain_unknown_answers() {
         let a = Lit::new(Var::from(0), true);
         let mut cache = BlockBatchCache::default();
@@ -994,15 +1013,23 @@ mod block_accel_policy_tests {
 }
 
 impl BlockBatchCache {
+    fn window_setting(value: Option<&str>) -> usize {
+        value
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8)
+            .clamp(1, 64)
+    }
+
     fn window() -> usize {
         use std::sync::OnceLock;
         static WINDOW: OnceLock<usize> = OnceLock::new();
         *WINDOW.get_or_init(|| {
-            std::env::var("INDUCTOR_CDCL_BLOCK_WINDOW")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(64)
-                .clamp(1, 64)
+            let setting = std::env::var("INDUCTOR_CDCL_BLOCK_WINDOW").ok();
+            // The fixed ten-AIGER board sweep found 64 wastes speculative
+            // answers and 4 destabilizes zipcpu's proof path. Eight reduced
+            // completed-model wall time by 12.2% while FPGA service remained
+            // roughly 60% of the two main short-model wall times.
+            Self::window_setting(setting.as_deref())
         })
     }
 
@@ -1026,6 +1053,25 @@ impl BlockBatchCache {
                 .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
                 .unwrap_or(true)
         })
+    }
+
+    fn revision_trust_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_REVISION_TRUST")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        })
+    }
+
+    fn trusted_sat_snapshot_fresh(
+        cache_age: u64,
+        captured_revision: u64,
+        current_revision: u64,
+        revision_trust: bool,
+    ) -> bool {
+        cache_age == 0 || revision_trust && captured_revision == current_revision
     }
 
     fn async_enabled() -> bool {
@@ -1683,7 +1729,9 @@ impl IC3 {
                 let mut inquiries: Vec<_> = candidates
                     .iter()
                     .cloned()
-                    .zip(requests.iter().map(|(_, query)| query.clone()))
+                    .zip(requests.iter().map(|(solver, query)| {
+                        (query.clone(), solver.incremental_context_revision())
+                    }))
                     .zip(
                         results
                             .into_iter()
@@ -1692,12 +1740,13 @@ impl IC3 {
                     )
                     .map(
                         |(
-                            ((frame, state), query),
+                            ((frame, state), (query, context_revision)),
                             ((result, trusted_cpu), hardware_selected),
                         )| CachedBlockInquiry {
                             frame,
                             state,
                             query,
+                            context_revision,
                             result,
                             trusted_cpu,
                             hardware_selected,
@@ -1851,15 +1900,28 @@ impl IC3 {
                     }
                     (false, IncrementalResult::Sat { model }) => {
                         let validation_start = Instant::now();
-                        // Only a synchronous answer consumed in the same block
-                        // epoch is eligible for direct trust. Background and
-                        // retained answers can be perfectly correct for an old
-                        // frame snapshot, yet stale after CPU strengthening.
+                        // The production rule accepts only the same block
+                        // epoch. The research rule replaces that conservative
+                        // proxy with the exact captured per-frame formula
+                        // revision; any CPU strengthening changes the revision
+                        // and still forces the ordinary fallback.
+                        let current_revision = self.solvers[po.frame - 1]
+                            .dcs
+                            .incremental_context_revision();
+                        let snapshot_fresh = BlockBatchCache::trusted_sat_snapshot_fresh(
+                            entry.cache_age,
+                            entry.context_revision,
+                            current_revision,
+                            BlockBatchCache::revision_trust_enabled(),
+                        );
                         let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check()
-                            && entry.cache_age == 0
+                            && snapshot_fresh
                             && !BlockBatchCache::async_enabled();
                         let stale_trusted = crate::accel::cdcl_host::active_skip_cpu_check()
                             && !direct_trust;
+                        if direct_trust && entry.cache_age > 0 {
+                            crate::accel::cdcl_host::note_active_trusted_sat_revision_reused();
+                        }
                         if stale_trusted {
                             crate::accel::cdcl_host::note_active_trusted_sat_stale();
                         }
