@@ -2384,17 +2384,30 @@ fn query_work_score(query: &IncrementalQuery) -> u64 {
         .saturating_add(query.domain.len() as u64)
 }
 
+const COMPACT_FULL_LANE_LOCAL_CLAUSES: usize = 512;
+const COMPACT_FULL_LANE_LOCAL_LITERALS: usize = 8192;
+
+fn query_private_literal_count(query: &IncrementalQuery) -> usize {
+    query
+        .constraints
+        .iter()
+        .fold(0usize, |total, clause| total.saturating_add(clause.len()))
+}
+
+fn query_exceeds_compact_private_arena(query: &IncrementalQuery) -> bool {
+    query.constraints.len() > COMPACT_FULL_LANE_LOCAL_CLAUSES
+        || query_private_literal_count(query) > COMPACT_FULL_LANE_LOCAL_LITERALS
+}
+
 /// Rank pressure on the two independent private-arena dimensions. Multiplying
 /// by the opposite compact-lane bound compares each query's fraction of the
 /// 512-clause / 8192-literal arena without floating point. This score is used
-/// only to choose lane 0 versus lane 1 inside an already-selected pair.
+/// only when neither member of an already-selected pair fits the compact lane.
 fn query_private_arena_score(query: &IncrementalQuery) -> u64 {
-    let constraint_literals = query.constraints.iter().fold(0u64, |total, clause| {
-        total.saturating_add(clause.len() as u64)
-    });
+    let constraint_literals = query_private_literal_count(query) as u64;
     (query.constraints.len() as u64)
-        .saturating_mul(8192)
-        .max(constraint_literals.saturating_mul(512))
+        .saturating_mul(COMPACT_FULL_LANE_LOCAL_LITERALS as u64)
+        .max(constraint_literals.saturating_mul(COMPACT_FULL_LANE_LOCAL_CLAUSES as u64))
 }
 
 /// Two engines execute adjacent requests concurrently, so pairing the largest
@@ -2409,13 +2422,23 @@ fn schedule_query_pairs_for_layout<T>(
     pending.sort_by_cached_key(|item| std::cmp::Reverse(query_work_score(query_of(item))));
     if heterogeneous_full_lanes {
         for pair in pending.chunks_mut(2) {
-            if pair.len() == 2
-                && query_private_arena_score(query_of(&pair[0]))
-                    > query_private_arena_score(query_of(&pair[1]))
-            {
+            if pair.len() != 2 {
+                continue;
+            }
+            let first_exceeds = query_exceeds_compact_private_arena(query_of(&pair[0]));
+            let second_exceeds = query_exceeds_compact_private_arena(query_of(&pair[1]));
+            let swap = (first_exceeds && !second_exceeds)
+                || (first_exceeds
+                    && second_exceeds
+                    && query_private_arena_score(query_of(&pair[0]))
+                        > query_private_arena_score(query_of(&pair[1])));
+            if swap {
                 // Batch order maps the first record to the compact lane 0 and
-                // the second to the capacity lane 1. Original result indices
-                // travel with each query and are restored by the caller.
+                // the second to the capacity lane 1. Preserve the qualified
+                // default order when both queries fit lane 0: merely swapping
+                // fitting queries changes lane-local learnt/search history.
+                // Original result indices travel with each query and are
+                // restored by the caller.
                 pair.swap(0, 1);
             }
         }
@@ -5830,6 +5853,29 @@ mod tests {
         );
         assert!(
             query_private_arena_score(&pending[1].1) > query_private_arena_score(&pending[0].1)
+        );
+    }
+
+    #[test]
+    fn heterogeneous_pair_scheduler_preserves_fitting_pair_order() {
+        let mut more_pressure = IncrementalQuery::new(0, LitVec::new());
+        more_pressure.constraints = (0..511)
+            .map(|_| LitVec::from([Lit::new(Var::from(0), true)]))
+            .collect();
+        let mut less_pressure = IncrementalQuery::new(0, LitVec::new());
+        less_pressure.constraints = (0..510)
+            .map(|_| LitVec::from([Lit::new(Var::from(0), true)]))
+            .collect();
+        let mut pending = vec![(7usize, more_pressure), (3usize, less_pressure)];
+
+        schedule_query_pairs_for_layout(&mut pending, |(_, query)| query, true);
+
+        assert_eq!(
+            pending.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [7, 3],
+        );
+        assert!(
+            query_private_arena_score(&pending[0].1) > query_private_arena_score(&pending[1].1)
         );
     }
 
