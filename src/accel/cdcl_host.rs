@@ -20,7 +20,7 @@ use super::cdcl::{
 use crate::gipsat::decode_batch_results;
 use crate::gipsat::{
     BatchDecodeError, DagCnfSolver, IncrementalCdcl, IncrementalQuery, IncrementalResult,
-    pack_batch, solve_on_cpu_after_hardware_unknown,
+    QueryBudget, pack_batch, solve_on_cpu_after_hardware_unknown,
 };
 use logicrs::{Lit, LitVec, Var};
 #[cfg(has_cdcl_accel)]
@@ -176,12 +176,54 @@ pub fn register_frame_resident_clause(literals: &[Lit], lo: u32, hi: u32) {
         .push(ResidentClause::new(cursor, hi, literals));
 }
 
-fn frame_ranged_context(n_var: u32, transition: &[LitVec]) -> Option<ShadowContext> {
+fn canonical_clause_set<'a>(clauses: impl Iterator<Item = &'a LitVec>) -> Vec<Vec<u32>> {
+    let mut set: Vec<Vec<u32>> = clauses
+        .map(|clause| {
+            let mut raw: Vec<u32> = clause.iter().map(|lit| u32::from(*lit)).collect();
+            raw.sort_unstable();
+            raw.dedup();
+            raw
+        })
+        .collect();
+    set.sort_unstable();
+    set.dedup();
+    set
+}
+
+fn ranged_snapshot_matches(
+    clauses: &[ResidentClause],
+    frame: u32,
+    exact_lemmas: &[LitVec],
+) -> bool {
+    canonical_clause_set(
+        clauses
+            .iter()
+            .filter(|clause| clause.lo <= frame && frame <= clause.hi)
+            .map(|clause| &clause.literals),
+    ) == canonical_clause_set(exact_lemmas.iter())
+}
+
+fn frame_ranged_context(
+    n_var: u32,
+    transition: &[LitVec],
+    frame: u32,
+    exact_lemmas: &[LitVec],
+) -> Option<ShadowContext> {
     if !active_frame_ranges() {
         return None;
     }
     let registry = frame_range_registry().lock().ok()?;
     if registry.n_var != n_var || registry.transition != transition {
+        return None;
+    }
+    // The append-only range registry is a transport optimization, not the
+    // semantic authority. Clause subsumption, solver cloning and promotion to
+    // infinity can make its event log diverge from one frame solver's exact
+    // resident lemma snapshot. Only use the compact ranged representation when
+    // the active formula is set-equivalent; otherwise the caller falls back to
+    // an exact-frame snapshot. This is context maintenance, not result checking.
+    if !ranged_snapshot_matches(&registry.clauses, frame, exact_lemmas) {
+        FRAME_RANGE_SNAPSHOT_MISMATCH.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // Preserve registration order exactly. IC3 revisits lower frames, so `hi`
@@ -1382,13 +1424,17 @@ struct ActiveState {
     loaded_context: Option<LoadedContext>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PairedCpuWork {
     status: u32,
     elapsed_ns: u64,
     decisions: u64,
     conflicts: u64,
     propagations: u64,
+    /// Exact GipSAT payload for native semantic replay.  CSV consumers keep
+    /// using the scalar fields above; the binary replay stream additionally
+    /// uses the model/core as an independently computed oracle.
+    result: Option<IncrementalResult>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1622,6 +1668,7 @@ static ACTIVE_CONTEXT_APPEND_NS: AtomicU64 = AtomicU64::new(0);
 // the server process.
 static ACTIVE_CONTEXT_LOAD_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_APPEND_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static FRAME_RANGE_SNAPSHOT_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_FALLBACK_NS: AtomicU64 = AtomicU64::new(0);
@@ -1676,6 +1723,11 @@ static ARCH_TRACE_WRITER: std::sync::OnceLock<Option<std::sync::Mutex<BufWriter<
     std::sync::OnceLock::new();
 static ARCH_TRACE_BATCH_ID: AtomicU64 = AtomicU64::new(0);
 static ARCH_TRACE_QUERIES: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_WRITER: std::sync::OnceLock<
+    Option<std::sync::Mutex<BufWriter<std::fs::File>>>,
+> = std::sync::OnceLock::new();
+static EXACT_REPLAY_BATCHES: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_ZERO_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CONFLICT_0: AtomicU64 = AtomicU64::new(0);
@@ -2614,7 +2666,9 @@ impl BatchedSolverContext {
                 scope: ShadowContextScope::SharedTransition,
             })
         } else if active_frame_ranges() {
-            if let Some(context) = frame_ranged_context(self.n_var, &self.trans) {
+            if let Some(context) =
+                frame_ranged_context(self.n_var, &self.trans, self.frame, &self.lemmas)
+            {
                 // Refresh because IC3 can append a ranged lemma after this
                 // per-pass solver cache was built.
                 self.ranged = Some(context);
@@ -2708,7 +2762,7 @@ fn prepare_batched_query(
         query.constraints.truncate(n_existing_constraints);
     }
 
-    if let Some(context) = frame_ranged_context(n_var, &trans) {
+    if let Some(context) = frame_ranged_context(n_var, &trans, frame, &lemmas) {
         return (context, query, false);
     }
 
@@ -2849,6 +2903,7 @@ fn measure_reference_cpu(
     requests: &[(&DagCnfSolver, IncrementalQuery)],
     selected: &[bool],
     apply_paired_filter: bool,
+    retain_result: bool,
 ) -> Vec<PairedCpuWork> {
     requests
         .iter()
@@ -2864,20 +2919,183 @@ fn measure_reference_cpu(
             // profiling copy. Remove FPGA-only budgets for the exact CPU run.
             let mut cpu: DagCnfSolver = (**solver).clone();
             let mut cpu_query = query.clone();
-            cpu_query.budget.decisions = 0;
-            cpu_query.budget.conflicts = 0;
+            cpu_query.budget = QueryBudget::default();
             let start = std::time::Instant::now();
             let result = cpu.solve_incremental(&cpu_query);
             let elapsed_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let status = result_status(&result);
             PairedCpuWork {
-                status: result_status(&result),
+                status,
                 elapsed_ns,
                 decisions: u64::from(cpu.probe.n_decide),
                 conflicts: u64::from(cpu.probe.n_conflict),
                 propagations: u64::from(cpu.probe.n_prop),
+                result: retain_result.then_some(result),
             }
         })
         .collect()
+}
+
+const EXACT_REPLAY_VERSION: u32 = 1;
+const EXACT_REPLAY_BATCH: u32 = 1;
+
+fn exact_replay_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_EXACT_REPLAY_QUERIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(256)
+    })
+}
+
+fn exact_replay_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
+    EXACT_REPLAY_WRITER
+        .get_or_init(|| {
+            let path = std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY")?;
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!(
+                        "inductor-cdcl: cannot create exact replay {}: {error}",
+                        std::path::Path::new(&path).display(),
+                    );
+                    return None;
+                }
+            };
+            let mut writer = BufWriter::new(file);
+            // Eight-byte magic, stream version and the request ABI version.
+            if writer.write_all(b"INDEXACT").is_err()
+                || writer
+                    .write_all(&EXACT_REPLAY_VERSION.to_le_bytes())
+                    .is_err()
+                || writer.write_all(&ABI_VERSION.to_le_bytes()).is_err()
+            {
+                return None;
+            }
+            Some(std::sync::Mutex::new(writer))
+        })
+        .as_ref()
+}
+
+#[inline]
+fn exact_push_u64(words: &mut Vec<u32>, value: u64) {
+    words.push(value as u32);
+    words.push((value >> 32) as u32);
+}
+
+/// Serialize one production-scheduled batch in the exact word encoding used
+/// by the C++/HLS boundary.  The stream deliberately duplicates its logical
+/// context per record: records are self-contained, while the native replayer
+/// can still model a two-entry resident-context cache and distinguish hits,
+/// prefix appends and replacements.
+fn record_exact_replay_batch(
+    pass_id: u64,
+    context: &ShadowContext,
+    pending: &[(usize, IncrementalQuery)],
+    cpu: &[PairedCpuWork],
+) {
+    let limit = exact_replay_limit();
+    if limit == 0 {
+        return;
+    }
+    let written = EXACT_REPLAY_QUERIES.load(Ordering::Relaxed);
+    if written >= limit {
+        return;
+    }
+    let take = pending.len().min((limit - written) as usize);
+    if take == 0 {
+        return;
+    }
+    let Some(writer) = exact_replay_writer() else {
+        return;
+    };
+
+    let batch_id = EXACT_REPLAY_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut words = Vec::new();
+    // Filled after the record has been assembled; length excludes itself.
+    words.push(0);
+    words.push(EXACT_REPLAY_BATCH);
+    exact_push_u64(&mut words, pass_id);
+    exact_push_u64(&mut words, batch_id);
+    words.push(match context.scope {
+        ShadowContextScope::SharedTransition => 0,
+        ShadowContextScope::ExactFrame(_) => 1,
+        ShadowContextScope::FrameRanged => 2,
+    });
+    words.push(context.n_var);
+    words.push(context.clauses.len() as u32);
+    words.push(take as u32);
+    for clause in &context.clauses {
+        words.push(clause.lo);
+        words.push(clause.hi);
+        words.push(clause.literals.len() as u32);
+        words.extend(clause.literals.iter().map(|lit| u32::from(*lit)));
+    }
+    for (index, query) in pending.iter().take(take) {
+        let Some(work) = cpu.get(*index) else {
+            return;
+        };
+        let Some(result) = work.result.as_ref() else {
+            return;
+        };
+        // Exact replay is a correctness gate, not a latency-limit experiment:
+        // remove scheduling budgets and cross-query learnt retention so every
+        // record must reach the CPU oracle's conclusive result independently.
+        let mut query = query.clone();
+        query.budget = QueryBudget::default();
+        query.keep_learnts = false;
+        let (header, payload) = query.pack();
+        let query_words = header.as_words().len() + payload.len();
+        words.push(*index as u32);
+        words.push(query_words as u32);
+        words.extend(header.as_words());
+        words.extend(payload);
+        words.push(result_status(result));
+        words.push(result_reason(result));
+        match result {
+            IncrementalResult::Sat { model } => {
+                words.push(0);
+                words.push(model.len() as u32);
+                words.extend(model.iter().map(|lit| u32::from(*lit)));
+            }
+            IncrementalResult::Unsat {
+                core,
+                used_constraints,
+            } => {
+                words.push(u32::from(*used_constraints));
+                words.push(core.len() as u32);
+                words.extend(core.iter().map(|lit| u32::from(*lit)));
+            }
+            IncrementalResult::Unknown(_) => {
+                words.push(0);
+                words.push(0);
+            }
+        }
+    }
+    words[0] = (words.len() - 1) as u32;
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
+    for word in words {
+        if writer.write_all(&word.to_le_bytes()).is_err() {
+            return;
+        }
+    }
+    EXACT_REPLAY_QUERIES.fetch_add(take as u64, Ordering::Relaxed);
+}
+
+fn flush_exact_replay_writer() {
+    if let Some(writer) = exact_replay_writer()
+        && let Ok(mut writer) = writer.lock()
+    {
+        let _ = writer.flush();
+    }
 }
 
 fn comparison_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
@@ -4062,7 +4280,11 @@ pub fn solve_active_batch_with_min(
     }
     ACTIVE_OFFERED_PASSES.fetch_add(1, Ordering::Relaxed);
     ACTIVE_OFFERED.fetch_add(planned_count as u64, Ordering::Relaxed);
-    let reference_cpu = compare_cpu.then(|| measure_reference_cpu(&requests, &planned, paired));
+    let retain_exact_result = trace_only
+        && std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some();
+    let reference_cpu = compare_cpu.then(|| {
+        measure_reference_cpu(&requests, &planned, paired, retain_exact_result)
+    });
     if let Some(cpu) = reference_cpu.as_ref() {
         PAIRED_BASELINE_CPU_NS.fetch_add(
             cpu.iter().map(|work| work.elapsed_ns).sum(),
@@ -4075,6 +4297,12 @@ pub fn solve_active_batch_with_min(
             for group in &groups {
                 for range in &group.batches {
                     record_architecture_trace_batch(
+                        pass_id,
+                        &group.context,
+                        &group.pending[range.clone()],
+                        cpu,
+                    );
+                    record_exact_replay_batch(
                         pass_id,
                         &group.context,
                         &group.pending[range.clone()],
@@ -4847,11 +5075,16 @@ pub fn flush_and_report() {
     }
     if architecture_trace_enabled() {
         flush_architecture_trace_writer();
+        flush_exact_replay_writer();
         eprintln!(
-            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}",
+            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, file {}; ranged snapshot fallbacks {}",
             ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
             ARCH_TRACE_QUERIES.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_TRACE_CSV").unwrap_or_else(|_| "disabled".to_string()),
+            EXACT_REPLAY_BATCHES.load(Ordering::Relaxed),
+            EXACT_REPLAY_QUERIES.load(Ordering::Relaxed),
+            std::env::var("INDUCTOR_CDCL_EXACT_REPLAY").unwrap_or_else(|_| "disabled".to_string()),
+            FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
         );
     }
     if paired_enabled() {
@@ -6043,5 +6276,28 @@ mod tests {
         assert!(!pair_scheduler_setting(Some("0"), true));
         assert!(!pair_scheduler_setting(Some("false"), true));
         assert!(!pair_scheduler_setting(Some("off"), true));
+    }
+
+    #[test]
+    fn ranged_context_requires_exact_active_lemma_set() {
+        let a = Lit::new(Var::from(1), true);
+        let b = Lit::new(Var::from(2), false);
+        let clauses = vec![
+            ResidentClause::new(1, 3, LitVec::from([a, b])),
+            // A duplicate with different literal order is semantically the
+            // same clause and must not force a reload.
+            ResidentClause::new(2, 2, LitVec::from([b, a])),
+            ResidentClause::new(4, 5, LitVec::from([!a])),
+        ];
+        assert!(ranged_snapshot_matches(
+            &clauses,
+            2,
+            &[LitVec::from([a, b])],
+        ));
+        assert!(!ranged_snapshot_matches(
+            &clauses,
+            4,
+            &[LitVec::from([a, b])],
+        ));
     }
 }
