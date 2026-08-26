@@ -1728,6 +1728,7 @@ static EXACT_REPLAY_WRITER: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 static EXACT_REPLAY_BATCHES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_MICS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_ZERO_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CONFLICT_0: AtomicU64 = AtomicU64::new(0);
@@ -2938,6 +2939,12 @@ fn measure_reference_cpu(
 
 const EXACT_REPLAY_VERSION: u32 = 1;
 const EXACT_REPLAY_BATCH: u32 = 1;
+const EXACT_REPLAY_MIC: u32 = 2;
+
+pub struct ExactMicReplayCapture {
+    context: ShadowContext,
+    request: Vec<u32>,
+}
 
 fn exact_replay_limit() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2946,6 +2953,16 @@ fn exact_replay_limit() -> u64 {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(256)
+    })
+}
+
+fn exact_mic_replay_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_EXACT_REPLAY_MICS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16)
     })
 }
 
@@ -3088,6 +3105,97 @@ fn record_exact_replay_batch(
         }
     }
     EXACT_REPLAY_QUERIES.fetch_add(take as u64, Ordering::Relaxed);
+}
+
+/// Snapshot one ordinary CPU MIC before it mutates the solver. The request is
+/// deliberately unlimited, model-guided and proof-neutral: the native C++
+/// replayer must finish the whole dependent traversal from this exact formula.
+pub fn begin_exact_mic_replay(
+    solver: &DagCnfSolver,
+    cube: &[(Lit, Lit)],
+    constraints: &[LitVec],
+    protected_index: usize,
+) -> Option<ExactMicReplayCapture> {
+    let limit = exact_mic_replay_limit();
+    if std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_none()
+        || limit == 0
+        || EXACT_REPLAY_MICS.load(Ordering::Relaxed) >= limit
+        || cube.len() < 2
+    {
+        return None;
+    }
+    let mut cache = BatchedSolverContext::new(solver);
+    let context = cache.context(false).clone();
+    let frame = match context.scope {
+        ShadowContextScope::ExactFrame(frame) => frame,
+        ShadowContextScope::FrameRanged => solver.accel_level,
+        ShadowContextScope::SharedTransition => return None,
+    };
+    let mut request = pack_mic_chain_request(
+        context.n_var,
+        frame,
+        cube,
+        constraints,
+        protected_index,
+        0,
+        0,
+        0,
+    )
+    .ok()?;
+    request[2] |= MIC_MODEL_SHRINK;
+    Some(ExactMicReplayCapture { context, request })
+}
+
+/// Complete one exact MIC record with the final cube produced by ordinary
+/// GipSAT. CSim either has to reproduce it or emit an independently provable
+/// alternative inductive cube; the live IC3 result remains untouched.
+pub fn finish_exact_mic_replay(capture: Option<ExactMicReplayCapture>, output: &LitVec) {
+    let Some(capture) = capture else { return };
+    if output.is_empty() {
+        return;
+    }
+    let limit = exact_mic_replay_limit();
+    let Some(writer) = exact_replay_writer() else {
+        return;
+    };
+    let Ok(previous) =
+        EXACT_REPLAY_MICS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < limit).then_some(current + 1)
+        })
+    else {
+        return;
+    };
+    let mic_id = previous + 1;
+    let mut words = Vec::new();
+    words.push(0);
+    words.push(EXACT_REPLAY_MIC);
+    exact_push_u64(&mut words, mic_id);
+    words.push(match capture.context.scope {
+        ShadowContextScope::SharedTransition => 0,
+        ShadowContextScope::ExactFrame(_) => 1,
+        ShadowContextScope::FrameRanged => 2,
+    });
+    words.push(capture.context.n_var);
+    words.push(capture.context.clauses.len() as u32);
+    words.push(capture.request.len() as u32);
+    words.push(output.len() as u32);
+    for clause in &capture.context.clauses {
+        words.push(clause.lo);
+        words.push(clause.hi);
+        words.push(clause.literals.len() as u32);
+        words.extend(clause.literals.iter().map(|lit| u32::from(*lit)));
+    }
+    words.extend(capture.request);
+    words.extend(output.iter().map(|lit| u32::from(*lit)));
+    words[0] = (words.len() - 1) as u32;
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
+    for word in words {
+        if writer.write_all(&word.to_le_bytes()).is_err() {
+            return;
+        }
+    }
 }
 
 fn flush_exact_replay_writer() {
@@ -5077,12 +5185,13 @@ pub fn flush_and_report() {
         flush_architecture_trace_writer();
         flush_exact_replay_writer();
         eprintln!(
-            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, file {}; ranged snapshot fallbacks {}",
+            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, file {}; ranged snapshot fallbacks {}",
             ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
             ARCH_TRACE_QUERIES.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_TRACE_CSV").unwrap_or_else(|_| "disabled".to_string()),
             EXACT_REPLAY_BATCHES.load(Ordering::Relaxed),
             EXACT_REPLAY_QUERIES.load(Ordering::Relaxed),
+            EXACT_REPLAY_MICS.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_EXACT_REPLAY").unwrap_or_else(|_| "disabled".to_string()),
             FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
         );

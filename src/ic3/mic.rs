@@ -1173,6 +1173,27 @@ impl IC3 {
             let parent = GHashSet::from_iter(parent);
             cube.sort_by_key(|x| parent.contains(x));
         }
+        // Capture the exact formula and the already-ordered CPU traversal.
+        // This is a simulation oracle only: it neither enables the hardware
+        // MIC path nor changes the cube consumed by the live proof.
+        let exact_mic_replay = if parameter.level == 0 {
+            cube.iter()
+                .position(|lit| !self.tsctx.cube_subsume_init(std::slice::from_ref(lit)))
+                .and_then(|protected_index| {
+                    let pairs: Vec<_> = cube
+                        .iter()
+                        .map(|lit| (*lit, self.tsctx.next(*lit)))
+                        .collect();
+                    crate::accel::cdcl_host::begin_exact_mic_replay(
+                        &self.solvers[frame - 1].dcs,
+                        &pairs,
+                        constraint,
+                        protected_index,
+                    )
+                })
+        } else {
+            None
+        };
         let mut keep = GHashSet::new();
         // Independent MIC batches lose almost all useful tail work as soon as
         // one early drop shrinks the cube. The full-CDCL MIC-chain command
@@ -1467,6 +1488,7 @@ impl IC3 {
         if parameter.level == 0 {
             self.solvers[frame - 1].unset_domain();
         }
+        crate::accel::cdcl_host::finish_exact_mic_replay(exact_mic_replay, &cube);
         self.activity.bump_cube_activity(&cube);
         self.statistic.block.mic_time += start.elapsed();
         cube
