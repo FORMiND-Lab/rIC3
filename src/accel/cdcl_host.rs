@@ -3338,8 +3338,12 @@ fn deterministic_active_failure(error: &HardwareError) -> bool {
         // same frontier shape will not become supported on a retry.
         HardwareError::Decode(_)
             | HardwareError::Capacity
-            // The C++ bridge maps kernel TOP_CAPACITY (3) to -103.
-            | HardwareError::Command(-103)
+            // The C++ bridge maps the kernel's top-level BAD_COMMAND,
+            // BAD_PAYLOAD, CAPACITY and RESPONSE_CAPACITY statuses to
+            // -101..=-104. Retrying the same solver/image/shape cannot change
+            // any of them; an older image otherwise produces one error per
+            // frontier batch instead of falling back once to the CPU.
+            | HardwareError::Command(-104..=-101)
     )
 }
 
@@ -5190,10 +5194,14 @@ mod tests {
     #[test]
     fn deterministic_device_failures_trip_the_solver_run_circuit_breaker() {
         assert!(deterministic_active_failure(&HardwareError::Capacity));
-        assert!(deterministic_active_failure(&HardwareError::Command(-103)));
+        for status in -104..=-101 {
+            assert!(deterministic_active_failure(&HardwareError::Command(status)));
+        }
         assert!(deterministic_active_failure(&HardwareError::Decode(
             BatchDecodeError::Backend(1),
         )));
+        assert!(!deterministic_active_failure(&HardwareError::Command(-105)));
+        assert!(!deterministic_active_failure(&HardwareError::Command(-100)));
         assert!(!deterministic_active_failure(&HardwareError::Command(-32)));
         assert!(!deterministic_active_failure(&HardwareError::Unavailable));
     }
