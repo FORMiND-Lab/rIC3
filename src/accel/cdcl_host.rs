@@ -2327,6 +2327,15 @@ fn pair_scheduler_enabled() -> bool {
     })
 }
 
+fn heterogeneous_full_lanes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_HETEROGENEOUS_FULL_LANES")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
 fn active_resident_lemmas() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -2375,12 +2384,46 @@ fn query_work_score(query: &IncrementalQuery) -> u64 {
         .saturating_add(query.domain.len() as u64)
 }
 
+/// Rank pressure on the two independent private-arena dimensions. Multiplying
+/// by the opposite compact-lane bound compares each query's fraction of the
+/// 512-clause / 8192-literal arena without floating point. This score is used
+/// only to choose lane 0 versus lane 1 inside an already-selected pair.
+fn query_private_arena_score(query: &IncrementalQuery) -> u64 {
+    let constraint_literals = query.constraints.iter().fold(0u64, |total, clause| {
+        total.saturating_add(clause.len() as u64)
+    });
+    (query.constraints.len() as u64)
+        .saturating_mul(8192)
+        .max(constraint_literals.saturating_mul(512))
+}
+
 /// Two engines execute adjacent requests concurrently, so pairing the largest
 /// estimates together minimizes the sum of pair maxima for a fixed set of
 /// scores. The caller keeps an original index alongside each active query and
 /// restores result order after the FPGA returns.
-fn schedule_query_pairs<T>(pending: &mut [T], query_of: impl Fn(&T) -> &IncrementalQuery) {
+fn schedule_query_pairs_for_layout<T>(
+    pending: &mut [T],
+    query_of: impl Fn(&T) -> &IncrementalQuery,
+    heterogeneous_full_lanes: bool,
+) {
     pending.sort_by_cached_key(|item| std::cmp::Reverse(query_work_score(query_of(item))));
+    if heterogeneous_full_lanes {
+        for pair in pending.chunks_mut(2) {
+            if pair.len() == 2
+                && query_private_arena_score(query_of(&pair[0]))
+                    > query_private_arena_score(query_of(&pair[1]))
+            {
+                // Batch order maps the first record to the compact lane 0 and
+                // the second to the capacity lane 1. Original result indices
+                // travel with each query and are restored by the caller.
+                pair.swap(0, 1);
+            }
+        }
+    }
+}
+
+fn schedule_query_pairs<T>(pending: &mut [T], query_of: impl Fn(&T) -> &IncrementalQuery) {
+    schedule_query_pairs_for_layout(pending, query_of, heterogeneous_full_lanes_enabled());
 }
 
 fn query_request_words(query: &IncrementalQuery) -> Option<usize> {
@@ -5767,6 +5810,27 @@ mod tests {
             [0, 2, 3, 1]
         );
         assert_eq!(pair_cost(&pending), 10);
+    }
+
+    #[test]
+    fn heterogeneous_pair_scheduler_places_arena_pressure_on_lane_one() {
+        let mut pressure = IncrementalQuery::new(0, LitVec::new());
+        pressure.constraints = (0..513)
+            .map(|_| LitVec::from([Lit::new(Var::from(0), true)]))
+            .collect();
+        let mut short = IncrementalQuery::new(0, LitVec::new());
+        short.domain.push(Var::from(0));
+        let mut pending = vec![(7usize, pressure), (3usize, short)];
+
+        schedule_query_pairs_for_layout(&mut pending, |(_, query)| query, true);
+
+        assert_eq!(
+            pending.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [3, 7],
+        );
+        assert!(
+            query_private_arena_score(&pending[1].1) > query_private_arena_score(&pending[0].1)
+        );
     }
 
     #[test]
