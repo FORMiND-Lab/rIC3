@@ -1672,6 +1672,10 @@ static PAIRED_PREFLIGHT_CLONE_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_PREFLIGHT_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
 static PAIRED_WRITER: std::sync::OnceLock<Option<std::sync::Mutex<BufWriter<std::fs::File>>>> =
     std::sync::OnceLock::new();
+static ARCH_TRACE_WRITER: std::sync::OnceLock<Option<std::sync::Mutex<BufWriter<std::fs::File>>>> =
+    std::sync::OnceLock::new();
+static ARCH_TRACE_BATCH_ID: AtomicU64 = AtomicU64::new(0);
+static ARCH_TRACE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_ZERO_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CONFLICT_0: AtomicU64 = AtomicU64::new(0);
@@ -2914,6 +2918,114 @@ fn comparison_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::Fi
         .as_ref()
 }
 
+fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
+    ARCH_TRACE_WRITER
+        .get_or_init(|| {
+            let path = std::env::var_os("INDUCTOR_CDCL_TRACE_CSV")?;
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!(
+                        "inductor-cdcl: cannot create architecture trace {}: {error}",
+                        std::path::Path::new(&path).display(),
+                    );
+                    return None;
+                }
+            };
+            let mut writer = BufWriter::new(file);
+            if writeln!(
+                writer,
+                "pass_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_scope\tcontext_vars\tcontext_clauses\tcontext_literals\tcontext_words"
+            )
+            .is_err()
+            {
+                return None;
+            }
+            Some(std::sync::Mutex::new(writer))
+        })
+        .as_ref()
+}
+
+fn record_architecture_trace_batch(
+    pass_id: u64,
+    context: &ShadowContext,
+    pending: &[(usize, IncrementalQuery)],
+    cpu: &[PairedCpuWork],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let Some(writer) = architecture_trace_writer() else {
+        return;
+    };
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
+    let batch_id = ARCH_TRACE_BATCH_ID.fetch_add(1, Ordering::Relaxed) + 1;
+    ARCH_TRACE_QUERIES.fetch_add(pending.len() as u64, Ordering::Relaxed);
+    let context_literals = context
+        .clauses
+        .iter()
+        .map(|clause| clause.literals.len() as u64)
+        .sum::<u64>();
+    let context_words = context.clauses.iter().fold(2u64, |words, clause| {
+        words.saturating_add(3u64.saturating_add(clause.literals.len() as u64))
+    });
+    let context_scope = match context.scope {
+        ShadowContextScope::SharedTransition => "shared",
+        ShadowContextScope::ExactFrame(_) => "exact-frame",
+        ShadowContextScope::FrameRanged => "frame-ranged",
+    };
+    for (position, (index, query)) in pending.iter().enumerate() {
+        let Some(cpu_work) = cpu.get(*index) else {
+            continue;
+        };
+        let constraint_literals = query
+            .constraints
+            .iter()
+            .map(|clause| clause.len() as u64)
+            .sum::<u64>();
+        let _ = writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            pass_id,
+            batch_id,
+            pending.len(),
+            position,
+            index,
+            query.frame,
+            cpu_work.status,
+            cpu_work.elapsed_ns,
+            cpu_work.decisions,
+            cpu_work.conflicts,
+            cpu_work.propagations,
+            query.assumptions.len(),
+            query.constraints.len(),
+            constraint_literals,
+            query.domain.len(),
+            query_request_words(query).unwrap_or(0),
+            context_scope,
+            context.n_var,
+            context.clauses.len(),
+            context_literals,
+            context_words,
+        );
+    }
+}
+
+fn flush_architecture_trace_writer() {
+    if let Some(writer) = architecture_trace_writer()
+        && let Ok(mut writer) = writer.lock()
+    {
+        let _ = writer.flush();
+    }
+}
+
 fn record_comparison_batch(
     pass_id: u64,
     context: &ShadowContext,
@@ -3042,8 +3154,12 @@ pub fn shadow_enabled() -> bool {
 /// GipSAT; qualified throughput mode may instead restore structurally complete
 /// SAT models and UNSAT cores directly. Active and shadow modes are separate so
 /// one process never opens the singleton XRT bridge twice.
+fn architecture_trace_enabled() -> bool {
+    std::env::var_os("INDUCTOR_CDCL_TRACE_CSV").is_some()
+}
+
 pub fn active_enabled() -> bool {
-    std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some()
+    (std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some() || architecture_trace_enabled())
         && std::env::var_os("INDUCTOR_CDCL_PAIRED").is_none()
         && std::env::var_os("INDUCTOR_CDCL_SHADOW").is_none()
         && std::env::var_os("INDUCTOR_ACCEL").is_none()
@@ -3313,6 +3429,9 @@ fn active_state() -> &'static std::sync::Mutex<ActiveState> {
 /// `ACTIVE_STATE` is a `OnceLock`, so a missing device never triggers another
 /// XRT initialization attempt in the same rIC3 process.
 fn active_hardware_available() -> bool {
+    if architecture_trace_enabled() {
+        return true;
+    }
     if ACTIVE_HARDWARE_DISABLED.load(Ordering::Relaxed) {
         return false;
     }
@@ -3839,7 +3958,8 @@ pub fn solve_active_batch_with_min(
         return output;
     }
     let paired = paired_enabled();
-    let compare_cpu = paired || active_compare_cpu_enabled();
+    let trace_only = architecture_trace_enabled();
+    let compare_cpu = paired || active_compare_cpu_enabled() || trace_only;
     let paired_preflight = paired
         .then(|| measure_paired_preflight(&requests))
         .flatten();
@@ -3948,6 +4068,25 @@ pub fn solve_active_batch_with_min(
             cpu.iter().map(|work| work.elapsed_ns).sum(),
             Ordering::Relaxed,
         );
+    }
+
+    if trace_only {
+        if let Some(cpu) = reference_cpu.as_ref() {
+            for group in &groups {
+                for range in &group.batches {
+                    record_architecture_trace_batch(
+                        pass_id,
+                        &group.context,
+                        &group.pending[range.clone()],
+                        cpu,
+                    );
+                }
+            }
+        }
+        // The trace is observational. Returning UNKNOWN keeps the live IC3
+        // solver on its ordinary exact GipSAT path and prevents simulation
+        // parameters from affecting proof state or verdict.
+        return output;
     }
 
     let state_wait_start = std::time::Instant::now();
@@ -4704,6 +4843,15 @@ pub fn flush_and_report() {
             SHADOW_HW_UNSAT_CPU_SAT.load(Ordering::Relaxed),
             SHADOW_UNKNOWN.load(Ordering::Relaxed),
             SHADOW_ERROR.load(Ordering::Relaxed),
+        );
+    }
+    if architecture_trace_enabled() {
+        flush_architecture_trace_writer();
+        eprintln!(
+            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}",
+            ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
+            ARCH_TRACE_QUERIES.load(Ordering::Relaxed),
+            std::env::var("INDUCTOR_CDCL_TRACE_CSV").unwrap_or_else(|_| "disabled".to_string()),
         );
     }
     if paired_enabled() {
