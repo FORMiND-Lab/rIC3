@@ -23,6 +23,7 @@ use crate::gipsat::{
     QueryBudget, pack_batch, solve_on_cpu_after_hardware_unknown,
 };
 use logicrs::{Lit, LitVec, Var};
+use std::collections::HashMap;
 #[cfg(has_cdcl_accel)]
 use std::ffi::CString;
 use std::io::{BufWriter, Write};
@@ -50,6 +51,13 @@ unsafe extern "C" {
         response_capacity_words: u32,
         out_response_words: *mut u32,
     ) -> i32;
+    fn ind_cdcl_solve_arena_batch(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
     fn ind_cdcl_load_context_and_solve_batch(
         request: *const u32,
         request_words: u32,
@@ -58,6 +66,13 @@ unsafe extern "C" {
         out_response_words: *mut u32,
     ) -> i32;
     fn ind_cdcl_solve_mic_chain(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
+    fn ind_cdcl_solve_arena_mic(
         request: *const u32,
         request_words: u32,
         response: *mut u32,
@@ -497,6 +512,74 @@ fn pack_batch_request(
     Ok((request, response_capacity))
 }
 
+const ARENA_VIEW_PREFIX_WORDS: usize = 5;
+const ARENA_VIEW_REUSE: u32 = 0;
+const ARENA_VIEW_TOGGLE: u32 = 1;
+const ARENA_VIEW_BITMAP: u32 = 2;
+
+/// Insert one independently planned physical-lane view immediately before
+/// each complete query record. The ordinary batch packer remains the single
+/// source of truth for query flags and response capacity.
+fn pack_arena_batch_request(
+    queries: &[IncrementalQuery],
+    views: &[ArenaViewUpdate],
+    want_stage_profile: bool,
+) -> Result<(Vec<u32>, usize), HardwareError> {
+    if queries.is_empty() || queries.len() != views.len() {
+        return Err(HardwareError::InvalidContext);
+    }
+    let (plain, response_capacity) = pack_batch_request(queries, want_stage_profile)?;
+    let mut payload_words = 0usize;
+    for (query, view) in queries.iter().zip(views) {
+        let query_words = query_request_words(query).ok_or(HardwareError::Capacity)?;
+        payload_words = payload_words
+            .checked_add(view.words.len())
+            .and_then(|words| words.checked_add(query_words))
+            .ok_or(HardwareError::Capacity)?;
+    }
+    let total_words = 4usize
+        .checked_add(payload_words)
+        .ok_or(HardwareError::Capacity)?;
+    if total_words > KERNEL_MAX_REQUEST_WORDS || total_words > u32::MAX as usize {
+        return Err(HardwareError::Capacity);
+    }
+    let mut request = Vec::with_capacity(total_words);
+    request.extend([plain[0], plain[1], payload_words as u32, plain[3]]);
+    let mut offset = 4usize;
+    for (query, view) in queries.iter().zip(views) {
+        let query_words = query_request_words(query).ok_or(HardwareError::Capacity)?;
+        request.extend_from_slice(&view.words);
+        request.extend_from_slice(
+            plain
+                .get(offset..offset + query_words)
+                .ok_or(HardwareError::InvalidContext)?,
+        );
+        offset += query_words;
+    }
+    if offset != plain.len() {
+        return Err(HardwareError::InvalidContext);
+    }
+    Ok((request, response_capacity))
+}
+
+fn pack_arena_mic_request(
+    view: &ArenaViewUpdate,
+    mic: &[u32],
+) -> Result<Vec<u32>, HardwareError> {
+    let total_words = view
+        .words
+        .len()
+        .checked_add(mic.len())
+        .ok_or(HardwareError::Capacity)?;
+    if total_words > KERNEL_MAX_REQUEST_WORDS || total_words > u32::MAX as usize {
+        return Err(HardwareError::Capacity);
+    }
+    let mut request = Vec::with_capacity(total_words);
+    request.extend_from_slice(&view.words);
+    request.extend_from_slice(mic);
+    Ok(request)
+}
+
 fn pack_load_context_and_batch_request(
     n_var: u32,
     clauses: &[ResidentClause],
@@ -735,12 +818,187 @@ fn decode_mic_chain_record(
     ))
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ArenaLaneView {
+    bitmap: Vec<u32>,
+    key: u64,
+    valid: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArenaViewUpdate {
+    words: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArenaMappedClause {
+    id: u32,
+    lo: u32,
+    hi: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ArenaContextMapping {
+    clauses: Vec<ArenaMappedClause>,
+}
+
+impl ArenaContextMapping {
+    fn active(&self, frame: u32, ranged: bool) -> Vec<u32> {
+        self.clauses
+            .iter()
+            .filter(|clause| !ranged || clause.lo <= frame && frame <= clause.hi)
+            .map(|clause| clause.id)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResidentArena {
+    n_var: u32,
+    /// One normalized body can occur more than once in a CNF. Stable IDs are
+    /// assigned by occurrence ordinal, not merely by body, so duplicate
+    /// clauses remain duplicate physical occurrences exactly as in replay.
+    instances: HashMap<Vec<u32>, Vec<u32>>,
+    n_clause: u32,
+    lanes: [ArenaLaneView; 2],
+    next_view_key: u64,
+}
+
+impl ResidentArena {
+    fn reset(&mut self, n_var: u32) {
+        *self = Self {
+            n_var,
+            ..Self::default()
+        };
+    }
+
+    fn normalize_clause(
+        n_var: u32,
+        literals: &LitVec,
+    ) -> Result<Option<Vec<u32>>, HardwareError> {
+        if n_var == 0 || literals.is_empty() {
+            return Err(HardwareError::InvalidContext);
+        }
+        let mut normalized = Vec::with_capacity(literals.len());
+        for &literal in literals.iter() {
+            let literal = u32::from(literal);
+            if literal >> 1 >= n_var {
+                return Err(HardwareError::InvalidContext);
+            }
+            if normalized.contains(&(literal ^ 1)) {
+                return Ok(None);
+            }
+            if !normalized.contains(&literal) {
+                normalized.push(literal);
+            }
+        }
+        Ok(Some(normalized))
+    }
+
+    fn intern_context(
+        &mut self,
+        context: &ShadowContext,
+    ) -> Result<(ArenaContextMapping, Vec<ResidentClause>), HardwareError> {
+        if self.n_var != context.n_var {
+            self.reset(context.n_var);
+        }
+        let mut ordinals: HashMap<Vec<u32>, usize> = HashMap::new();
+        let mut mapping = ArenaContextMapping::default();
+        let mut appended = Vec::new();
+        for clause in &context.clauses {
+            let Some(body) = Self::normalize_clause(context.n_var, &clause.literals)? else {
+                continue;
+            };
+            let ordinal = ordinals.entry(body.clone()).or_default();
+            let ids = self.instances.entry(body.clone()).or_default();
+            let id = if *ordinal < ids.len() {
+                ids[*ordinal]
+            } else {
+                let id = self.n_clause;
+                self.n_clause = self
+                    .n_clause
+                    .checked_add(1)
+                    .ok_or(HardwareError::Capacity)?;
+                ids.push(id);
+                let literals = body
+                    .iter()
+                    .map(|literal| Lit::new(Var::from(literal >> 1), literal & 1 == 0))
+                    .collect::<LitVec>();
+                appended.push(ResidentClause::new(0, u32::MAX, literals));
+                id
+            };
+            *ordinal += 1;
+            mapping.clauses.push(ArenaMappedClause {
+                id,
+                lo: clause.lo,
+                hi: clause.hi,
+            });
+        }
+        Ok((mapping, appended))
+    }
+
+    fn plan_view(
+        &mut self,
+        lane: usize,
+        active: &[u32],
+    ) -> Result<ArenaViewUpdate, HardwareError> {
+        let lane = self.lanes.get_mut(lane).ok_or(HardwareError::InvalidContext)?;
+        let bitmap_words = usize::try_from((self.n_clause + 31) / 32)
+            .map_err(|_| HardwareError::Capacity)?;
+        let mut target = vec![0u32; bitmap_words];
+        for &clause in active {
+            if clause >= self.n_clause {
+                return Err(HardwareError::InvalidContext);
+            }
+            target[(clause >> 5) as usize] |= 1 << (clause & 31);
+        }
+        lane.bitmap.resize(bitmap_words, 0);
+        let changed = !lane.valid || lane.bitmap != target;
+        let (mode, key, update) = if changed {
+            self.next_view_key = self
+                .next_view_key
+                .checked_add(1)
+                .ok_or(HardwareError::Capacity)?;
+            let mut toggles = Vec::new();
+            for clause in 0..self.n_clause {
+                let word = (clause >> 5) as usize;
+                let mask = 1 << (clause & 31);
+                if (lane.bitmap[word] ^ target[word]) & mask != 0 {
+                    toggles.push(clause);
+                }
+            }
+            if toggles.len() <= bitmap_words {
+                (ARENA_VIEW_TOGGLE, self.next_view_key, toggles)
+            } else {
+                (ARENA_VIEW_BITMAP, self.next_view_key, target.clone())
+            }
+        } else {
+            (ARENA_VIEW_REUSE, lane.key, Vec::new())
+        };
+        let update_words = u32::try_from(update.len()).map_err(|_| HardwareError::Capacity)?;
+        let mut words = Vec::with_capacity(ARENA_VIEW_PREFIX_WORDS + update.len());
+        words.extend([
+            mode,
+            key as u32,
+            (key >> 32) as u32,
+            self.n_clause,
+            update_words,
+        ]);
+        words.extend(update);
+        lane.bitmap = target;
+        lane.key = key;
+        lane.valid = true;
+        Ok(ArenaViewUpdate { words })
+    }
+}
+
 pub struct HardwareCdcl {
     n_var: u32,
     materialized_frame: Option<u32>,
     last_batch_work: HardwareWork,
     last_batch_records: Vec<HardwareWork>,
     stage_profile: bool,
+    arena: ResidentArena,
 }
 
 impl HardwareCdcl {
@@ -788,6 +1046,7 @@ impl HardwareCdcl {
                 last_batch_work: HardwareWork::default(),
                 last_batch_records: Vec::new(),
                 stage_profile: stage_profile_enabled(),
+                arena: ResidentArena::default(),
             })
         }
         #[cfg(not(has_cdcl_accel))]
@@ -817,10 +1076,12 @@ impl HardwareCdcl {
             let rc = unsafe { ind_cdcl_load_context(words.as_ptr(), words.len() as u32) };
             if rc != 0 {
                 self.materialized_frame = None;
+                self.arena = ResidentArena::default();
                 return Err(HardwareError::Command(rc));
             }
             self.n_var = n_var;
             self.materialized_frame = None;
+            self.arena = ResidentArena::default();
             Ok(())
         }
         #[cfg(not(has_cdcl_accel))]
@@ -942,6 +1203,179 @@ impl HardwareCdcl {
         #[cfg(not(has_cdcl_accel))]
         {
             let _ = (request, response_capacity_u32, response);
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    fn invalidate_arena_context(&mut self) {
+        self.n_var = 0;
+        self.materialized_frame = None;
+        self.arena = ResidentArena::default();
+    }
+
+    /// Extend one process-lifetime union arena and return the stable IDs that
+    /// represent this logical snapshot. Context switches and frame shrinkage
+    /// only change the subsequent private lane views; the physical clause
+    /// store is reset solely when the variable universe changes.
+    fn prepare_arena_context(
+        &mut self,
+        context: &ShadowContext,
+    ) -> Result<ArenaContextMapping, HardwareError> {
+        if context.n_var == 0 {
+            return Err(HardwareError::InvalidContext);
+        }
+        if self.arena.n_var != context.n_var || self.n_var != context.n_var {
+            self.load_context(context.n_var, &[])?;
+            self.arena.reset(context.n_var);
+        }
+        let mut candidate = self.arena.clone();
+        let (mapping, appended) = candidate.intern_context(context)?;
+        if !appended.is_empty()
+            && let Err(error) = self.add_frame_clauses(&appended)
+        {
+            self.invalidate_arena_context();
+            return Err(error);
+        }
+        self.arena = candidate;
+        Ok(mapping)
+    }
+
+    /// Execute a normal query batch while keeping the union clause arena
+    /// resident. Each logical query carries only a lane-local active-clause
+    /// view plus its ordinary private assumptions/constraints/domain.
+    fn solve_arena_batch(
+        &mut self,
+        context: &ShadowContext,
+        queries: &[IncrementalQuery],
+    ) -> Result<Vec<IncrementalResult>, HardwareError> {
+        self.last_batch_work = HardwareWork::default();
+        self.last_batch_records.clear();
+        if queries.is_empty() {
+            return Err(HardwareError::InvalidContext);
+        }
+        let mapping = self.prepare_arena_context(context)?;
+        let ranged = context.scope == ShadowContextScope::FrameRanged;
+        let mut candidate = self.arena.clone();
+        let mut views = Vec::with_capacity(queries.len());
+        for (index, query) in queries.iter().enumerate() {
+            let active = mapping.active(query.frame, ranged);
+            views.push(candidate.plan_view(index & 1, &active)?);
+        }
+        let (request, response_capacity) =
+            pack_arena_batch_request(queries, &views, self.stage_profile)?;
+        let response_capacity_u32 =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        let mut response = vec![0u32; response_capacity];
+        #[cfg(not(has_cdcl_accel))]
+        let response = vec![0u32; response_capacity];
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_solve_arena_batch(
+                    request.as_ptr(),
+                    request.len() as u32,
+                    response.as_mut_ptr(),
+                    response_capacity_u32,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                self.invalidate_arena_context();
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() {
+                self.invalidate_arena_context();
+                return Err(HardwareError::Capacity);
+            }
+            response.truncate(out_words);
+            self.arena = candidate;
+            self.materialized_frame = None;
+            self.decode_batch_response(queries, &response)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, response_capacity_u32, response, candidate);
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    fn solve_arena_mic_chain(
+        &mut self,
+        context: &ShadowContext,
+        frame: u32,
+        cube: &[(Lit, Lit)],
+        constraints: &[LitVec],
+        protected_index: usize,
+        decision_budget: u32,
+        conflict_budget: u32,
+        max_trials: u32,
+    ) -> Result<MicChainResult, HardwareError> {
+        let mapping = self.prepare_arena_context(context)?;
+        let active = mapping.active(frame, context.scope == ShadowContextScope::FrameRanged);
+        let mut candidate = self.arena.clone();
+        let view = candidate.plan_view(0, &active)?;
+        let mic = pack_mic_chain_request(
+            self.n_var,
+            frame,
+            cube,
+            constraints,
+            protected_index,
+            decision_budget,
+            conflict_budget,
+            max_trials,
+        )?;
+        let request = pack_arena_mic_request(&view, &mic)?;
+        let response_capacity = MIC_RESPONSE_HEADER_WORDS
+            .checked_add(cube.len())
+            .ok_or(HardwareError::Capacity)?;
+        let response_capacity_u32 =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        let mut response = vec![0u32; response_capacity];
+        #[cfg(not(has_cdcl_accel))]
+        let response = vec![0u32; response_capacity];
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_solve_arena_mic(
+                    request.as_ptr(),
+                    request.len() as u32,
+                    response.as_mut_ptr(),
+                    response_capacity_u32,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                self.invalidate_arena_context();
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() {
+                self.invalidate_arena_context();
+                return Err(HardwareError::Capacity);
+            }
+            let (result, record_words) = match decode_mic_chain_record(cube, &response[..out_words]) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    self.invalidate_arena_context();
+                    return Err(error);
+                }
+            };
+            if record_words != out_words {
+                self.invalidate_arena_context();
+                return Err(HardwareError::InvalidResponse);
+            }
+            self.arena = candidate;
+            self.materialized_frame = None;
+            Ok(result)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, response_capacity_u32, response, candidate);
             Err(HardwareError::Unavailable)
         }
     }
@@ -3491,6 +3925,16 @@ pub fn active_enabled() -> bool {
         && std::env::var_os("INDUCTOR_ACCEL").is_none()
 }
 
+/// Command 12/13 require the shared-frame-view image. Keep the feature
+/// explicit so an older, otherwise ABI-compatible xclbin cannot be selected
+/// accidentally while simulation and board qualification overlap.
+fn active_arena_views_enabled() -> bool {
+    active_enabled()
+        && std::env::var("INDUCTOR_CDCL_ARENA_VIEWS")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+}
+
 /// Run the same independent propagation inquiries on a cloned GipSAT state
 /// and on the FPGA, but return UNKNOWN to IC3 so the ordinary CPU path remains
 /// authoritative. This is a measurement mode, not an alternative proof path.
@@ -3934,10 +4378,25 @@ pub fn solve_active_mic_chain(
         return None;
     };
 
-    let update = plan_context_update(state.loaded_context.as_ref(), &context);
-    let context_reused = update != ContextUpdate::Reload;
+    let arena_views = active_arena_views_enabled() && !mic_chain_experimental_reorder();
+    let update = if arena_views {
+        ContextUpdate::Ready
+    } else {
+        plan_context_update(state.loaded_context.as_ref(), &context)
+    };
+    let context_reused = if arena_views {
+        state
+            .hardware
+            .as_ref()
+            .is_some_and(|hardware| hardware.arena.n_var == context.n_var)
+    } else {
+        update != ContextUpdate::Reload
+    };
     let mut ready = update == ContextUpdate::Ready;
     let mut fused_append_clauses = None;
+    if arena_views {
+        state.loaded_context = None;
+    }
     if let ContextUpdate::Append(clauses) = update {
         // The production traversal is one order-dependent chain. Fuse its
         // monotonic resident append with the immediately following MIC so the
@@ -4006,7 +4465,7 @@ pub fn solve_active_mic_chain(
     // an on-card guard and would materialize automatically if this call were
     // ever omitted, but the split prevents frame maintenance from being
     // mislabeled as useful MIC/CDCL occupancy.
-    if fused_append_clauses.is_none() {
+    if !arena_views && fused_append_clauses.is_none() {
         let materialize_started = std::time::Instant::now();
         let materialize_kernel_before = direct_kernel_ns();
         let materialized = state
@@ -4068,6 +4527,18 @@ pub fn solve_active_mic_chain(
         .ok_or(HardwareError::Unavailable)
         .and_then(|hardware| {
             if parallel_lanes == 1 {
+                if arena_views {
+                    return hardware.solve_arena_mic_chain(
+                        &context,
+                        frame,
+                        cube,
+                        constraints,
+                        protected_index,
+                        mic_chain_decision_budget(),
+                        mic_chain_conflict_budget(),
+                        max_trials,
+                    );
+                }
                 if let Some(clauses) = fused_append_clauses.as_deref() {
                     return hardware.append_and_solve_mic_chain(
                         clauses,
@@ -4361,7 +4832,19 @@ pub fn solve_active_batch_with_min(
         let query_words: Vec<_> = group
             .pending
             .iter()
-            .map(|(_, query)| query_request_words(query).unwrap_or(KERNEL_MAX_REQUEST_WORDS))
+            .map(|(_, query)| {
+                let words = query_request_words(query).unwrap_or(KERNEL_MAX_REQUEST_WORDS);
+                if active_arena_views_enabled() {
+                    // Dense bitmap is the largest legal view update. Runtime
+                    // still rechecks the process-lifetime union arena, which
+                    // can be larger after switching between context groups.
+                    words.saturating_add(
+                        ARENA_VIEW_PREFIX_WORDS + (group.context.clauses.len() + 31) / 32,
+                    )
+                } else {
+                    words
+                }
+            })
             .collect();
         group.batches = plan_full_batch_ranges(
             &query_words,
@@ -4437,6 +4920,7 @@ pub fn solve_active_batch_with_min(
         return output;
     };
     'groups: for mut group in groups {
+        let arena_views = active_arena_views_enabled();
         let mut context_load_ns = 0u64;
         let context_update = plan_context_update(state.loaded_context.as_ref(), &group.context);
         let mut context_ready = context_update == ContextUpdate::Ready;
@@ -4444,6 +4928,13 @@ pub fn solve_active_batch_with_min(
             ContextUpdate::Append(clauses) => Some(clauses),
             ContextUpdate::Ready | ContextUpdate::Reload => None,
         };
+        if arena_views {
+            // The physical union and private views are owned by HardwareCdcl;
+            // the legacy exact-snapshot cache must not claim residency.
+            state.loaded_context = None;
+            context_ready = true;
+            append_clauses = None;
+        }
         let batches = std::mem::take(&mut group.batches);
         for range in batches {
             let start = range.start;
@@ -4455,6 +4946,24 @@ pub fn solve_active_batch_with_min(
             ACTIVE_BATCHES.fetch_add(1, Ordering::Relaxed);
             let mut batch_ns = 0u64;
             let mut result = None;
+            if arena_views {
+                let batch_start = std::time::Instant::now();
+                let kernel_before = direct_kernel_ns();
+                result = Some(
+                    state
+                        .hardware
+                        .as_mut()
+                        .ok_or(HardwareError::Unavailable)
+                        .and_then(|hardware| {
+                            hardware.solve_arena_batch(&group.context, &queries)
+                        }),
+                );
+                ACTIVE_BATCH_KERNEL_NS.fetch_add(
+                    direct_kernel_ns().saturating_sub(kernel_before),
+                    Ordering::Relaxed,
+                );
+                batch_ns = batch_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            }
             if !context_ready && let Some(clauses) = append_clauses.take() {
                 let append_start = std::time::Instant::now();
                 let kernel_before = direct_kernel_ns();
@@ -5955,6 +6464,131 @@ mod tests {
         assert_eq!(&combined[1..1 + context.len()], context.as_slice());
         assert_eq!(&combined[1 + context.len()..], batch.as_slice());
         assert_eq!(combined_capacity, response_capacity);
+    }
+
+    #[test]
+    fn resident_arena_preserves_duplicate_occurrence_ids_across_shrink() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), true);
+        let duplicate = ResidentClause::new(0, u32::MAX, LitVec::from([a, b]));
+        let tautology = ResidentClause::new(0, u32::MAX, LitVec::from([a, !a]));
+        let context = |clauses| ShadowContext {
+            n_var: 2,
+            clauses,
+            scope: ShadowContextScope::ExactFrame(3),
+        };
+        let mut arena = ResidentArena::default();
+        let (full, appended) = arena
+            .intern_context(&context(vec![
+                duplicate.clone(),
+                duplicate.clone(),
+                tautology,
+            ]))
+            .unwrap();
+        assert_eq!(full.active(3, false), vec![0, 1]);
+        assert_eq!(appended.len(), 2);
+        assert_eq!(arena.n_clause, 2);
+
+        let (short, appended) = arena
+            .intern_context(&context(vec![duplicate.clone()]))
+            .unwrap();
+        assert_eq!(short.active(3, false), vec![0]);
+        assert!(appended.is_empty());
+
+        let (restored, appended) = arena
+            .intern_context(&context(vec![duplicate.clone(), duplicate]))
+            .unwrap();
+        assert_eq!(restored.active(3, false), vec![0, 1]);
+        assert!(appended.is_empty());
+    }
+
+    #[test]
+    fn arena_views_choose_toggle_bitmap_and_reuse_across_inactive_growth() {
+        let mut arena = ResidentArena {
+            n_var: 1,
+            n_clause: 33,
+            ..ResidentArena::default()
+        };
+        let first = arena.plan_view(0, &[0]).unwrap();
+        assert_eq!(first.words[0], ARENA_VIEW_TOGGLE);
+        assert_eq!(&first.words[ARENA_VIEW_PREFIX_WORDS..], &[0]);
+
+        let reuse = arena.plan_view(0, &[0]).unwrap();
+        assert_eq!(reuse.words[0], ARENA_VIEW_REUSE);
+        assert_eq!(reuse.words[4], 0);
+        assert_eq!(reuse.words[1], first.words[1]);
+
+        let dense: Vec<_> = (0..12).collect();
+        let bitmap = arena.plan_view(0, &dense).unwrap();
+        assert_eq!(bitmap.words[0], ARENA_VIEW_BITMAP);
+        assert_eq!(bitmap.words[4], 2);
+
+        // The device append path extends an external view with zero bits for
+        // new clauses and updates its physical count. An inactive append can
+        // therefore keep both bitmap and key through REUSE.
+        let before_growth_key = (u64::from(bitmap.words[2]) << 32) | u64::from(bitmap.words[1]);
+        arena.n_clause = 34;
+        let growth = arena.plan_view(0, &dense).unwrap();
+        let growth_key = (u64::from(growth.words[2]) << 32) | u64::from(growth.words[1]);
+        assert_eq!(growth.words[0], ARENA_VIEW_REUSE);
+        assert_eq!(growth.words[3], 34);
+        assert_eq!(growth.words[4], 0);
+        assert_eq!(growth_key, before_growth_key);
+    }
+
+    #[test]
+    fn arena_batch_packer_interleaves_lane_views_without_changing_queries() {
+        let a = Lit::new(Var::from(0), true);
+        let mut first = IncrementalQuery::new(2, LitVec::from([a]));
+        first.domain = vec![Var::from(0)];
+        let second = IncrementalQuery::new(5, LitVec::from([!a]));
+        let queries = [first, second];
+        let views = [
+            ArenaViewUpdate {
+                words: vec![ARENA_VIEW_TOGGLE, 11, 0, 3, 1, 2],
+            },
+            ArenaViewUpdate {
+                words: vec![ARENA_VIEW_REUSE, 7, 0, 3, 0],
+            },
+        ];
+        let (plain, plain_capacity) = pack_batch_request(&queries, false).unwrap();
+        let (arena, arena_capacity) =
+            pack_arena_batch_request(&queries, &views, false).unwrap();
+        let first_words = query_request_words(&queries[0]).unwrap();
+        let second_words = query_request_words(&queries[1]).unwrap();
+
+        assert_eq!(arena[0], ABI_VERSION);
+        assert_eq!(arena[1], 2);
+        assert_eq!(arena[2] as usize, arena.len() - 4);
+        assert_eq!(arena_capacity, plain_capacity);
+        assert_eq!(&arena[4..4 + views[0].words.len()], &views[0].words);
+        assert_eq!(
+            &arena[4 + views[0].words.len()..4 + views[0].words.len() + first_words],
+            &plain[4..4 + first_words]
+        );
+        let second_offset = 4 + views[0].words.len() + first_words;
+        assert_eq!(
+            &arena[second_offset..second_offset + views[1].words.len()],
+            &views[1].words
+        );
+        assert_eq!(
+            &arena[second_offset + views[1].words.len()..],
+            &plain[4 + first_words..4 + first_words + second_words]
+        );
+    }
+
+    #[test]
+    fn arena_view_planning_is_transactional_until_candidate_commit() {
+        let arena = ResidentArena {
+            n_var: 1,
+            n_clause: 1,
+            ..ResidentArena::default()
+        };
+        let mut candidate = arena.clone();
+        let update = candidate.plan_view(0, &[0]).unwrap();
+        assert_eq!(update.words[0], ARENA_VIEW_TOGGLE);
+        assert!(!arena.lanes[0].valid);
+        assert!(candidate.lanes[0].valid);
     }
 
     #[test]
