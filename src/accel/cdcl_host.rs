@@ -3372,11 +3372,43 @@ fn measure_reference_cpu(
 }
 
 // Version 2 adds phase/op_id/dependency metadata ahead of each batch or MIC
-// context. The native replay models only concurrency that the producer marks
-// as independent; query adjacency is never treated as independence.
-const EXACT_REPLAY_VERSION: u32 = 2;
+// context. Version 3 records the stable producer ticket used by the persistent
+// ring model for every query. The server remains the sole SQ producer: it
+// resolves the lease/epoch and assigns a physical lane before constructing the
+// 64-byte ABI-v2 descriptor.
+const EXACT_REPLAY_VERSION: u32 = 3;
 const EXACT_REPLAY_BATCH: u32 = 1;
 const EXACT_REPLAY_MIC: u32 = 2;
+const RING_INDEPENDENT_SET: u32 = 1 << 3;
+const RING_END_OF_BATCH: u32 = 1 << 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PersistentRingQueryTicket {
+    batch_id: u32,
+    position: u32,
+    flags: u32,
+    user_tag: u64,
+}
+
+fn persistent_ring_batch_id(pass_id: u64) -> u32 {
+    let folded = (pass_id as u32) ^ (pass_id >> 32) as u32;
+    folded.max(1)
+}
+
+fn persistent_ring_query_ticket(
+    pass_id: u64,
+    position: usize,
+    end_of_batch: bool,
+) -> PersistentRingQueryTicket {
+    let batch_id = persistent_ring_batch_id(pass_id);
+    let position = position.min(u32::MAX as usize) as u32;
+    PersistentRingQueryTicket {
+        batch_id,
+        position,
+        flags: RING_INDEPENDENT_SET | if end_of_batch { RING_END_OF_BATCH } else { 0 },
+        user_tag: (u64::from(batch_id) << 32) | u64::from(position),
+    }
+}
 
 pub struct ExactMicReplayCapture {
     context: ShadowContext,
@@ -3453,6 +3485,7 @@ fn record_exact_replay_batch(
     context: &ShadowContext,
     pending: &[(usize, IncrementalQuery)],
     cpu: &[PairedCpuWork],
+    end_of_pass: bool,
 ) {
     let limit = exact_replay_limit();
     if limit == 0 {
@@ -3504,7 +3537,7 @@ fn record_exact_replay_batch(
         words.push(clause.literals.len() as u32);
         words.extend(clause.literals.iter().map(|lit| u32::from(*lit)));
     }
-    for (index, query) in pending.iter().take(take) {
+    for (query_position, (index, query)) in pending.iter().take(take).enumerate() {
         let Some(work) = cpu.get(*index) else {
             return;
         };
@@ -3520,6 +3553,19 @@ fn record_exact_replay_batch(
         let (header, payload) = query.pack();
         let query_words = header.as_words().len() + payload.len();
         words.push(*index as u32);
+        // A capture truncated by its query limit is a closed simulation batch,
+        // even when the live independent wave had more inquiries.
+        let ticket = persistent_ring_query_ticket(
+            pass_id,
+            *index,
+            query_position + 1 == take
+                && (end_of_pass || take < pending.len() || written + take as u64 >= limit),
+        );
+        words.push(ticket.batch_id);
+        words.push(ticket.position);
+        words.push(ticket.flags);
+        words.push(ticket.user_tag as u32);
+        words.push((ticket.user_tag >> 32) as u32);
         words.push(query_words as u32);
         words.extend(header.as_words());
         words.extend(payload);
@@ -4905,6 +4951,11 @@ pub fn solve_active_batch_with_min(
 
     if trace_only {
         if let Some(cpu) = reference_cpu.as_ref() {
+            let mut remaining: usize = groups
+                .iter()
+                .flat_map(|group| group.batches.iter())
+                .map(std::ops::Range::len)
+                .sum();
             for group in &groups {
                 for range in &group.batches {
                     record_architecture_trace_batch(
@@ -4913,11 +4964,13 @@ pub fn solve_active_batch_with_min(
                         &group.pending[range.clone()],
                         cpu,
                     );
+                    remaining = remaining.saturating_sub(range.len());
                     record_exact_replay_batch(
                         pass_id,
                         &group.context,
                         &group.pending[range.clone()],
                         cpu,
+                        remaining == 0,
                     );
                 }
             }
@@ -6209,6 +6262,42 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn persistent_ring_tickets_keep_one_independent_wave_correlated() {
+        let pass = (7u64 << 32) | 11u64;
+        let batch = persistent_ring_batch_id(pass);
+        assert_ne!(batch, 0);
+        let tickets: Vec<_> = (0..19)
+            .map(|position| persistent_ring_query_ticket(pass, position, position == 18))
+            .collect();
+        assert!(tickets.iter().all(|ticket| ticket.batch_id == batch));
+        assert!(
+            tickets
+                .iter()
+                .all(|ticket| ticket.flags & RING_INDEPENDENT_SET != 0)
+        );
+        assert!(
+            tickets[..18]
+                .iter()
+                .all(|ticket| ticket.flags & RING_END_OF_BATCH == 0)
+        );
+        assert_ne!(tickets[18].flags & RING_END_OF_BATCH, 0);
+        for (position, ticket) in tickets.iter().enumerate() {
+            assert_eq!(ticket.position, position as u32);
+            assert_eq!(ticket.user_tag >> 32, u64::from(batch));
+            assert_eq!(ticket.user_tag as u32, position as u32);
+        }
+    }
+
+    #[test]
+    fn persistent_ring_batch_id_never_uses_protocol_sentinel() {
+        assert_eq!(persistent_ring_batch_id(0), 1);
+        assert_eq!(
+            persistent_ring_batch_id(u64::from(u32::MAX) << 32 | u64::from(u32::MAX)),
+            1
+        );
+    }
 
     #[test]
     fn deterministic_device_failures_trip_the_solver_run_circuit_breaker() {
