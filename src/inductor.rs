@@ -383,6 +383,18 @@ pub fn macro_scope(phase: Phase, frame: usize) -> PhaseGuard {
     g
 }
 
+/// Return the algorithm-derived trace labels currently in scope.
+///
+/// The exact FPGA replay writer uses this even when the ordinary binary trace
+/// is disabled.  Keeping the labels next to the IC3 `macro_scope` source avoids
+/// reconstructing dependencies later from adjacent query shapes.
+#[inline]
+pub fn current_macro_context() -> (Phase, u32) {
+    let phase = PHASE.with(|p| Phase::from_u8(p.get()).unwrap_or(Phase::Other));
+    let op_id = OP.with(|o| o.get());
+    (phase, op_id)
+}
+
 /// Run `body` as one IC3 phase, recording its span and the queries it issued.
 ///
 /// This is the B layer: it is what lets the analysis say how much of wall-clock

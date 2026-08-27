@@ -3371,7 +3371,10 @@ fn measure_reference_cpu(
         .collect()
 }
 
-const EXACT_REPLAY_VERSION: u32 = 1;
+// Version 2 adds phase/op_id/dependency metadata ahead of each batch or MIC
+// context. The native replay models only concurrency that the producer marks
+// as independent; query adjacency is never treated as independence.
+const EXACT_REPLAY_VERSION: u32 = 2;
 const EXACT_REPLAY_BATCH: u32 = 1;
 const EXACT_REPLAY_MIC: u32 = 2;
 
@@ -3474,6 +3477,19 @@ fn record_exact_replay_batch(
     words.push(EXACT_REPLAY_BATCH);
     exact_push_u64(&mut words, pass_id);
     exact_push_u64(&mut words, batch_id);
+    let (phase, scoped_op_id) = crate::inductor::current_macro_context();
+    // solve_active_batch accepts only an already-independent inquiry set.
+    // pass_id spans every context/word-limited record produced by this one
+    // call, so it is the exact persistent-queue scope when a caller launched
+    // outside a thread-local macro_scope (notably async PUSH prefetch).
+    let op_id = if scoped_op_id != 0 {
+        scoped_op_id
+    } else {
+        (pass_id as u32).max(1)
+    };
+    words.push(phase as u32);
+    words.push(op_id);
+    words.push(1); // independent inquiry set
     words.push(match context.scope {
         ShadowContextScope::SharedTransition => 0,
         ShadowContextScope::ExactFrame(_) => 1,
@@ -3604,6 +3620,10 @@ pub fn finish_exact_mic_replay(capture: Option<ExactMicReplayCapture>, output: &
     words.push(0);
     words.push(EXACT_REPLAY_MIC);
     exact_push_u64(&mut words, mic_id);
+    let (phase, op_id) = crate::inductor::current_macro_context();
+    words.push(phase as u32);
+    words.push(op_id);
+    words.push(2); // dependent MIC chain
     words.push(match capture.context.scope {
         ShadowContextScope::SharedTransition => 0,
         ShadowContextScope::ExactFrame(_) => 1,
