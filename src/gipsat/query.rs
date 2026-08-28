@@ -1,8 +1,9 @@
 use super::DagCnfSolver;
 use super::cdb::CREF_NONE;
 use crate::accel::cdcl::{
-    ABI_VERSION, BANK_ALIGNED_DOMAIN, BatchHeader, BatchResponseHeader, KEEP_LEARNTS, QueryHeader,
-    RESPONSE_HEADER_WORDS, ResponseHeader, Status, UnknownReason, WANT_CORE, WANT_MODEL,
+    ABI_VERSION, BANK_ALIGNED_DOMAIN, BatchHeader, BatchResponseHeader, KEEP_LEARNTS,
+    PACKED_SAT_MODEL, QueryHeader, RESPONSE_HEADER_WORDS, ResponseHeader, Status, UnknownReason,
+    WANT_CORE, WANT_MODEL,
 };
 use logicrs::{Lbool, Lit, LitVec, Var, satif::Satif};
 
@@ -34,6 +35,15 @@ pub fn bank_aligned_domain_enabled() -> bool {
             .is_some_and(|value| {
                 !matches!(value.as_str(), "" | "0" | "false" | "off")
             })
+    })
+}
+
+pub fn packed_sat_model_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_PACKED_SAT_MODEL")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "off"))
     })
 }
 
@@ -108,6 +118,9 @@ impl IncrementalQuery {
         }
         if bank_aligned {
             flags |= BANK_ALIGNED_DOMAIN;
+            if packed_sat_model_enabled() {
+                flags |= PACKED_SAT_MODEL;
+            }
         }
         let header = QueryHeader {
             version: ABI_VERSION,
@@ -167,6 +180,38 @@ fn decode_lit(word: u32) -> Lit {
     Lit::new(Var::from(word >> 1), word & 1 == 0)
 }
 
+fn decode_packed_sat_model(
+    query: &IncrementalQuery,
+    payload: &[u32],
+) -> Result<LitVec, BatchDecodeError> {
+    let expected = query.domain.len().div_ceil(32);
+    if payload.len() != expected {
+        return Err(BatchDecodeError::InvalidResultShape);
+    }
+    if let Some(&last) = payload.last() {
+        let used = query.domain.len() & 31;
+        if used != 0 && last & (!0u32 << used) != 0 {
+            return Err(BatchDecodeError::InvalidResultShape);
+        }
+    }
+    let mut model = LitVec::new();
+    let mut bit = 0usize;
+    for lane in 0..4u32 {
+        for &variable in &query.domain {
+            if u32::from(variable) & 3 != lane {
+                continue;
+            }
+            let positive = payload[bit >> 5] & (1u32 << (bit & 31)) != 0;
+            model.push(Lit::new(variable, positive));
+            bit += 1;
+        }
+    }
+    if bit != query.domain.len() {
+        return Err(BatchDecodeError::InvalidResultShape);
+    }
+    Ok(model)
+}
+
 /// Decode the variable-length records emitted by the persistent HLS batch
 /// command. Malformed device output is an error, never a partial SAT result.
 pub fn decode_batch_results(
@@ -216,9 +261,14 @@ pub fn decode_batch_results(
         let result = match Status::from_word(header.status)
             .ok_or(BatchDecodeError::InvalidStatus)?
         {
-            Status::Sat if n_core == 0 && header.error == 0 => IncrementalResult::Sat {
-                model: payload[..n_model].iter().map(|w| decode_lit(*w)).collect(),
-            },
+            Status::Sat if n_core == 0 && header.error == 0 => {
+                let model = if bank_aligned_domain_enabled() && packed_sat_model_enabled() {
+                    decode_packed_sat_model(query, &payload[..n_model])?
+                } else {
+                    payload[..n_model].iter().map(|w| decode_lit(*w)).collect()
+                };
+                IncrementalResult::Sat { model }
+            }
             Status::Unsat if n_model == 0 && header.error == 0 => IncrementalResult::Unsat {
                 core: payload[..n_core].iter().map(|w| decode_lit(*w)).collect(),
                 used_constraints: !query.constraints.is_empty(),
@@ -840,6 +890,48 @@ mod tests {
         assert_eq!(
             decode_batch_results(&queries, &words),
             Err(BatchDecodeError::QueryCount),
+        );
+    }
+
+    #[test]
+    fn packed_sat_models_decode_lane_major_across_word_boundaries() {
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = (0..33).map(Var::from).collect();
+        let lane_major: Vec<Var> = (0..4u32)
+            .flat_map(|lane| {
+                query
+                    .domain
+                    .iter()
+                    .copied()
+                    .filter(move |variable| u32::from(*variable) & 3 == lane)
+            })
+            .collect();
+        let mut payload = vec![0u32; 2];
+        for (bit, variable) in lane_major.iter().enumerate() {
+            if u32::from(*variable) & 1 == 0 {
+                payload[bit >> 5] |= 1u32 << (bit & 31);
+            }
+        }
+
+        let model = decode_packed_sat_model(&query, &payload).unwrap();
+        assert_eq!(model.len(), 33);
+        for (literal, variable) in model.iter().zip(lane_major) {
+            assert_eq!(literal.var(), variable);
+            assert_eq!(literal.polarity(), u32::from(variable) & 1 == 0);
+        }
+    }
+
+    #[test]
+    fn packed_sat_models_reject_bad_lengths_and_nonzero_tail_bits() {
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = (0..33).map(Var::from).collect();
+        assert_eq!(
+            decode_packed_sat_model(&query, &[0]),
+            Err(BatchDecodeError::InvalidResultShape),
+        );
+        assert_eq!(
+            decode_packed_sat_model(&query, &[0, 2]),
+            Err(BatchDecodeError::InvalidResultShape),
         );
     }
 

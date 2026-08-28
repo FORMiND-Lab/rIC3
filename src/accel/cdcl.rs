@@ -35,6 +35,9 @@ pub const MIC_PROTECT_INDEX: u32 = 1 << 7;
 /// Domain payload is four bank-aligned scheduled slots per line. This is an
 /// internal candidate-image contract; ordinary ABI-v2 images keep it clear.
 pub const BANK_ALIGNED_DOMAIN: u32 = 1 << 8;
+/// Return one SAT assignment bit per logical domain variable in lane-major
+/// bank order. `ResponseHeader::n_model` then counts packed 32-bit words.
+pub const PACKED_SAT_MODEL: u32 = 1 << 9;
 pub const MIC_PROTECTED_INDEX_SHIFT: u32 = 16;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
@@ -270,7 +273,11 @@ impl QueryHeader {
     }
 
     pub fn valid_for(&self, payload: &[u32]) -> bool {
-        if self.version != ABI_VERSION || self.payload_words() != Some(payload.len()) {
+        if self.version != ABI_VERSION
+            || self.payload_words() != Some(payload.len())
+            || self.flags & PACKED_SAT_MODEL != 0 && self.flags & BANK_ALIGNED_DOMAIN == 0
+            || self.flags & BANK_ALIGNED_DOMAIN != 0 && self.n_domain & 3 != 0
+        {
             return false;
         }
         let begin = self.n_assumptions as usize;
