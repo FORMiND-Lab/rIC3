@@ -77,10 +77,17 @@ impl IncrementalQuery {
             payload.extend(clause.iter().map(|l| Into::<u32>::into(*l)));
         }
         if bank_aligned {
+            assert!(
+                self.domain.len() <= 32768,
+                "bank-aligned CDCL domain exceeds the 15-bit schedule ABI"
+            );
             let mut banks: [Vec<(u16, u16)>; 4] = std::array::from_fn(|_| Vec::new());
             for (rank, variable) in self.domain.iter().enumerate() {
                 let variable = u32::from(*variable);
-                debug_assert!(rank < 32768 && variable < 32768);
+                assert!(
+                    variable < 32768,
+                    "bank-aligned CDCL variable exceeds the 15-bit schedule ABI"
+                );
                 banks[(variable & 3) as usize].push((rank as u16, variable as u16));
             }
             for line in 0..domain_words / 4 {
