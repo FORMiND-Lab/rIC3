@@ -1,7 +1,7 @@
 use super::DagCnfSolver;
 use super::cdb::CREF_NONE;
 use crate::accel::cdcl::{
-    ABI_VERSION, BatchHeader, BatchResponseHeader, KEEP_LEARNTS, QueryHeader,
+    ABI_VERSION, BANK_ALIGNED_DOMAIN, BatchHeader, BatchResponseHeader, KEEP_LEARNTS, QueryHeader,
     RESPONSE_HEADER_WORDS, ResponseHeader, Status, UnknownReason, WANT_CORE, WANT_MODEL,
 };
 use logicrs::{Lbool, Lit, LitVec, Var, satif::Satif};
@@ -26,6 +26,28 @@ pub struct IncrementalQuery {
     pub keep_learnts: bool,
 }
 
+pub fn bank_aligned_domain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_BANK_ALIGNED_DOMAIN")
+            .ok()
+            .is_some_and(|value| {
+                !matches!(value.as_str(), "" | "0" | "false" | "off")
+            })
+    })
+}
+
+pub fn encoded_domain_words(domain: &[Var]) -> usize {
+    if !bank_aligned_domain_enabled() {
+        return domain.len();
+    }
+    let mut banks = [0usize; 4];
+    for variable in domain {
+        banks[(u32::from(*variable) & 3) as usize] += 1;
+    }
+    4 * banks.into_iter().max().unwrap_or(0)
+}
+
 impl IncrementalQuery {
     pub fn new(frame: u32, assumptions: impl Into<LitVec>) -> Self {
         Self {
@@ -44,19 +66,41 @@ impl IncrementalQuery {
             n.checked_add(1 + c.len())
                 .expect("incremental CDCL constraint payload overflow")
         });
+        let bank_aligned = bank_aligned_domain_enabled();
+        let domain_words = encoded_domain_words(&self.domain);
         let mut payload = Vec::with_capacity(
-            self.assumptions.len() + constraint_words + self.domain.len(),
+            self.assumptions.len() + constraint_words + domain_words,
         );
         payload.extend(self.assumptions.iter().map(|l| Into::<u32>::into(*l)));
         for clause in &self.constraints {
             payload.push(clause.len() as u32);
             payload.extend(clause.iter().map(|l| Into::<u32>::into(*l)));
         }
-        payload.extend(self.domain.iter().map(|v| Into::<u32>::into(*v)));
+        if bank_aligned {
+            let mut banks: [Vec<(u16, u16)>; 4] = std::array::from_fn(|_| Vec::new());
+            for (rank, variable) in self.domain.iter().enumerate() {
+                let variable = u32::from(*variable);
+                debug_assert!(rank < 32768 && variable < 32768);
+                banks[(variable & 3) as usize].push((rank as u16, variable as u16));
+            }
+            for line in 0..domain_words / 4 {
+                for bank in &banks {
+                    let slot = bank.get(line).map_or(0, |&(rank, variable)| {
+                        0x8000_0000 | (u32::from(rank) << 16) | u32::from(variable)
+                    });
+                    payload.push(slot);
+                }
+            }
+        } else {
+            payload.extend(self.domain.iter().map(|v| Into::<u32>::into(*v)));
+        }
 
         let mut flags = WANT_MODEL | WANT_CORE;
         if self.keep_learnts {
             flags |= KEEP_LEARNTS;
+        }
+        if bank_aligned {
+            flags |= BANK_ALIGNED_DOMAIN;
         }
         let header = QueryHeader {
             version: ABI_VERSION,
@@ -64,7 +108,7 @@ impl IncrementalQuery {
             flags,
             n_assumptions: self.assumptions.len() as u32,
             n_constraint_words: constraint_words as u32,
-            n_domain: self.domain.len() as u32,
+            n_domain: domain_words as u32,
             decision_budget: self.budget.decisions,
             conflict_budget: self.budget.conflicts,
         };

@@ -28,7 +28,7 @@ use simplify::Simplify;
 pub use statistic::SolverStatistic;
 pub use query::{
     BatchDecodeError, IncrementalCdcl, IncrementalQuery, IncrementalResult, QueryBudget,
-    decode_batch_results, pack_batch, solve_on_cpu_after_hardware_unknown,
+    decode_batch_results, encoded_domain_words, pack_batch, solve_on_cpu_after_hardware_unknown,
     solve_with_cpu_fallback,
 };
 use std::iter::empty;

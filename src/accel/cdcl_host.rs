@@ -20,7 +20,7 @@ use super::cdcl::{
 use crate::gipsat::decode_batch_results;
 use crate::gipsat::{
     BatchDecodeError, DagCnfSolver, IncrementalCdcl, IncrementalQuery, IncrementalResult,
-    QueryBudget, pack_batch, solve_on_cpu_after_hardware_unknown,
+    QueryBudget, encoded_domain_words, pack_batch, solve_on_cpu_after_hardware_unknown,
 };
 use logicrs::{Lit, LitVec, Var};
 use std::collections::HashMap;
@@ -474,7 +474,10 @@ fn pack_batch_request(
         .iter()
         .try_fold(0usize, |total, query| {
             let record = RESPONSE_HEADER_WORDS
-                .checked_add(query.domain.len().max(query.assumptions.len()))?
+                .checked_add(
+                    encoded_domain_words(&query.domain)
+                        .max(query.assumptions.len()),
+                )?
                 .checked_add(if want_stage_profile {
                     STAGE_PROFILE_WORDS
                 } else {
@@ -2948,7 +2951,7 @@ fn query_request_words(query: &IncrementalQuery) -> Option<usize> {
     8usize
         .checked_add(query.assumptions.len())?
         .checked_add(constraints)?
-        .checked_add(query.domain.len())
+        .checked_add(encoded_domain_words(&query.domain))
 }
 
 /// Partition one context-compatible query sequence into complete hardware

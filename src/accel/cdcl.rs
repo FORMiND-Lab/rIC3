@@ -32,6 +32,9 @@ pub const WANT_LAST_CONSTRAINT_MODEL: u32 = 1 << 6;
 /// Protect one cube entry in place. Its zero-based index occupies flags[31:16]
 /// so the FPGA follows GipSAT's existing literal/drop order.
 pub const MIC_PROTECT_INDEX: u32 = 1 << 7;
+/// Domain payload is four bank-aligned scheduled slots per line. This is an
+/// internal candidate-image contract; ordinary ABI-v2 images keep it clear.
+pub const BANK_ALIGNED_DOMAIN: u32 = 1 << 8;
 pub const MIC_PROTECTED_INDEX_SHIFT: u32 = 16;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
