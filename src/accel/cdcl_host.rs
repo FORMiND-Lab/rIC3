@@ -2214,6 +2214,7 @@ static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_MICS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_BLOCK_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_BLOCK_EVENTS: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_FRAME_EVENTS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_ROOTS: std::sync::OnceLock<std::sync::Mutex<HashSet<u32>>> =
     std::sync::OnceLock::new();
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
@@ -3512,11 +3513,15 @@ fn measure_reference_cpu(
 // Version 8 also emits compact event-only records for BLOCK roots that did not
 // launch an exact SAT inquiry. This keeps the resident proof state continuous
 // instead of accumulating their mutations into the next full checkpoint.
-const EXACT_REPLAY_VERSION: u32 = 8;
+// Version 9 emits the direct extend/propagate/push-to-infinity maintenance
+// stream between BLOCK roots.  Initial/final images are trace-only oracles;
+// production consumes only the mutation commands.
+const EXACT_REPLAY_VERSION: u32 = 9;
 const EXACT_REPLAY_BATCH: u32 = 1;
 const EXACT_REPLAY_MIC: u32 = 2;
 const EXACT_REPLAY_BLOCK_PROGRESS_RECORD: u32 = 3;
 const EXACT_REPLAY_BLOCK_EVENT_RECORD: u32 = 4;
+const EXACT_REPLAY_FRAME_EVENT_RECORD: u32 = 5;
 const RING_INDEPENDENT_SET: u32 = 1 << 3;
 const RING_END_OF_BATCH: u32 = 1 << 2;
 
@@ -3563,6 +3568,13 @@ pub struct ExactBlockProgressCapture {
     current_obligation_image: Vec<u32>,
     current_lemma_image: Vec<u32>,
     steps: Vec<ExactBlockProgressStep>,
+}
+
+pub struct ExactFrameEventCapture {
+    input_obligations: (usize, u64),
+    input_lemmas: (usize, u64),
+    initial_obligation_image: Vec<u32>,
+    initial_lemma_image: Vec<u32>,
 }
 
 struct ExactImagePatch {
@@ -3905,6 +3917,77 @@ pub fn begin_exact_block_progress(
 
 pub fn exact_block_progress_enabled() -> bool {
     std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some()
+}
+
+/// Begin one direct proof-state maintenance wave.  This scope deliberately
+/// starts before IC3 extends the delta-frame vector and closes only after
+/// propagation and infinity promotion, so no inter-BLOCK mutation needs to be
+/// inferred at the next root boundary.
+pub fn begin_exact_frame_events(
+    obligations: (usize, u64),
+    lemmas: (usize, u64),
+    obligation_image: Vec<u32>,
+    lemma_image: Vec<u32>,
+) -> Option<ExactFrameEventCapture> {
+    std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").map(|_| {
+        ExactFrameEventCapture {
+            input_obligations: obligations,
+            input_lemmas: lemmas,
+            initial_obligation_image: obligation_image,
+            initial_lemma_image: lemma_image,
+        }
+    })
+}
+
+/// Close a maintenance wave with CPU images used only as an exact simulation
+/// oracle. The serialized production-shape program is `semantic_ops`.
+pub fn finish_exact_frame_events(
+    capture: Option<ExactFrameEventCapture>,
+    proved: bool,
+    obligations: (usize, u64),
+    lemmas: (usize, u64),
+    obligation_image: Vec<u32>,
+    lemma_image: Vec<u32>,
+    semantic_ops: Vec<Vec<u32>>,
+) {
+    let Some(capture) = capture else { return };
+    let Some(writer) = exact_replay_writer() else { return };
+    let wave_id = EXACT_REPLAY_FRAME_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut words = vec![
+        0,
+        EXACT_REPLAY_FRAME_EVENT_RECORD,
+        wave_id.min(u64::from(u32::MAX)) as u32,
+        u32::from(proved),
+        capture.input_obligations.0.min(u32::MAX as usize) as u32,
+    ];
+    exact_push_u64(&mut words, capture.input_obligations.1);
+    words.push(obligations.0.min(u32::MAX as usize) as u32);
+    exact_push_u64(&mut words, obligations.1);
+    words.push(capture.input_lemmas.0.min(u32::MAX as usize) as u32);
+    exact_push_u64(&mut words, capture.input_lemmas.1);
+    words.push(lemmas.0.min(u32::MAX as usize) as u32);
+    exact_push_u64(&mut words, lemmas.1);
+    words.push(semantic_ops.len().min(u32::MAX as usize) as u32);
+    words.push(
+        capture.initial_obligation_image.len().min(u32::MAX as usize) as u32,
+    );
+    words.extend(capture.initial_obligation_image);
+    words.push(capture.initial_lemma_image.len().min(u32::MAX as usize) as u32);
+    words.extend(capture.initial_lemma_image);
+    words.push(obligation_image.len().min(u32::MAX as usize) as u32);
+    words.extend(obligation_image);
+    words.push(lemma_image.len().min(u32::MAX as usize) as u32);
+    words.extend(lemma_image);
+    for operation in semantic_ops {
+        words.extend(operation);
+    }
+    words[0] = (words.len() - 1) as u32;
+    let Ok(mut writer) = writer.lock() else { return };
+    for word in words {
+        if writer.write_all(&word.to_le_bytes()).is_err() {
+            return;
+        }
+    }
 }
 
 /// Append one algorithm-level instruction to the buffered BLOCK program.
@@ -6189,7 +6272,7 @@ pub fn flush_and_report() {
         }
         flush_exact_replay_writer();
         eprintln!(
-            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK checkpoints {}, event-only roots {}, file {}; ranged snapshot fallbacks {}",
+            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK checkpoints {}, event-only roots {}, frame-event waves {}, file {}; ranged snapshot fallbacks {}",
             ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
             ARCH_TRACE_QUERIES.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_TRACE_CSV").unwrap_or_else(|_| "disabled".to_string()),
@@ -6198,6 +6281,7 @@ pub fn flush_and_report() {
             EXACT_REPLAY_MICS.load(Ordering::Relaxed),
             EXACT_REPLAY_BLOCK_PROGRESS.load(Ordering::Relaxed),
             EXACT_REPLAY_BLOCK_EVENTS.load(Ordering::Relaxed),
+            EXACT_REPLAY_FRAME_EVENTS.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_EXACT_REPLAY").unwrap_or_else(|_| "disabled".to_string()),
             FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
         );

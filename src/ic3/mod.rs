@@ -379,6 +379,17 @@ impl IC3 {
             self.filog.log(Level::Info, self.frame.statistic(true));
             self.tracer
                 .trace_state(None, McResult::Unknown(Some(self.level())));
+            let frame_event = if crate::accel::cdcl_host::exact_block_progress_enabled() {
+                crate::accel::cdcl_host::begin_exact_frame_events(
+                    self.obligations.progress_snapshot(),
+                    self.frame.progress_snapshot(),
+                    self.obligations.progress_image(),
+                    self.frame.progress_image(),
+                )
+            } else {
+                None
+            };
+            frame::begin_frame_maintenance_journal(frame_event.is_some());
             self.extend();
             self.render_progress();
             let start = Instant::now();
@@ -390,11 +401,33 @@ impl IC3 {
             );
             self.statistic.propagate.overall_time += start.elapsed();
             if propagate {
+                if frame_event.is_some() {
+                    crate::accel::cdcl_host::finish_exact_frame_events(
+                        frame_event,
+                        true,
+                        self.obligations.progress_snapshot(),
+                        self.frame.progress_snapshot(),
+                        self.obligations.progress_image(),
+                        self.frame.progress_image(),
+                        frame::finish_frame_maintenance_journal(),
+                    );
+                }
                 self.tracer.trace_state(None, McResult::UNSAT);
                 self.finish_progress(McResult::UNSAT);
                 return McResult::UNSAT;
             }
             self.propagate_to_inf();
+            if frame_event.is_some() {
+                crate::accel::cdcl_host::finish_exact_frame_events(
+                    frame_event,
+                    false,
+                    self.obligations.progress_snapshot(),
+                    self.frame.progress_snapshot(),
+                    self.obligations.progress_image(),
+                    self.frame.progress_image(),
+                    frame::finish_frame_maintenance_journal(),
+                );
+            }
             self.render_progress();
         }
     }

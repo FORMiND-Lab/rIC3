@@ -217,13 +217,19 @@ impl ProofObligationQueue {
         }
         self.num[po.frame] += 1;
         trace!("add obligation: {}", po.state);
+        super::frame::note_frame_obligation_mutation(true, &po);
         assert!(self.obligations.insert(po));
     }
 
     pub fn add_if_new(&mut self, po: ProofObligation) -> bool {
         let frame = po.frame;
         trace!("add obligation if new: {}", po.state);
-        if !self.obligations.insert(po) {
+        if super::frame::frame_maintenance_journal_enabled() {
+            if !self.obligations.insert(po.clone()) {
+                return false;
+            }
+            super::frame::note_frame_obligation_mutation(true, &po);
+        } else if !self.obligations.insert(po) {
             return false;
         }
         if self.num.len() <= frame {
@@ -236,7 +242,11 @@ impl ProofObligationQueue {
     pub fn pop(&mut self, depth: usize) -> Option<ProofObligation> {
         if let Some(po) = self.obligations.last().filter(|po| po.frame <= depth) {
             self.num[po.frame] -= 1;
-            self.obligations.pop_last()
+            let popped = self.obligations.pop_last();
+            if let Some(po) = &popped {
+                super::frame::note_frame_obligation_mutation(false, po);
+            }
+            popped
         } else {
             None
         }
@@ -250,6 +260,7 @@ impl ProofObligationQueue {
         let ret = self.obligations.remove(po);
         if ret {
             self.num[po.frame] -= 1;
+            super::frame::note_frame_obligation_mutation(false, po);
         }
         ret
     }
@@ -258,6 +269,7 @@ impl ProofObligationQueue {
         let ret = self.obligations.take(po);
         if let Some(taken) = &ret {
             self.num[taken.frame] -= 1;
+            super::frame::note_frame_obligation_mutation(false, taken);
         }
         ret
     }
@@ -267,6 +279,9 @@ impl ProofObligationQueue {
     }
 
     pub fn clear(&mut self) {
+        if !self.obligations.is_empty() {
+            super::frame::note_frame_clear_obligations();
+        }
         self.obligations.clear();
         for n in self.num.iter_mut() {
             *n = 0;

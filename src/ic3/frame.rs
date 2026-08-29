@@ -30,6 +30,121 @@ pub(super) struct BlockLemmaMutation {
 thread_local! {
     static BLOCK_LEMMA_JOURNAL: RefCell<Option<Vec<BlockLemmaMutation>>> =
         const { RefCell::new(None) };
+    // Mutations outside BLOCK used to be rediscovered by diffing the next
+    // BLOCK root image.  Keep one direct semantic stream across the complete
+    // extend/propagate/push-to-infinity maintenance wave instead.  The final
+    // images remain an independent simulation oracle only.
+    static FRAME_MAINTENANCE_JOURNAL: RefCell<Option<Vec<Vec<u32>>>> =
+        const { RefCell::new(None) };
+}
+
+const RESIDENT_REMOVE_OBLIGATION: u32 = 0;
+const RESIDENT_INSERT_OBLIGATION: u32 = 1;
+const RESIDENT_CLEAR_OBLIGATIONS: u32 = 2;
+const RESIDENT_REMOVE_LEMMA: u32 = 3;
+const RESIDENT_INSERT_LEMMA: u32 = 4;
+const RESIDENT_SET_LEMMA_FRAMES: u32 = 5;
+const RESIDENT_MOVE_LEMMA: u32 = 6;
+
+pub(super) fn begin_frame_maintenance_journal(enabled: bool) {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
+        *journal.borrow_mut() = enabled.then(Vec::new);
+    });
+}
+
+pub(super) fn finish_frame_maintenance_journal() -> Vec<Vec<u32>> {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
+        journal.borrow_mut().take().unwrap_or_default()
+    })
+}
+
+pub(super) fn frame_maintenance_journal_enabled() -> bool {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| journal.borrow().is_some())
+}
+
+pub(super) fn note_frame_obligation_mutation(
+    insert: bool,
+    po: &ProofObligation,
+) {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
+        let mut journal = journal.borrow_mut();
+        let Some(journal) = journal.as_mut() else { return };
+        let mut payload = Vec::new();
+        payload.push(po.state.len().min(u32::MAX as usize) as u32);
+        payload.extend(po.state.iter().map(|lit| u32::from(*lit)));
+        payload.push(po.input.len().min(u32::MAX as usize) as u32);
+        for inputs in &po.input {
+            payload.push(inputs.len().min(u32::MAX as usize) as u32);
+            payload.extend(inputs.iter().map(|lit| u32::from(*lit)));
+        }
+        let mut operation = vec![
+            if insert {
+                RESIDENT_INSERT_OBLIGATION
+            } else {
+                RESIDENT_REMOVE_OBLIGATION
+            },
+            po.frame.min(u32::MAX as usize) as u32,
+            po.depth.min(u32::MAX as usize) as u32,
+            u32::from(po.removed),
+            payload.len().min(u32::MAX as usize) as u32,
+        ];
+        operation.extend(payload);
+        journal.push(operation);
+    });
+}
+
+pub(super) fn note_frame_clear_obligations() {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
+        if let Some(journal) = journal.borrow_mut().as_mut() {
+            journal.push(vec![RESIDENT_CLEAR_OBLIGATIONS]);
+        }
+    });
+}
+
+fn note_frame_lemma_mutation(insert: bool, frame: usize, lemma: &LitOrdVec) {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
+        let mut journal = journal.borrow_mut();
+        let Some(journal) = journal.as_mut() else { return };
+        let mut operation = vec![
+            if insert {
+                RESIDENT_INSERT_LEMMA
+            } else {
+                RESIDENT_REMOVE_LEMMA
+            },
+            frame.min(u32::MAX as usize) as u32,
+            lemma.len().min(u32::MAX as usize) as u32 + 1,
+            lemma.len().min(u32::MAX as usize) as u32,
+        ];
+        operation.extend(lemma.iter().map(|lit| u32::from(*lit)));
+        journal.push(operation);
+    });
+}
+
+fn note_frame_lemma_move(source: usize, destination: usize, lemma: &LitOrdVec) {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
+        let mut journal = journal.borrow_mut();
+        let Some(journal) = journal.as_mut() else { return };
+        let mut operation = vec![
+            RESIDENT_MOVE_LEMMA,
+            source.min(u32::MAX as usize) as u32,
+            destination.min(u32::MAX as usize) as u32,
+            lemma.len().min(u32::MAX as usize) as u32 + 1,
+            lemma.len().min(u32::MAX as usize) as u32,
+        ];
+        operation.extend(lemma.iter().map(|lit| u32::from(*lit)));
+        journal.push(operation);
+    });
+}
+
+fn note_frame_count(frame_count: usize) {
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
+        if let Some(journal) = journal.borrow_mut().as_mut() {
+            journal.push(vec![
+                RESIDENT_SET_LEMMA_FRAMES,
+                frame_count.min(u32::MAX as usize) as u32,
+            ]);
+        }
+    });
 }
 
 pub(super) fn begin_block_lemma_journal(enabled: bool) {
@@ -192,6 +307,7 @@ impl Frames {
 
     pub fn extend(&mut self) {
         self.frames.push(Frame::new());
+        note_frame_count(self.frames.len());
     }
 
     pub fn reserve(&mut self, var: Var) {
@@ -354,6 +470,7 @@ impl IC3 {
                 frame,
                 lemma: lemma.as_litvec().clone(),
             };
+            note_frame_lemma_mutation(insert, frame, lemma);
             BLOCK_LEMMA_JOURNAL.with(|journal| {
                 if let Some(journal) = journal.borrow_mut().as_mut() {
                     journal.push(mutation.clone());
@@ -476,10 +593,12 @@ impl IC3 {
         );
         let lemma = LitOrdVec::new(lemma);
         assert!(self.frame.trivial_contained(None, &lemma).is_none());
+        let last_frame = self.frame.frames.len() - 1;
         let lastf = self.frame.frames.last_mut().unwrap();
         let olen = lastf.len();
         lastf.retain(|l| !l.eq(&lemma));
         assert_eq!(lastf.len() + 1, olen);
+        note_frame_lemma_move(last_frame, usize::MAX, &lemma);
         let clause = !lemma.as_litvec();
         crate::accel::cdcl_host::register_frame_resident_clause(
             &clause,
