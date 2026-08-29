@@ -519,6 +519,12 @@ const ARENA_VIEW_PREFIX_WORDS: usize = 5;
 const ARENA_VIEW_REUSE: u32 = 0;
 const ARENA_VIEW_TOGGLE: u32 = 1;
 const ARENA_VIEW_BITMAP: u32 = 2;
+const QUALIFIED_ARENA_MAX_VARS: u32 = 32_768;
+// Admission bound of the qualified full VCK5000 image. Using the complete
+// bitmap here is conservative: most commands send sparse toggles, but the
+// host planner must not form a batch that only fits when every view update is
+// unusually small.
+const QUALIFIED_ARENA_MAX_CLAUSES: usize = 75_000;
 
 /// Insert one independently planned physical-lane view immediately before
 /// each complete query record. The ordinary batch packer remains the single
@@ -1243,25 +1249,62 @@ impl HardwareCdcl {
         Ok(mapping)
     }
 
-    /// Execute a normal query batch while keeping the union clause arena
-    /// resident. Each logical query carries only a lane-local active-clause
-    /// view plus its ordinary private assumptions/constraints/domain.
-    fn solve_arena_batch(
+    /// Batch inquiries from different IC3 frame snapshots through one union
+    /// arena. Each query receives the mapping of its own exact/ranged context;
+    /// clauses interned for another snapshot remain physically resident but
+    /// disabled in that query's lane-local bitmap.
+    fn solve_arena_batch_contexts(
         &mut self,
-        context: &ShadowContext,
+        contexts: &[ShadowContext],
         queries: &[IncrementalQuery],
     ) -> Result<Vec<IncrementalResult>, HardwareError> {
         self.last_batch_work = HardwareWork::default();
         self.last_batch_records.clear();
-        if queries.is_empty() {
+        if queries.is_empty() || contexts.len() != queries.len() {
             return Err(HardwareError::InvalidContext);
         }
-        let mapping = self.prepare_arena_context(context)?;
-        let ranged = context.scope == ShadowContextScope::FrameRanged;
+        let required_n_var = contexts
+            .iter()
+            .map(|context| context.n_var)
+            .max()
+            .filter(|n_var| *n_var != 0 && *n_var <= QUALIFIED_ARENA_MAX_VARS)
+            .ok_or(HardwareError::InvalidContext)?;
+        // Solver clones in one IC3 frontier can own different counts of
+        // temporary activation variables. The resident engine only needs one
+        // upper bound, so retain an already-larger arena or grow once to the
+        // maximum instead of splitting/resetting on each logical snapshot.
+        let arena_n_var = if self.n_var >= required_n_var
+            && self.n_var <= QUALIFIED_ARENA_MAX_VARS
+            && self.arena.n_var == self.n_var
+        {
+            self.n_var
+        } else {
+            required_n_var
+        };
+        let normalized_contexts: Vec<_> = contexts
+            .iter()
+            .cloned()
+            .map(|mut context| {
+                context.n_var = arena_n_var;
+                context
+            })
+            .collect();
+        let mut mappings = Vec::with_capacity(normalized_contexts.len());
+        for context in &normalized_contexts {
+            mappings.push(self.prepare_arena_context(context)?);
+        }
         let mut candidate = self.arena.clone();
         let mut views = Vec::with_capacity(queries.len());
-        for (index, query) in queries.iter().enumerate() {
-            let active = mapping.active(query.frame, ranged);
+        for (index, ((context, mapping), query)) in normalized_contexts
+            .iter()
+            .zip(mappings.iter())
+            .zip(queries.iter())
+            .enumerate()
+        {
+            let active = mapping.active(
+                query.frame,
+                context.scope == ShadowContextScope::FrameRanged,
+            );
             views.push(candidate.plan_view(index & 1, &active)?);
         }
         let (request, response_capacity) =
@@ -1920,6 +1963,9 @@ static ACTIVE_SKIPPED_PASSES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_OFFERED_PASSES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MAX_READY: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SHARED_DOMAIN_PROJECTED_QUERIES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SHARED_DOMAIN_PROJECTED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SHARED_DOMAIN_PROJECTED_SAVED_WORDS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOADS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_APPENDS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_APPEND_CLAUSES: AtomicU64 = AtomicU64::new(0);
@@ -3022,6 +3068,82 @@ fn plan_full_batch_ranges(
     ranges
 }
 
+/// Architecture-only planner for an ABI where one identical decision domain
+/// is carried once per batch instead of once per query. It does not alter the
+/// production request. Live native/board telemetry uses it to decide whether
+/// implementing the new wire command is worth an HLS iteration.
+fn plan_shared_domain_batch_ranges(
+    domains: &[&[Var]],
+    query_words: &[usize],
+    min_batch: usize,
+    max_batch: usize,
+    max_words: usize,
+) -> Vec<std::ops::Range<usize>> {
+    if domains.len() != query_words.len()
+        || domains.is_empty()
+        || min_batch == 0
+        || min_batch > max_batch
+        || max_words < 4
+    {
+        return Vec::new();
+    }
+    let n_query = domains.len();
+    let mut covered = vec![0usize; n_query + 1];
+    let mut batches = vec![0usize; n_query + 1];
+    let mut take = vec![0usize; n_query];
+    for start in (0..n_query).rev() {
+        covered[start] = covered[start + 1];
+        batches[start] = batches[start + 1];
+        let shared_domain_words = encoded_domain_words(domains[start]);
+        let Some(mut words) = 4usize.checked_add(shared_domain_words) else {
+            continue;
+        };
+        let limit = n_query.min(start.saturating_add(max_batch));
+        for end in start..limit {
+            if domains[end] != domains[start] {
+                break;
+            }
+            let Some(private_words) = query_words[end].checked_sub(shared_domain_words) else {
+                break;
+            };
+            let Some(next) = words.checked_add(private_words) else {
+                break;
+            };
+            if next > max_words {
+                break;
+            }
+            words = next;
+            let count = end + 1 - start;
+            if count < min_batch {
+                continue;
+            }
+            let candidate_covered = count.saturating_add(covered[end + 1]);
+            let candidate_batches = 1usize.saturating_add(batches[end + 1]);
+            if candidate_covered > covered[start]
+                || candidate_covered == covered[start]
+                    && (candidate_batches < batches[start]
+                        || candidate_batches == batches[start] && count > take[start])
+            {
+                covered[start] = candidate_covered;
+                batches[start] = candidate_batches;
+                take[start] = count;
+            }
+        }
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < n_query {
+        let count = take[start];
+        if count == 0 {
+            start += 1;
+        } else {
+            ranges.push(start..start + count);
+            start += count;
+        }
+    }
+    ranges
+}
+
 /// Cache the resident partition once per live frame solver while one
 /// propagation pass is being planned. `incremental_resident_partition`
 /// returns owned clause vectors, so invoking it for every query turns a cheap
@@ -3486,7 +3608,7 @@ fn exact_push_u64(words: &mut Vec<u32>, value: u64) {
 fn record_exact_replay_batch(
     pass_id: u64,
     context: &ShadowContext,
-    pending: &[(usize, IncrementalQuery)],
+    pending: &[(usize, IncrementalQuery, ShadowContext)],
     cpu: &[PairedCpuWork],
     end_of_pass: bool,
 ) {
@@ -3540,7 +3662,7 @@ fn record_exact_replay_batch(
         words.push(clause.literals.len() as u32);
         words.extend(clause.literals.iter().map(|lit| u32::from(*lit)));
     }
-    for (query_position, (index, query)) in pending.iter().take(take).enumerate() {
+    for (query_position, (index, query, _)) in pending.iter().take(take).enumerate() {
         let Some(work) = cpu.get(*index) else {
             return;
         };
@@ -3783,7 +3905,7 @@ fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std
 fn record_architecture_trace_batch(
     pass_id: u64,
     context: &ShadowContext,
-    pending: &[(usize, IncrementalQuery)],
+    pending: &[(usize, IncrementalQuery, ShadowContext)],
     cpu: &[PairedCpuWork],
 ) {
     if pending.is_empty() {
@@ -3810,7 +3932,7 @@ fn record_architecture_trace_batch(
         ShadowContextScope::ExactFrame(_) => "exact-frame",
         ShadowContextScope::FrameRanged => "frame-ranged",
     };
-    for (position, (index, query)) in pending.iter().enumerate() {
+    for (position, (index, query, _)) in pending.iter().enumerate() {
         let Some(cpu_work) = cpu.get(*index) else {
             continue;
         };
@@ -3858,7 +3980,7 @@ fn flush_architecture_trace_writer() {
 fn record_comparison_batch(
     pass_id: u64,
     context: &ShadowContext,
-    pending: &[(usize, IncrementalQuery)],
+    pending: &[(usize, IncrementalQuery, ShadowContext)],
     queries: &[IncrementalQuery],
     cpu: &[PairedCpuWork],
     preflight: Option<&[PairedPreflightWork]>,
@@ -3870,7 +3992,7 @@ fn record_comparison_batch(
         return;
     }
     let batch_id = PAIRED_BATCH_ID.fetch_add(1, Ordering::Relaxed) + 1;
-    let batch_cpu_ns = pending.iter().fold(0u64, |total, (index, _)| {
+    let batch_cpu_ns = pending.iter().fold(0u64, |total, (index, _, _)| {
         total.saturating_add(cpu.get(*index).map_or(0, |work| work.elapsed_ns))
     });
     PAIRED_QUERIES.fetch_add(queries.len() as u64, Ordering::Relaxed);
@@ -3879,7 +4001,7 @@ fn record_comparison_batch(
     if batch_hw_ns < batch_cpu_ns {
         PAIRED_HW_FASTER_BATCHES.fetch_add(1, Ordering::Relaxed);
     }
-    for ((index, _), work) in pending.iter().zip(hardware) {
+    for ((index, _, _), work) in pending.iter().zip(hardware) {
         let Some(cpu_work) = cpu.get(*index) else {
             continue;
         };
@@ -3904,7 +4026,7 @@ fn record_comparison_batch(
         .map(|clause| clause.literals.len() as u64)
         .sum::<u64>();
     let init_ns = ACTIVE_INIT_NS.load(Ordering::Relaxed);
-    for (position, (((index, _), query), work)) in
+    for (position, (((index, _, _), query), work)) in
         pending.iter().zip(queries).zip(hardware).enumerate()
     {
         let Some(cpu_work) = cpu.get(*index) else {
@@ -4002,6 +4124,19 @@ fn active_arena_views_enabled() -> bool {
         && std::env::var("INDUCTOR_CDCL_ARENA_VIEWS")
             .ok()
             .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+}
+
+fn shared_domain_projection_enabled() -> bool {
+    std::env::var("INDUCTOR_CDCL_SHARED_DOMAIN_PROJECTION")
+        .ok()
+        .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "off"))
+}
+
+fn cross_context_batch_enabled() -> bool {
+    shared_domain_projection_enabled()
+        || std::env::var("INDUCTOR_CDCL_CROSS_CONTEXT_BATCH")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "off"))
 }
 
 /// Run the same independent propagation inquiries on a cloned GipSAT state
@@ -4792,6 +4927,21 @@ fn mic_chain_effectively_complete(
             && trials == eligible_trials)
 }
 
+fn batch_context_compatible(
+    left: &ShadowContext,
+    right: &ShadowContext,
+    arena_views: bool,
+) -> bool {
+    if arena_views {
+        left.n_var != 0
+            && right.n_var != 0
+            && left.n_var <= QUALIFIED_ARENA_MAX_VARS
+            && right.n_var <= QUALIFIED_ARENA_MAX_VARS
+    } else {
+        left == right
+    }
+}
+
 /// Solve a set of already-independent IC3 inquiries in as few XRT submissions
 /// as their resident contexts and the command-word limit allow. The returned
 /// order matches the input order. This function deliberately does not decide
@@ -4855,12 +5005,20 @@ pub fn solve_active_batch_with_min(
     }
     struct Group {
         context: ShadowContext,
-        pending: Vec<(usize, IncrementalQuery)>,
+        pending: Vec<(usize, IncrementalQuery, ShadowContext)>,
         batches: Vec<std::ops::Range<usize>>,
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut caches = Vec::new();
     let prefer_query_lemmas = !(active_resident_lemmas() || active_frame_ranges());
+    // Exact/architecture traces encode one context per recorded batch. Keep
+    // those diagnostic streams on their original grouping even if the arena
+    // flag is present; production active mode can carry one context per query.
+    let arena_views = active_arena_views_enabled() && !trace_only;
+    // Keep the measured production path unchanged until the shared-domain ABI
+    // closes the queue-economics gate. The projection flag opts into the
+    // prerequisite cross-snapshot merge automatically for native simulation.
+    let merge_contexts = arena_views && cross_context_batch_enabled();
     for (index, (solver, query)) in requests.iter().enumerate() {
         if !selected[index] {
             continue;
@@ -4881,12 +5039,19 @@ pub fn solve_active_batch_with_min(
         }
         let query = caches[cache_index].prepare_query(query.clone(), use_query_lemmas);
         let context = caches[cache_index].context(use_query_lemmas);
-        if let Some(group) = groups.iter_mut().find(|group| &group.context == context) {
-            group.pending.push((index, query));
+        // An arena command does not require identical logical snapshots: it
+        // interns their union once and carries one exact bitmap per query.
+        // Grouping by full ShadowContext here defeated that protocol and
+        // turned an eight-inquiry IC3 frontier into eight device launches.
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| batch_context_compatible(&group.context, &context, merge_contexts))
+        {
+            group.pending.push((index, query, context.clone()));
         } else {
             groups.push(Group {
                 context: context.clone(),
-                pending: vec![(index, query)],
+                pending: vec![(index, query, context.clone())],
                 batches: Vec::new(),
             });
         }
@@ -4896,25 +5061,53 @@ pub fn solve_active_batch_with_min(
     let mut planned_count = 0usize;
     for group in &mut groups {
         if pair_scheduler_enabled() {
-            schedule_query_pairs(&mut group.pending, |(_, query)| query);
+            schedule_query_pairs(&mut group.pending, |(_, query, _)| query);
         }
         let query_words: Vec<_> = group
             .pending
             .iter()
-            .map(|(_, query)| {
+            .map(|(_, query, _)| {
                 let words = query_request_words(query).unwrap_or(KERNEL_MAX_REQUEST_WORDS);
-                if active_arena_views_enabled() {
+                if arena_views {
                     // Dense bitmap is the largest legal view update. Runtime
                     // still rechecks the process-lifetime union arena, which
                     // can be larger after switching between context groups.
                     words.saturating_add(
-                        ARENA_VIEW_PREFIX_WORDS + (group.context.clauses.len() + 31) / 32,
+                        ARENA_VIEW_PREFIX_WORDS
+                            + QUALIFIED_ARENA_MAX_CLAUSES.div_ceil(32),
                     )
                 } else {
                     words
                 }
             })
             .collect();
+        if merge_contexts && shared_domain_projection_enabled() {
+            let domains: Vec<&[Var]> = group
+                .pending
+                .iter()
+                .map(|(_, query, _)| query.domain.as_slice())
+                .collect();
+            let projected = plan_shared_domain_batch_ranges(
+                &domains,
+                &query_words,
+                min_batch_size,
+                active_batch_size(),
+                KERNEL_MAX_REQUEST_WORDS,
+            );
+            let projected_queries = projected.iter().map(|range| range.len()).sum::<usize>();
+            let saved_words = projected.iter().fold(0usize, |total, range| {
+                total.saturating_add(
+                    encoded_domain_words(domains[range.start])
+                        .saturating_mul(range.len().saturating_sub(1)),
+                )
+            });
+            ACTIVE_SHARED_DOMAIN_PROJECTED_QUERIES
+                .fetch_add(projected_queries as u64, Ordering::Relaxed);
+            ACTIVE_SHARED_DOMAIN_PROJECTED_BATCHES
+                .fetch_add(projected.len() as u64, Ordering::Relaxed);
+            ACTIVE_SHARED_DOMAIN_PROJECTED_SAVED_WORDS
+                .fetch_add(saved_words as u64, Ordering::Relaxed);
+        }
         group.batches = plan_full_batch_ranges(
             &query_words,
             min_batch_size,
@@ -4927,7 +5120,7 @@ pub fn solve_active_batch_with_min(
             Ordering::Relaxed,
         );
         for range in &group.batches {
-            for (index, _) in &group.pending[range.clone()] {
+            for (index, _, _) in &group.pending[range.clone()] {
                 planned[*index] = true;
             }
         }
@@ -4996,7 +5189,6 @@ pub fn solve_active_batch_with_min(
         return output;
     };
     'groups: for mut group in groups {
-        let arena_views = active_arena_views_enabled();
         let mut context_load_ns = 0u64;
         let context_update = plan_context_update(state.loaded_context.as_ref(), &group.context);
         let mut context_ready = context_update == ContextUpdate::Ready;
@@ -5017,7 +5209,11 @@ pub fn solve_active_batch_with_min(
             let end = range.end;
             let queries: Vec<_> = group.pending[start..end]
                 .iter()
-                .map(|(_, query)| query.clone())
+                .map(|(_, query, _)| query.clone())
+                .collect();
+            let contexts: Vec<_> = group.pending[start..end]
+                .iter()
+                .map(|(_, _, context)| context.clone())
                 .collect();
             ACTIVE_BATCHES.fetch_add(1, Ordering::Relaxed);
             let mut batch_ns = 0u64;
@@ -5031,7 +5227,7 @@ pub fn solve_active_batch_with_min(
                         .as_mut()
                         .ok_or(HardwareError::Unavailable)
                         .and_then(|hardware| {
-                            hardware.solve_arena_batch(&group.context, &queries)
+                            hardware.solve_arena_batch_contexts(&contexts, &queries)
                         }),
                 );
                 ACTIVE_BATCH_KERNEL_NS.fetch_add(
@@ -5235,7 +5431,9 @@ pub fn solve_active_batch_with_min(
             }
             match result {
                 Ok(results) => {
-                    for ((index, _), result) in group.pending[start..end].iter().zip(results) {
+                    for ((index, _, _), result) in
+                        group.pending[start..end].iter().zip(results)
+                    {
                         match &result {
                             IncrementalResult::Sat { .. } => {
                                 ACTIVE_HW_SAT.fetch_add(1, Ordering::Relaxed);
@@ -6029,6 +6227,19 @@ pub fn flush_and_report() {
             hw_used.saturating_sub(block_used),
             hw_rejected.saturating_sub(block_rejected),
         );
+        if shared_domain_projection_enabled() {
+            let projected_queries =
+                ACTIVE_SHARED_DOMAIN_PROJECTED_QUERIES.load(Ordering::Relaxed);
+            let projected_batches =
+                ACTIVE_SHARED_DOMAIN_PROJECTED_BATCHES.load(Ordering::Relaxed);
+            eprintln!(
+                "inductor-cdcl: shared-domain ABI projection queries/batches/fill {}/{}/{:.3}, repeated request words removed {} (planning only; production wire unchanged)",
+                projected_queries,
+                projected_batches,
+                projected_queries as f64 / projected_batches.max(1) as f64,
+                ACTIVE_SHARED_DOMAIN_PROJECTED_SAVED_WORDS.load(Ordering::Relaxed),
+            );
+        }
         if active_skip_cpu_check() {
             eprintln!(
                 "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, revision-fresh SAT reused {}, stale SAT discarded {}, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
@@ -6532,6 +6743,42 @@ mod tests {
     }
 
     #[test]
+    fn shared_domain_projection_recovers_large_frontier_batches() {
+        let domain: Vec<_> = (0..16_326).map(Var::from).collect();
+        let domains = vec![domain.as_slice(); 8];
+        // The measured p187 shape is approximately 16,326 repeated domain
+        // words plus 2,474 private query/view words. Ordinary ABI-v2 can fit
+        // only one record; a shared domain fits six in the same 32K command.
+        let words = vec![18_800; 8];
+        assert_eq!(
+            plan_full_batch_ranges(&words, 1, 8, 32_768),
+            (0..8).map(|index| index..index + 1).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan_shared_domain_batch_ranges(&domains, &words, 1, 8, 32_768),
+            vec![0..6, 6..8]
+        );
+
+        let other = vec![Var::from(1), Var::from(2)];
+        let split_domains = [
+            domain.as_slice(),
+            domain.as_slice(),
+            other.as_slice(),
+            other.as_slice(),
+        ];
+        assert_eq!(
+            plan_shared_domain_batch_ranges(
+                &split_domains,
+                &[16_426, 16_426, 102, 102],
+                2,
+                8,
+                32_768,
+            ),
+            vec![0..2, 2..4]
+        );
+    }
+
+    #[test]
     fn resident_context_packing_rejects_bad_ranges_and_variables() {
         let a = Lit::new(Var::from(0), true);
         let good = ResidentClause::new(0, 3, LitVec::from([a]));
@@ -6612,6 +6859,69 @@ mod tests {
             .unwrap();
         assert_eq!(restored.active(3, false), vec![0, 1]);
         assert!(appended.is_empty());
+    }
+
+    #[test]
+    fn resident_arena_isolates_different_frame_snapshots_in_one_batch() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), true);
+        let context = |literal, frame| ShadowContext {
+            n_var: 2,
+            clauses: vec![ResidentClause::new(
+                0,
+                u32::MAX,
+                LitVec::from([literal]),
+            )],
+            scope: ShadowContextScope::ExactFrame(frame),
+        };
+        let first_context = context(a, 3);
+        let second_context = context(b, 4);
+        assert!(batch_context_compatible(
+            &first_context,
+            &second_context,
+            true
+        ));
+        assert!(!batch_context_compatible(
+            &first_context,
+            &second_context,
+            false
+        ));
+        assert!(batch_context_compatible(
+            &first_context,
+            &ShadowContext {
+                n_var: 3,
+                clauses: second_context.clauses.clone(),
+                scope: second_context.scope,
+            },
+            true
+        ));
+        assert!(!batch_context_compatible(
+            &first_context,
+            &ShadowContext {
+                n_var: QUALIFIED_ARENA_MAX_VARS + 1,
+                clauses: second_context.clauses.clone(),
+                scope: second_context.scope,
+            },
+            true
+        ));
+
+        let mut arena = ResidentArena::default();
+        let (first_mapping, first_append) = arena.intern_context(&first_context).unwrap();
+        let (second_mapping, second_append) = arena.intern_context(&second_context).unwrap();
+        assert_eq!(arena.n_clause, 2);
+        assert_eq!(first_append.len(), 1);
+        assert_eq!(second_append.len(), 1);
+        assert_eq!(first_mapping.active(3, false), vec![0]);
+        assert_eq!(second_mapping.active(4, false), vec![1]);
+
+        let first_view = arena.plan_view(0, &[0]).unwrap();
+        let second_view = arena.plan_view(1, &[1]).unwrap();
+        assert_eq!(first_view.words[0], ARENA_VIEW_TOGGLE);
+        assert_eq!(second_view.words[0], ARENA_VIEW_TOGGLE);
+        assert_eq!(&first_view.words[ARENA_VIEW_PREFIX_WORDS..], &[0]);
+        assert_eq!(&second_view.words[ARENA_VIEW_PREFIX_WORDS..], &[1]);
+        assert_eq!(arena.lanes[0].bitmap, vec![0b01]);
+        assert_eq!(arena.lanes[1].bitmap, vec![0b10]);
     }
 
     #[test]
