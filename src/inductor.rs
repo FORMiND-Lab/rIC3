@@ -35,6 +35,10 @@ thread_local! {
     static FRAME: Cell<u16> = const { Cell::new(0) };
     /// Macro-op currently in scope, or 0 for "none".
     static OP: Cell<u32> = const { Cell::new(0) };
+    /// Outermost algorithm-owned macro-op. Nested operations (notably MIC
+    /// inside BLOCK) keep this id so exact replay can model one resident
+    /// program without losing the finer-grained OP used by the ordinary trace.
+    static ROOT_OP: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Allocates macro-op ids. Starts at 1 so 0 can mean "no scope".
@@ -349,7 +353,7 @@ pub fn init(model: &str, shape: NetlistShape) -> bool {
 /// later query. Binding the guard to `_ctx` keeps it alive for the enclosing
 /// scope; binding to `_` would drop it immediately and restore too early.
 #[must_use = "dropping the guard immediately restores the previous label"]
-pub struct PhaseGuard(u8, u16, u32);
+pub struct PhaseGuard(u8, u16, u32, u32);
 
 impl Drop for PhaseGuard {
     #[inline]
@@ -357,6 +361,7 @@ impl Drop for PhaseGuard {
         PHASE.with(|p| p.set(self.0));
         FRAME.with(|f| f.set(self.1));
         OP.with(|o| o.set(self.2));
+        ROOT_OP.with(|o| o.set(self.3));
     }
 }
 
@@ -365,7 +370,12 @@ impl Drop for PhaseGuard {
 pub fn set_context(phase: Phase, frame: usize) -> PhaseGuard {
     let prev_p = PHASE.with(|p| p.replace(phase as u8));
     let prev_f = FRAME.with(|f| f.replace(frame.min(u16::MAX as usize) as u16));
-    PhaseGuard(prev_p, prev_f, OP.with(|o| o.get()))
+    PhaseGuard(
+        prev_p,
+        prev_f,
+        OP.with(|o| o.get()),
+        ROOT_OP.with(|o| o.get()),
+    )
 }
 
 /// Open a macro-op scope: every query issued while the guard lives shares one
@@ -379,7 +389,13 @@ pub fn set_context(phase: Phase, frame: usize) -> PhaseGuard {
 #[inline]
 pub fn macro_scope(phase: Phase, frame: usize) -> PhaseGuard {
     let g = set_context(phase, frame);
-    OP.with(|o| o.set(OP_COUNTER.fetch_add(1, Ordering::Relaxed)));
+    let id = OP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    OP.with(|o| o.set(id));
+    ROOT_OP.with(|o| {
+        if o.get() == 0 {
+            o.set(id);
+        }
+    });
     g
 }
 
@@ -391,7 +407,14 @@ pub fn macro_scope(phase: Phase, frame: usize) -> PhaseGuard {
 #[inline]
 pub fn current_macro_context() -> (Phase, u32) {
     let phase = PHASE.with(|p| Phase::from_u8(p.get()).unwrap_or(Phase::Other));
-    let op_id = OP.with(|o| o.get());
+    let op_id = ROOT_OP.with(|root| {
+        let root = root.get();
+        if root != 0 {
+            root
+        } else {
+            OP.with(|op| op.get())
+        }
+    });
     (phase, op_id)
 }
 
@@ -402,10 +425,13 @@ pub fn current_macro_context() -> (Phase, u32) {
 /// the upper bound on what query-level parallelism can buy.
 #[inline]
 pub fn in_phase<R>(phase: Phase, frame: usize, body: impl FnOnce() -> R) -> R {
+    // Exact FPGA replay is intentionally usable without the much larger
+    // ordinary trace. Keep the algorithm labels alive in that configuration;
+    // only timing/QueryRec serialization is conditional on `enabled()`.
+    let _guard = set_context(phase, frame);
     if !enabled() {
         return body();
     }
-    let _guard = set_context(phase, frame);
     let start = now_ns();
     let qid_begin = peek_qid();
     let r = body();

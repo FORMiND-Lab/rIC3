@@ -1432,6 +1432,14 @@ impl IC3 {
     }
 
     pub fn block(&mut self, limit: Option<f64>) -> BlockResult {
+        // One invocation drains an obligation wave and may contain dependent
+        // MIC traversals. Scope the operation at its implementation boundary
+        // so every caller and every early return retains the same exact-replay
+        // root for a future resident BLOCK program.
+        let _op = crate::inductor::macro_scope(
+            inductor_trace::Phase::Block,
+            self.level(),
+        );
         if crate::accel::cdcl_host::block_batch_enabled() {
             crate::inductor::ThreadCpuTimer::enable();
         }
