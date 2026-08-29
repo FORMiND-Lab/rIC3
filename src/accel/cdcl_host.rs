@@ -5,19 +5,21 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockRootExecutionStatus, BlockRootResponse,
-    BlockSemanticCommand, BlockSemanticCommandResponse, MIC_BATCH_HEADER_WORDS,
-    MIC_BATCH_RESPONSE_HEADER_WORDS, MIC_MODEL_SHRINK, MIC_PROTECT_INDEX,
-    MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS, MicHeader, MicResponseHeader,
-    PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK, PROFILE_CLEANUP, PROFILE_DECIDE,
-    PROFILE_EMIT, PROFILE_EVALUATED_LITERALS, PROFILE_LEARN, PROFILE_LEARNT_LITERALS,
-    PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS, PROFILE_OCCURRENCE_UPDATES,
-    PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT, PROFILE_SETUP,
-    PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
+    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockFullRootResponse,
+    BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
+    BlockSemanticCommandResponse, MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
+    MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
+    MicHeader, MicResponseHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
+    PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS, PROFILE_LEARN,
+    PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
+    PROFILE_OCCURRENCE_UPDATES, PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
+    PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
     RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS, STAGE_PROFILE_MAGIC,
     STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
-    UnknownReason, WANT_STAGE_PROFILE, decode_block_root_response,
-    decode_block_semantic_batch_response, pack_block_root_request, pack_block_semantic_batch,
+    UnknownReason, WANT_STAGE_PROFILE, block_full_root_required_response_capacity,
+    decode_block_full_root_response, decode_block_root_response,
+    decode_block_semantic_batch_response, pack_block_full_root_request, pack_block_root_request,
+    pack_block_semantic_batch,
 };
 #[cfg(has_cdcl_accel)]
 use crate::gipsat::decode_batch_results;
@@ -97,6 +99,13 @@ unsafe extern "C" {
         out_response_words: *mut u32,
     ) -> i32;
     fn ind_cdcl_run_block_root(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
+    fn ind_cdcl_run_block_full_root(
         request: *const u32,
         request_words: u32,
         response: *mut u32,
@@ -1255,6 +1264,89 @@ impl HardwareCdcl {
                 return Err(HardwareError::InvalidResponse);
             }
             Ok(decoded)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, request_words, response_capacity_words);
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    /// Execute a bounded, complete resident BLOCK root. SAT predecessors,
+    /// UNSAT core reconstruction, MIC and lemma append remain inside one
+    /// native/RPC command; the ordered journal is the only CPU sync payload.
+    pub fn run_block_full_root(
+        &mut self,
+        max_frame: u32,
+        step_limit: usize,
+        next_var_by_current: &[u32],
+        init_value_by_current: &[u32],
+        latch_variables: &[u32],
+        input_variables: &[u32],
+        query_template: &IncrementalQuery,
+    ) -> Result<BlockFullRootResponse, HardwareError> {
+        if next_var_by_current.len() != self.n_var as usize
+            || init_value_by_current.len() != next_var_by_current.len()
+            || query_template.domain.is_empty()
+            || !query_template.constraints.is_empty()
+        {
+            return Err(HardwareError::InvalidContext);
+        }
+        let mut domain_query = query_template.clone();
+        domain_query.frame = 0;
+        domain_query.assumptions.clear();
+        domain_query.constraints.clear();
+        let (domain_header, domain_words) = domain_query.pack();
+        if domain_header.n_assumptions != 0
+            || domain_header.n_constraint_words != 0
+            || usize::try_from(domain_header.n_domain).ok() != Some(domain_words.len())
+        {
+            return Err(HardwareError::InvalidContext);
+        }
+        let request = pack_block_full_root_request(
+            max_frame,
+            step_limit,
+            next_var_by_current,
+            init_value_by_current,
+            &domain_words,
+            latch_variables,
+            input_variables,
+            domain_header.flags,
+            domain_header.decision_budget,
+            domain_header.conflict_budget,
+        )
+        .ok_or(HardwareError::InvalidContext)?;
+        let response_capacity = block_full_root_required_response_capacity(
+            step_limit,
+            latch_variables.len(),
+            input_variables.len(),
+        )
+        .ok_or(HardwareError::Capacity)?;
+        let request_words = u32::try_from(request.len()).map_err(|_| HardwareError::Capacity)?;
+        let response_capacity_words =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut response = vec![0u32; response_capacity];
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_run_block_full_root(
+                    request.as_ptr(),
+                    request_words,
+                    response.as_mut_ptr(),
+                    response_capacity_words,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() {
+                return Err(HardwareError::InvalidResponse);
+            }
+            response.truncate(out_words);
+            decode_block_full_root_response(&response).ok_or(HardwareError::InvalidResponse)
         }
         #[cfg(not(has_cdcl_accel))]
         {

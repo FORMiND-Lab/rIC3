@@ -107,6 +107,25 @@ impl TransysSolver {
         map
     }
 
+    /// Projection metadata installed by the complete resident BLOCK root.
+    /// Init uses 0/1 for constant latch values and 2 for symbolic variables;
+    /// latch/input lists define the exact packed-model witness projection.
+    pub fn resident_block_projection_metadata(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut init = vec![2u32; self.dcs.num_var()];
+        let latches = self
+            .ts
+            .latch()
+            .map(|latch| {
+                if let Some(value) = self.ts.init_map[latch].and_then(|lit| lit.try_constant()) {
+                    init[usize::from(latch)] = u32::from(value);
+                }
+                u32::from(latch)
+            })
+            .collect();
+        let inputs = self.ts.input().map(u32::from).collect();
+        (init, latches, inputs)
+    }
+
     pub fn install_incremental_sat_model(
         &mut self,
         query: &IncrementalQuery,

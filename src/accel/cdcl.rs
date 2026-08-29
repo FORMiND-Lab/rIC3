@@ -125,6 +125,17 @@ pub const BLOCK_ROOT_MAX_WORK: usize = 8;
 pub const BLOCK_ROOT_BATCH_OFFSET: usize =
     BLOCK_ROOT_RESPONSE_HEADER_WORDS + BLOCK_ROOT_MAX_WORK * BLOCK_ROOT_WORK_WORDS;
 
+pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 1;
+pub const BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS: usize = 12;
+pub const BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS: usize = 10;
+pub const BLOCK_FULL_ROOT_WORK_WORDS: usize = 7;
+pub const BLOCK_FULL_ROOT_EVENT_HEADER_WORDS: usize = 2;
+pub const BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS: usize = 6;
+pub const BLOCK_FULL_ROOT_SAT_HEADER_WORDS: usize = 10;
+pub const BLOCK_FULL_ROOT_MAX_STEPS: usize = 256;
+pub const BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR: u32 = 1;
+pub const BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA: u32 = 2;
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockRootExecutionStatus {
@@ -269,6 +280,250 @@ pub fn decode_block_root_response(words: &[u32]) -> Option<BlockRootResponse> {
         status,
         work,
         batch,
+    })
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockFullRootStatus {
+    Drained = 0,
+    CpuResult = 1,
+    CpuHandoff = 2,
+    StepBudget = 3,
+    Fallback = 4,
+    Error = 5,
+}
+
+impl BlockFullRootStatus {
+    fn from_word(word: u32) -> Option<Self> {
+        Some(match word {
+            0 => Self::Drained,
+            1 => Self::CpuResult,
+            2 => Self::CpuHandoff,
+            3 => Self::StepBudget,
+            4 => Self::Fallback,
+            5 => Self::Error,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockFullRootEvent {
+    SatPredecessor {
+        child_tag: u64,
+        parent_tag: u64,
+        parent_descriptor_handle: u32,
+        child_descriptor_handle: u32,
+        frame: u32,
+        depth: u32,
+        state: Vec<u32>,
+        input: Vec<u32>,
+    },
+    UnsatLemma {
+        frame: u32,
+        proof_tag: u64,
+        payload_handle: u32,
+        descriptor_handle: u32,
+        cube: Vec<u32>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockFullRootResponse {
+    pub status: BlockFullRootStatus,
+    pub handoff: Option<BlockRootWork>,
+    pub events: Vec<BlockFullRootEvent>,
+    pub cdcl_waves: u32,
+    pub mic_waves: u32,
+    pub sat_commits: u32,
+    pub unsat_commits: u32,
+}
+
+pub fn block_full_root_required_response_capacity(
+    step_limit: usize,
+    latch_count: usize,
+    input_count: usize,
+) -> Option<usize> {
+    let lemma = BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS.checked_add(latch_count)?;
+    let sat = BLOCK_FULL_ROOT_SAT_HEADER_WORDS
+        .checked_add(latch_count)?
+        .checked_add(input_count)?;
+    BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS
+        .checked_add(BLOCK_FULL_ROOT_WORK_WORDS)?
+        .checked_add(
+            step_limit
+                .checked_mul(BLOCK_FULL_ROOT_EVENT_HEADER_WORDS.checked_add(lemma.max(sat))?)?,
+        )
+}
+
+pub fn pack_block_full_root_request(
+    max_frame: u32,
+    step_limit: usize,
+    next_var_by_current: &[u32],
+    init_value_by_current: &[u32],
+    decision_domain: &[u32],
+    latch_variables: &[u32],
+    input_variables: &[u32],
+    query_flags: u32,
+    decision_budget: u32,
+    conflict_budget: u32,
+) -> Option<Vec<u32>> {
+    if step_limit == 0
+        || step_limit > BLOCK_FULL_ROOT_MAX_STEPS
+        || next_var_by_current.is_empty()
+        || init_value_by_current.len() != next_var_by_current.len()
+        || init_value_by_current.iter().any(|value| *value > 2)
+        || latch_variables.len() > next_var_by_current.len()
+        || input_variables.len() > next_var_by_current.len()
+        || query_flags & (BANK_ALIGNED_DOMAIN | PACKED_SAT_MODEL)
+            != (BANK_ALIGNED_DOMAIN | PACKED_SAT_MODEL)
+    {
+        return None;
+    }
+    let capacity = BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS
+        .checked_add(2usize.checked_mul(next_var_by_current.len())?)?
+        .checked_add(decision_domain.len())?
+        .checked_add(latch_variables.len())?
+        .checked_add(input_variables.len())?;
+    let mut words = Vec::with_capacity(capacity);
+    words.extend([
+        BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+        max_frame,
+        u32::try_from(step_limit).ok()?,
+        u32::try_from(next_var_by_current.len()).ok()?,
+        u32::try_from(decision_domain.len()).ok()?,
+        query_flags,
+        decision_budget,
+        conflict_budget,
+        u32::try_from(latch_variables.len()).ok()?,
+        u32::try_from(input_variables.len()).ok()?,
+        0,
+        0,
+    ]);
+    words.extend_from_slice(next_var_by_current);
+    words.extend_from_slice(init_value_by_current);
+    words.extend_from_slice(decision_domain);
+    words.extend_from_slice(latch_variables);
+    words.extend_from_slice(input_variables);
+    Some(words)
+}
+
+pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootResponse> {
+    let header = words.get(..BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS)?;
+    if header[0] != BLOCK_FULL_ROOT_PROTOCOL_VERSION || header[9] != 0 {
+        return None;
+    }
+    let status = BlockFullRootStatus::from_word(header[1])?;
+    let handoff_count = usize::try_from(header[2]).ok()?;
+    let event_count = usize::try_from(header[3]).ok()?;
+    let payload_words = usize::try_from(header[8]).ok()?;
+    if handoff_count > 1
+        || words.len() != BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS.checked_add(payload_words)?
+    {
+        return None;
+    }
+    let mut at = BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS;
+    let handoff = if handoff_count == 1 {
+        let record = words.get(at..at.checked_add(BLOCK_FULL_ROOT_WORK_WORDS)?)?;
+        at += BLOCK_FULL_ROOT_WORK_WORDS;
+        Some(BlockRootWork {
+            frame: record[0],
+            depth: record[1],
+            removed: record[2],
+            descriptor_handle: record[3],
+            user_tag_lo: record[4],
+            user_tag_hi: record[5],
+            payload_handle: record[6],
+        })
+    } else {
+        None
+    };
+    if matches!(
+        status,
+        BlockFullRootStatus::CpuResult
+            | BlockFullRootStatus::CpuHandoff
+            | BlockFullRootStatus::Fallback
+    ) != handoff.is_some()
+        || matches!(
+            status,
+            BlockFullRootStatus::Drained | BlockFullRootStatus::StepBudget
+        ) && handoff.is_some()
+    {
+        return None;
+    }
+
+    let mut events = Vec::with_capacity(event_count);
+    let mut sat_events = 0u32;
+    let mut unsat_events = 0u32;
+    for _ in 0..event_count {
+        let event_header = words.get(at..at.checked_add(BLOCK_FULL_ROOT_EVENT_HEADER_WORDS)?)?;
+        at += BLOCK_FULL_ROOT_EVENT_HEADER_WORDS;
+        let kind = event_header[0];
+        let record_words = usize::try_from(event_header[1]).ok()?;
+        let end = at.checked_add(record_words)?;
+        let record = words.get(at..end)?;
+        let event = match kind {
+            BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA => {
+                if record.len() < BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS {
+                    return None;
+                }
+                let cube_words = usize::try_from(record[5]).ok()?;
+                if record.len() != BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS.checked_add(cube_words)? {
+                    return None;
+                }
+                unsat_events = unsat_events.checked_add(1)?;
+                BlockFullRootEvent::UnsatLemma {
+                    frame: record[0],
+                    proof_tag: u64::from(record[1]) | (u64::from(record[2]) << 32),
+                    payload_handle: record[3],
+                    descriptor_handle: record[4],
+                    cube: record[BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS..].to_vec(),
+                }
+            }
+            BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR => {
+                if record.len() < BLOCK_FULL_ROOT_SAT_HEADER_WORDS {
+                    return None;
+                }
+                let state_words = usize::try_from(record[8]).ok()?;
+                let input_words = usize::try_from(record[9]).ok()?;
+                if record.len()
+                    != BLOCK_FULL_ROOT_SAT_HEADER_WORDS
+                        .checked_add(state_words)?
+                        .checked_add(input_words)?
+                {
+                    return None;
+                }
+                sat_events = sat_events.checked_add(1)?;
+                let state_begin = BLOCK_FULL_ROOT_SAT_HEADER_WORDS;
+                let input_begin = state_begin.checked_add(state_words)?;
+                BlockFullRootEvent::SatPredecessor {
+                    child_tag: u64::from(record[0]) | (u64::from(record[1]) << 32),
+                    parent_tag: u64::from(record[2]) | (u64::from(record[3]) << 32),
+                    parent_descriptor_handle: record[4],
+                    child_descriptor_handle: record[5],
+                    frame: record[6],
+                    depth: record[7],
+                    state: record[state_begin..input_begin].to_vec(),
+                    input: record[input_begin..].to_vec(),
+                }
+            }
+            _ => return None,
+        };
+        events.push(event);
+        at = end;
+    }
+    if at != words.len() || sat_events != header[6] || unsat_events != header[7] {
+        return None;
+    }
+    Some(BlockFullRootResponse {
+        status,
+        handoff,
+        events,
+        cdcl_waves: header[4],
+        mic_waves: header[5],
+        sat_commits: header[6],
+        unsat_commits: header[7],
     })
 }
 
@@ -891,5 +1146,91 @@ mod tests {
             .status,
             BlockRootExecutionStatus::Empty,
         );
+    }
+
+    #[test]
+    fn block_full_root_protocol_preserves_ordered_sat_and_unsat_journal() {
+        let flags = WANT_MODEL | WANT_CORE | BANK_ALIGNED_DOMAIN | PACKED_SAT_MODEL;
+        let request = pack_block_full_root_request(
+            3,
+            4,
+            &[2, 3, u32::MAX, u32::MAX],
+            &[1, 0, 2, 2],
+            &[0x8000_0000, 0x8001_0001, 0x8002_0002, 0x8003_0003],
+            &[0, 1],
+            &[3],
+            flags,
+            11,
+            17,
+        )
+        .unwrap();
+        assert_eq!(request.len(), 27);
+        assert_eq!(&request[..12], &[1, 3, 4, 4, 4, flags, 11, 17, 2, 1, 0, 0]);
+        assert_eq!(
+            block_full_root_required_response_capacity(4, 2, 1),
+            Some(77)
+        );
+
+        let response = [
+            BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+            BlockFullRootStatus::CpuHandoff as u32,
+            1,
+            2,
+            2,
+            1,
+            1,
+            1,
+            32,
+            0,
+            // CPU handoff work.
+            0,
+            6,
+            0,
+            9,
+            0x22,
+            0x8000_0000,
+            4,
+            // SAT event and its 11-word record.
+            BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR,
+            13,
+            0x22,
+            0x8000_0000,
+            0x11,
+            0,
+            7,
+            8,
+            0,
+            6,
+            2,
+            1,
+            0,
+            3,
+            3,
+            // UNSAT lemma event and its 6-word record.
+            BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA,
+            8,
+            2,
+            0x33,
+            0,
+            4,
+            5,
+            2,
+            0,
+            2,
+        ];
+        let decoded = decode_block_full_root_response(&response).unwrap();
+        assert_eq!(decoded.status, BlockFullRootStatus::CpuHandoff);
+        assert_eq!(decoded.handoff.unwrap().user_tag(), 0x8000_0000_0000_0022);
+        assert_eq!(decoded.events.len(), 2);
+        assert!(matches!(
+            &decoded.events[0],
+            BlockFullRootEvent::SatPredecessor { state, input, .. }
+                if state == &[0, 3] && input == &[3]
+        ));
+        assert!(matches!(
+            &decoded.events[1],
+            BlockFullRootEvent::UnsatLemma { frame: 2, cube, .. }
+                if cube == &[0, 2]
+        ));
     }
 }
