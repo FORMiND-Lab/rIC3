@@ -103,6 +103,42 @@ impl Frames {
         self.frames.len()
     }
 
+    /// Count and fingerprint the lemma image consumed by BLOCK. This is a
+    /// simulation oracle for a future FPGA-resident controller, not a proof
+    /// hash: the live CPU structures remain authoritative.
+    pub fn progress_snapshot(&self) -> (usize, u64) {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        let mut hash = OFFSET;
+        let mut count = 0usize;
+        let mut word = |value: u64| {
+            hash ^= value;
+            hash = hash.wrapping_mul(PRIME);
+        };
+        word(self.frames.len() as u64);
+        for (index, frame) in self.frames.iter().enumerate() {
+            word(index as u64);
+            word(frame.len() as u64);
+            count += frame.len();
+            for lemma in frame.iter() {
+                word(lemma.len() as u64);
+                for lit in lemma.iter() {
+                    word(u64::from(u32::from(*lit)));
+                }
+            }
+        }
+        word(u64::MAX);
+        word(self.inf.len() as u64);
+        count += self.inf.len();
+        for lemma in self.inf.iter() {
+            word(lemma.len() as u64);
+            for lit in lemma.iter() {
+                word(u64::from(u32::from(*lit)));
+            }
+        }
+        (count, hash)
+    }
+
     pub fn last(&self) -> &Frame {
         self.frames.last().unwrap()
     }

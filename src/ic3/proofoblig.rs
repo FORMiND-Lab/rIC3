@@ -159,6 +159,37 @@ impl ProofObligationQueue {
         Self::default()
     }
 
+    /// Compact deterministic oracle for a resident BLOCK-program simulation.
+    /// The fingerprint is observational only; it never participates in proof
+    /// decisions. BTreeSet order makes equal queues reproduce the same value.
+    pub fn progress_snapshot(&self) -> (usize, u64) {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        let mut hash = OFFSET;
+        let mut word = |value: u64| {
+            hash ^= value;
+            hash = hash.wrapping_mul(PRIME);
+        };
+        word(self.obligations.len() as u64);
+        for po in &self.obligations {
+            word(po.frame as u64);
+            word(po.depth as u64);
+            word(u64::from(po.removed));
+            word(po.state.len() as u64);
+            for lit in po.state.iter() {
+                word(u64::from(u32::from(*lit)));
+            }
+            word(po.input.len() as u64);
+            for inputs in &po.input {
+                word(inputs.len() as u64);
+                for lit in inputs {
+                    word(u64::from(u32::from(*lit)));
+                }
+            }
+        }
+        (self.obligations.len(), hash)
+    }
+
     pub fn add(&mut self, po: ProofObligation) {
         if self.num.len() <= po.frame {
             self.num.resize(po.frame + 1, 0);

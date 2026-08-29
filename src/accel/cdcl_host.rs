@@ -23,7 +23,7 @@ use crate::gipsat::{
     QueryBudget, encoded_domain_words, pack_batch, solve_on_cpu_after_hardware_unknown,
 };
 use logicrs::{Lit, LitVec, Var};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(has_cdcl_accel)]
 use std::ffi::CString;
 use std::io::{BufWriter, Write};
@@ -2212,6 +2212,9 @@ static EXACT_REPLAY_WRITER: std::sync::OnceLock<
 static EXACT_REPLAY_BATCHES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_MICS: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_BLOCK_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_ROOTS: std::sync::OnceLock<std::sync::Mutex<HashSet<u32>>> =
+    std::sync::OnceLock::new();
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_ZERO_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CONFLICT_0: AtomicU64 = AtomicU64::new(0);
@@ -3501,9 +3504,10 @@ fn measure_reference_cpu(
 // ring model for every query. The server remains the sole SQ producer: it
 // resolves the lease/epoch and assigns a physical lane before constructing the
 // 64-byte ABI-v2 descriptor.
-const EXACT_REPLAY_VERSION: u32 = 3;
+const EXACT_REPLAY_VERSION: u32 = 5;
 const EXACT_REPLAY_BATCH: u32 = 1;
 const EXACT_REPLAY_MIC: u32 = 2;
+const EXACT_REPLAY_BLOCK_PROGRESS_RECORD: u32 = 3;
 const RING_INDEPENDENT_SET: u32 = 1 << 3;
 const RING_END_OF_BATCH: u32 = 1 << 2;
 
@@ -3538,6 +3542,24 @@ fn persistent_ring_query_ticket(
 pub struct ExactMicReplayCapture {
     context: ShadowContext,
     request: Vec<u32>,
+}
+
+pub struct ExactBlockProgressCapture {
+    op_id: u32,
+    frame: u32,
+    obligations: (usize, u64),
+    lemmas: (usize, u64),
+    steps: Vec<ExactBlockProgressStep>,
+}
+
+struct ExactBlockProgressStep {
+    event: u32,
+    obligations: (usize, u64),
+    lemmas: (usize, u64),
+}
+
+fn exact_replay_roots() -> &'static std::sync::Mutex<HashSet<u32>> {
+    EXACT_REPLAY_ROOTS.get_or_init(Default::default)
 }
 
 fn exact_replay_limit() -> u64 {
@@ -3725,6 +3747,9 @@ fn record_exact_replay_batch(
             return;
         }
     }
+    if let Ok(mut roots) = exact_replay_roots().lock() {
+        roots.insert(op_id);
+    }
     EXACT_REPLAY_QUERIES.fetch_add(take as u64, Ordering::Relaxed);
 }
 
@@ -3821,6 +3846,103 @@ pub fn finish_exact_mic_replay(capture: Option<ExactMicReplayCapture>, output: &
             return;
         }
     }
+    if let Ok(mut roots) = exact_replay_roots().lock() {
+        roots.insert(op_id);
+    }
+}
+
+/// Capture the CPU proof-state boundary for one algorithm-owned BLOCK root.
+/// Only roots that actually emitted an exact query/MIC record are serialized,
+/// keeping the stream bounded by the existing query limits.
+pub fn begin_exact_block_progress(
+    frame: usize,
+    obligations: (usize, u64),
+    lemmas: (usize, u64),
+) -> Option<ExactBlockProgressCapture> {
+    if std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_none() {
+        return None;
+    }
+    let (phase, op_id) = crate::inductor::current_macro_context();
+    if phase != inductor_trace::Phase::Block || op_id == 0 {
+        return None;
+    }
+    Some(ExactBlockProgressCapture {
+        op_id,
+        frame: frame.min(u32::MAX as usize) as u32,
+        obligations,
+        lemmas,
+        steps: Vec::new(),
+    })
+}
+
+/// Append one algorithm-level instruction to the buffered BLOCK program. The
+/// records are emitted only if this root actually used the exact accelerator
+/// path, so cheap CPU-only roots do not inflate the replay stream.
+pub fn note_exact_block_progress_step(
+    capture: Option<&mut ExactBlockProgressCapture>,
+    event: u32,
+    obligations: (usize, u64),
+    lemmas: (usize, u64),
+) {
+    let Some(capture) = capture else { return };
+    capture.steps.push(ExactBlockProgressStep {
+        event,
+        obligations,
+        lemmas,
+    });
+}
+
+pub fn finish_exact_block_progress(
+    capture: Option<ExactBlockProgressCapture>,
+    result: u32,
+    result_aux: u32,
+    obligations: (usize, u64),
+    lemmas: (usize, u64),
+) {
+    let Some(capture) = capture else { return };
+    let captured = exact_replay_roots()
+        .lock()
+        .is_ok_and(|roots| roots.contains(&capture.op_id));
+    if !captured {
+        return;
+    }
+    let Some(writer) = exact_replay_writer() else {
+        return;
+    };
+    let mut words = vec![
+        0,
+        EXACT_REPLAY_BLOCK_PROGRESS_RECORD,
+        capture.op_id,
+        capture.frame,
+        result,
+        result_aux,
+        capture.obligations.0.min(u32::MAX as usize) as u32,
+    ];
+    exact_push_u64(&mut words, capture.obligations.1);
+    words.push(obligations.0.min(u32::MAX as usize) as u32);
+    exact_push_u64(&mut words, obligations.1);
+    words.push(capture.lemmas.0.min(u32::MAX as usize) as u32);
+    exact_push_u64(&mut words, capture.lemmas.1);
+    words.push(lemmas.0.min(u32::MAX as usize) as u32);
+    exact_push_u64(&mut words, lemmas.1);
+    words.push(capture.steps.len().min(u32::MAX as usize) as u32);
+    for step in capture.steps {
+        words.push(step.event);
+        words.push(step.obligations.0.min(u32::MAX as usize) as u32);
+        exact_push_u64(&mut words, step.obligations.1);
+        words.push(step.lemmas.0.min(u32::MAX as usize) as u32);
+        exact_push_u64(&mut words, step.lemmas.1);
+    }
+    words[0] = (words.len() - 1) as u32;
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
+    for word in words {
+        if writer.write_all(&word.to_le_bytes()).is_err() {
+            return;
+        }
+    }
+    EXACT_REPLAY_BLOCK_PROGRESS.fetch_add(1, Ordering::Relaxed);
 }
 
 fn flush_exact_replay_writer() {
@@ -5968,13 +6090,14 @@ pub fn flush_and_report() {
         flush_architecture_trace_writer();
         flush_exact_replay_writer();
         eprintln!(
-            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, file {}; ranged snapshot fallbacks {}",
+            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK progress {}, file {}; ranged snapshot fallbacks {}",
             ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
             ARCH_TRACE_QUERIES.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_TRACE_CSV").unwrap_or_else(|_| "disabled".to_string()),
             EXACT_REPLAY_BATCHES.load(Ordering::Relaxed),
             EXACT_REPLAY_QUERIES.load(Ordering::Relaxed),
             EXACT_REPLAY_MICS.load(Ordering::Relaxed),
+            EXACT_REPLAY_BLOCK_PROGRESS.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_EXACT_REPLAY").unwrap_or_else(|_| "disabled".to_string()),
             FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
         );

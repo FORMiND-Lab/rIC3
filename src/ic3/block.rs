@@ -89,6 +89,20 @@ struct BlockBatchCache {
 const DEFAULT_BLOCK_ASYNC: bool = false;
 const DEFAULT_BLOCK_WAVEFRONT: bool = true;
 
+// Version-5 exact replay instruction codes for the software resident BLOCK
+// controller. Keep these values in sync with cdcl_exact_replay_tb.cpp.
+const BLOCK_STEP_DISCARD_REMOVED: u32 = 0;
+const BLOCK_STEP_LIMIT: u32 = 1;
+const BLOCK_STEP_SUBSUME_CLEAR: u32 = 2;
+const BLOCK_STEP_TRIVIAL_REQUEUE: u32 = 3;
+const BLOCK_STEP_DROP_ACTIVITY: u32 = 4;
+const BLOCK_STEP_GENERALIZED: u32 = 5;
+const BLOCK_STEP_PROVED: u32 = 6;
+const BLOCK_STEP_PREDECESSOR: u32 = 7;
+const BLOCK_STEP_SUCCESS: u32 = 8;
+const BLOCK_STEP_FAILURE: u32 = 9;
+const BLOCK_STEP_TIMEOUT: u32 = 10;
+
 pub(super) struct BlockAccelPolicy {
     cpu_samples_ns: VecDeque<u64>,
     cpu_samples_scratch_ns: Vec<u64>,
@@ -1431,6 +1445,22 @@ impl IC3 {
         }
     }
 
+    fn note_exact_block_step(
+        &self,
+        progress: &mut Option<crate::accel::cdcl_host::ExactBlockProgressCapture>,
+        event: u32,
+    ) {
+        let Some(progress) = progress.as_mut() else {
+            return;
+        };
+        crate::accel::cdcl_host::note_exact_block_progress_step(
+            Some(progress),
+            event,
+            self.obligations.progress_snapshot(),
+            self.frame.progress_snapshot(),
+        );
+    }
+
     pub fn block(&mut self, limit: Option<f64>) -> BlockResult {
         // One invocation drains an obligation wave and may contain dependent
         // MIC traversals. Scope the operation at its implementation boundary
@@ -1440,6 +1470,34 @@ impl IC3 {
             inductor_trace::Phase::Block,
             self.level(),
         );
+        let mut progress = crate::accel::cdcl_host::begin_exact_block_progress(
+            self.level(),
+            self.obligations.progress_snapshot(),
+            self.frame.progress_snapshot(),
+        );
+        let result = self.block_inner(limit, &mut progress);
+        let (result_code, result_aux) = match &result {
+            BlockResult::Success => (0, 0),
+            BlockResult::Failure(depth) => (1, (*depth).min(u32::MAX as usize) as u32),
+            BlockResult::Proved => (2, 0),
+            BlockResult::BlockLimitExceeded => (3, 0),
+            BlockResult::OverallTimeLimitExceeded => (4, 0),
+        };
+        crate::accel::cdcl_host::finish_exact_block_progress(
+            progress,
+            result_code,
+            result_aux,
+            self.obligations.progress_snapshot(),
+            self.frame.progress_snapshot(),
+        );
+        result
+    }
+
+    fn block_inner(
+        &mut self,
+        limit: Option<f64>,
+        progress: &mut Option<crate::accel::cdcl_host::ExactBlockProgressCapture>,
+    ) -> BlockResult {
         if crate::accel::cdcl_host::block_batch_enabled() {
             crate::inductor::ThreadCpuTimer::enable();
         }
@@ -1461,6 +1519,7 @@ impl IC3 {
                 break;
             }
             let Some(mut po) = next.or_else(|| self.obligations.pop(self.level())) else {
+                self.note_exact_block_step(progress, BLOCK_STEP_SUCCESS);
                 break;
             };
             if from_wave {
@@ -1474,38 +1533,45 @@ impl IC3 {
             let mut cached_block = block_batch.take(&po, true);
             self.render_progress();
             if po.removed {
+                self.note_exact_block_step(progress, BLOCK_STEP_DISCARD_REMOVED);
                 continue;
             }
             if let Some(limit) = limit
                 && noc as f64 > limit
             {
                 self.restore_block_wave(&mut block_wave);
+                self.note_exact_block_step(progress, BLOCK_STEP_LIMIT);
                 return BlockResult::BlockLimitExceeded;
             }
             if self.ctrl.is_terminated() {
                 self.restore_block_wave(&mut block_wave);
+                self.note_exact_block_step(progress, BLOCK_STEP_TIMEOUT);
                 return BlockResult::OverallTimeLimitExceeded;
             }
             if let Some(limit) = self.cfg.time_limit
                 && self.statistic.time.time().as_secs() > limit
             {
                 self.restore_block_wave(&mut block_wave);
+                self.note_exact_block_step(progress, BLOCK_STEP_TIMEOUT);
                 return BlockResult::OverallTimeLimitExceeded;
             }
             if self.tsctx.cube_subsume_init(&po.state) {
                 if self.cfg.abs_cst || self.cfg.abs_trans {
                     self.add_obligation(po.clone());
                     if self.check_cex_by_bmc(po.depth) {
+                        self.note_exact_block_step(progress, BLOCK_STEP_FAILURE);
                         return BlockResult::Failure(po.depth);
                     }
                     self.obligations.clear();
                     self.frame.clear_po();
+                    self.note_exact_block_step(progress, BLOCK_STEP_SUBSUME_CLEAR);
                     continue;
                 } else if po.frame > 0 {
                     let lemma = po.state.as_litvec();
                     debug_assert!(!self.solvers[0].solve(lemma));
                 } else {
                     self.add_obligation(po.clone());
+                    self.note_exact_block_step(progress, BLOCK_STEP_FAILURE);
                     return BlockResult::Failure(po.depth);
                 }
             }
@@ -1514,10 +1580,12 @@ impl IC3 {
                     po.push_to(bf + 1);
                     self.add_obligation(po);
                 }
+                self.note_exact_block_step(progress, BLOCK_STEP_TRIVIAL_REQUEUE);
                 continue;
             }
             po.bump_act();
             if self.cfg.drop_po && po.act > 20.0 {
+                self.note_exact_block_step(progress, BLOCK_STEP_DROP_ACTIVITY);
                 continue;
             }
             let blocked_start = Instant::now();
@@ -2085,8 +2153,10 @@ impl IC3 {
                     MicType::from_config(&self.cfg)
                 };
                 if self.generalize(po, mic_type) {
+                    self.note_exact_block_step(progress, BLOCK_STEP_PROVED);
                     return BlockResult::Proved;
                 }
+                self.note_exact_block_step(progress, BLOCK_STEP_GENERALIZED);
                 debug!("{}", self.frame.statistic(false));
             } else {
                 let (model, inputs) = speculative_pred
@@ -2110,6 +2180,7 @@ impl IC3 {
                     self.add_obligation(pred);
                     self.add_obligation(po);
                 }
+                self.note_exact_block_step(progress, BLOCK_STEP_PREDECESSOR);
             }
         }
         BlockResult::Success
