@@ -78,6 +78,167 @@ pub const MIC_BATCH_RESPONSE_HEADER_WORDS: usize = 4;
 /// optional append extent, followed by the append and one complete MIC record.
 pub const PORTFOLIO_MIC_RECORD_PREFIX_WORDS: usize = 2;
 
+// Resident BLOCK-program ABI. This is intentionally separate from ABI-v2 SAT
+// inquiries: one packet carries a bounded sequence of proof-state mutations,
+// and every command receives the exact 14-word response emitted by the shared
+// C++/HLS command interpreter.
+pub const BLOCK_SEMANTIC_BATCH_VERSION: u32 = 1;
+pub const BLOCK_SEMANTIC_BATCH_HEADER_WORDS: usize = 4;
+pub const BLOCK_SEMANTIC_COMMAND_HEADER_WORDS: usize = 6;
+pub const BLOCK_SEMANTIC_RESPONSE_HEADER_WORDS: usize = 4;
+pub const BLOCK_SEMANTIC_COMMAND_RESPONSE_WORDS: usize = 14;
+
+pub const BLOCK_SEMANTIC_RESET: u32 = 0;
+pub const BLOCK_SEMANTIC_REGISTER_OBLIGATION: u32 = 1;
+pub const BLOCK_SEMANTIC_INSERT_OBLIGATION: u32 = 2;
+pub const BLOCK_SEMANTIC_REMOVE_OBLIGATION: u32 = 3;
+pub const BLOCK_SEMANTIC_POP_OBLIGATION: u32 = 4;
+pub const BLOCK_SEMANTIC_SET_LEMMA_FRAMES: u32 = 5;
+pub const BLOCK_SEMANTIC_REGISTER_LEMMA: u32 = 6;
+pub const BLOCK_SEMANTIC_INSERT_LEMMA: u32 = 7;
+pub const BLOCK_SEMANTIC_REMOVE_LEMMA: u32 = 8;
+pub const BLOCK_SEMANTIC_STATS: u32 = 9;
+pub const BLOCK_SEMANTIC_EVENT_REMOVE_OBLIGATION: u32 = 10;
+pub const BLOCK_SEMANTIC_EVENT_INSERT_OBLIGATION: u32 = 11;
+pub const BLOCK_SEMANTIC_EVENT_CLEAR_OBLIGATIONS: u32 = 12;
+pub const BLOCK_SEMANTIC_EVENT_REMOVE_LEMMA: u32 = 13;
+pub const BLOCK_SEMANTIC_EVENT_INSERT_LEMMA: u32 = 14;
+pub const BLOCK_SEMANTIC_EVENT_SET_LEMMA_FRAMES: u32 = 15;
+pub const BLOCK_SEMANTIC_EVENT_RESET_EPOCH: u32 = 16;
+pub const BLOCK_SEMANTIC_EVENT_PROMOTE_LEMMA_FRAME_TO_INF: u32 = 17;
+pub const BLOCK_SEMANTIC_EVENT_SHIFT_FRAME_SUFFIX_UP: u32 = 18;
+pub const BLOCK_SEMANTIC_EVENT_MOVE_LEMMA: u32 = 19;
+pub const BLOCK_SEMANTIC_REGISTER_STATE_FULL: u32 = 20;
+pub const BLOCK_SEMANTIC_REGISTER_STATE_DELTA: u32 = 21;
+pub const BLOCK_SEMANTIC_REGISTER_INPUT_FULL: u32 = 22;
+pub const BLOCK_SEMANTIC_REGISTER_INPUT_DELTA: u32 = 23;
+pub const BLOCK_SEMANTIC_COMPOSE_OBLIGATION: u32 = 24;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlockSemanticCommand {
+    pub command: u32,
+    pub frame: u32,
+    pub depth: u32,
+    pub removed: u32,
+    pub handle: u32,
+    pub payload: Vec<u32>,
+}
+
+impl BlockSemanticCommand {
+    pub fn new(command: u32) -> Self {
+        Self {
+            command,
+            ..Self::default()
+        }
+    }
+
+    pub fn packed_words(&self) -> Option<usize> {
+        BLOCK_SEMANTIC_COMMAND_HEADER_WORDS.checked_add(self.payload.len())
+    }
+
+    fn append_words(&self, words: &mut Vec<u32>) -> Option<()> {
+        words.extend([
+            self.command,
+            self.frame,
+            self.depth,
+            self.removed,
+            self.handle,
+            u32::try_from(self.payload.len()).ok()?,
+        ]);
+        words.extend_from_slice(&self.payload);
+        Some(())
+    }
+}
+
+/// Pack a complete resident proof-state transaction. The declared response
+/// capacity is part of the request so RPC, native simulation and a future ring
+/// transport reject truncation identically.
+pub fn pack_block_semantic_batch(commands: &[BlockSemanticCommand]) -> Option<Vec<u32>> {
+    let command_words = commands.iter().try_fold(0usize, |total, command| {
+        total.checked_add(command.packed_words()?)
+    })?;
+    let response_words = BLOCK_SEMANTIC_RESPONSE_HEADER_WORDS.checked_add(
+        commands
+            .len()
+            .checked_mul(BLOCK_SEMANTIC_COMMAND_RESPONSE_WORDS)?,
+    )?;
+    let mut words =
+        Vec::with_capacity(BLOCK_SEMANTIC_BATCH_HEADER_WORDS.checked_add(command_words)?);
+    words.extend([
+        BLOCK_SEMANTIC_BATCH_VERSION,
+        u32::try_from(commands.len()).ok()?,
+        u32::try_from(command_words).ok()?,
+        u32::try_from(response_words).ok()?,
+    ]);
+    for command in commands {
+        command.append_words(&mut words)?;
+    }
+    Some(words)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockSemanticCommandResponse {
+    pub status: u32,
+    pub found: u32,
+    pub obligation_count: u32,
+    pub lemma_count: u32,
+    pub obligation_arena_words: u32,
+    pub lemma_arena_words: u32,
+    pub output_handle: u32,
+    pub popped_frame: u32,
+    pub popped_depth: u32,
+    pub popped_removed: u32,
+    pub popped_sample: u32,
+    pub lemma_frame_count: u32,
+    pub state_arena_words: u32,
+    pub input_arena_words: u32,
+}
+
+impl BlockSemanticCommandResponse {
+    pub fn from_words(words: &[u32]) -> Option<Self> {
+        let words: &[u32; BLOCK_SEMANTIC_COMMAND_RESPONSE_WORDS] = words.try_into().ok()?;
+        Some(Self {
+            status: words[0],
+            found: words[1],
+            obligation_count: words[2],
+            lemma_count: words[3],
+            obligation_arena_words: words[4],
+            lemma_arena_words: words[5],
+            output_handle: words[6],
+            popped_frame: words[7],
+            popped_depth: words[8],
+            popped_removed: words[9],
+            popped_sample: words[10],
+            lemma_frame_count: words[11],
+            state_arena_words: words[12],
+            input_arena_words: words[13],
+        })
+    }
+}
+
+pub fn decode_block_semantic_batch_response(
+    words: &[u32],
+) -> Option<(u32, Vec<BlockSemanticCommandResponse>)> {
+    let header = words.get(..BLOCK_SEMANTIC_RESPONSE_HEADER_WORDS)?;
+    if header[0] != BLOCK_SEMANTIC_BATCH_VERSION {
+        return None;
+    }
+    let completed = usize::try_from(header[1]).ok()?;
+    let result_words = usize::try_from(header[2]).ok()?;
+    if result_words != completed.checked_mul(BLOCK_SEMANTIC_COMMAND_RESPONSE_WORDS)?
+        || words.len() != BLOCK_SEMANTIC_RESPONSE_HEADER_WORDS.checked_add(result_words)?
+    {
+        return None;
+    }
+    let mut responses = Vec::with_capacity(completed);
+    for record in words[BLOCK_SEMANTIC_RESPONSE_HEADER_WORDS..]
+        .chunks_exact(BLOCK_SEMANTIC_COMMAND_RESPONSE_WORDS)
+    {
+        responses.push(BlockSemanticCommandResponse::from_words(record)?);
+    }
+    Some((header[3], responses))
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
@@ -464,5 +625,51 @@ mod tests {
         let mut malformed_mic = mic_payload;
         malformed_mic[0] = 3;
         assert!(!mic.valid_for(&malformed_mic));
+    }
+
+    #[test]
+    fn block_semantic_batch_matches_cpp_word_abi() {
+        let mut state_full = BlockSemanticCommand::new(BLOCK_SEMANTIC_REGISTER_STATE_FULL);
+        state_full.payload = vec![2, 4];
+        let mut input_full = BlockSemanticCommand::new(BLOCK_SEMANTIC_REGISTER_INPUT_FULL);
+        input_full.payload = vec![3, 7];
+        let mut compose = BlockSemanticCommand::new(BLOCK_SEMANTIC_COMPOSE_OBLIGATION);
+        compose.payload = vec![0];
+        let mut frames = BlockSemanticCommand::new(BLOCK_SEMANTIC_SET_LEMMA_FRAMES);
+        frames.frame = 2;
+        let mut insert = BlockSemanticCommand::new(BLOCK_SEMANTIC_INSERT_OBLIGATION);
+        insert.frame = 1;
+        insert.depth = 3;
+        let commands = [
+            BlockSemanticCommand::new(BLOCK_SEMANTIC_RESET),
+            state_full,
+            input_full,
+            compose,
+            frames,
+            insert,
+            BlockSemanticCommand::new(BLOCK_SEMANTIC_STATS),
+        ];
+        let words = pack_block_semantic_batch(&commands).unwrap();
+        assert_eq!(words[..4], [1, 7, 47, 102]);
+        assert_eq!(words.len(), 51);
+        assert_eq!(&words[4..10], &[BLOCK_SEMANTIC_RESET, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &words[10..18],
+            &[BLOCK_SEMANTIC_REGISTER_STATE_FULL, 0, 0, 0, 0, 2, 2, 4],
+        );
+        assert_eq!(
+            &words[18..26],
+            &[BLOCK_SEMANTIC_REGISTER_INPUT_FULL, 0, 0, 0, 0, 2, 3, 7],
+        );
+
+        let mut response = vec![BLOCK_SEMANTIC_BATCH_VERSION, 1, 14, 0];
+        response.extend([0, 1, 2, 3, 10, 11, 7, 4, 5, 0, 9, 6, 2, 8]);
+        let (error, decoded) = decode_block_semantic_batch_response(&response).unwrap();
+        assert_eq!(error, 0);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].output_handle, 7);
+        assert_eq!(decoded[0].state_arena_words, 2);
+        response[2] = 13;
+        assert!(decode_block_semantic_batch_response(&response).is_none());
     }
 }
