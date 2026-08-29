@@ -3,7 +3,7 @@ use giputils::ptr::Grc;
 use log::trace;
 use logicrs::{LitOrdVec, LitVec};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, btree_set};
+use std::collections::{BTreeSet, HashMap, btree_set};
 use std::fmt::{self, Debug};
 use std::ops::{Deref, DerefMut};
 
@@ -167,6 +167,7 @@ impl Debug for ProofObligation {
 #[derive(Default, Debug)]
 pub struct ProofObligationQueue {
     obligations: BTreeSet<ProofObligation>,
+    resident_index: HashMap<Vec<u32>, ProofObligation>,
     num: Vec<usize>,
 }
 
@@ -234,20 +235,21 @@ impl ProofObligationQueue {
         self.num[po.frame] += 1;
         trace!("add obligation: {}", po.state);
         super::frame::note_frame_obligation_mutation(true, &po);
-        assert!(self.obligations.insert(po));
+        let key = po.resident_key();
+        assert!(self.obligations.insert(po.clone()));
+        assert!(self.resident_index.insert(key, po).is_none());
     }
 
     pub fn add_if_new(&mut self, po: ProofObligation) -> bool {
         let frame = po.frame;
         trace!("add obligation if new: {}", po.state);
-        if super::frame::frame_maintenance_journal_enabled() {
-            if !self.obligations.insert(po.clone()) {
-                return false;
-            }
-            super::frame::note_frame_obligation_mutation(true, &po);
-        } else if !self.obligations.insert(po) {
+        if !self.obligations.insert(po.clone()) {
             return false;
         }
+        if super::frame::frame_maintenance_journal_enabled() {
+            super::frame::note_frame_obligation_mutation(true, &po);
+        }
+        assert!(self.resident_index.insert(po.resident_key(), po).is_none());
         if self.num.len() <= frame {
             self.num.resize(frame + 1, 0);
         }
@@ -260,6 +262,7 @@ impl ProofObligationQueue {
             self.num[po.frame] -= 1;
             let popped = self.obligations.pop_last();
             if let Some(po) = &popped {
+                assert!(self.resident_index.remove(&po.resident_key()).is_some());
                 super::frame::note_frame_obligation_mutation(false, po);
             }
             popped
@@ -271,22 +274,35 @@ impl ProofObligationQueue {
     /// Simulation bridge for FPGA-owned work scheduling. The controller has
     /// already removed this descriptor; find the matching CPU proof-chain
     /// object without imposing the CPU BTreeSet's choice on the device.
-    pub fn take_resident_key(
+    fn take_resident_key(
         &mut self,
         key: &[u32],
         max_frame: usize,
     ) -> Option<ProofObligation> {
         let selected = self
-            .obligations
-            .iter()
-            .find(|po| po.frame <= max_frame && po.resident_key() == key)
-            .cloned()?;
+            .resident_index
+            .get(key)
+            .filter(|po| po.frame <= max_frame)?
+            .clone();
         let ret = self.obligations.take(&selected);
         if let Some(taken) = &ret {
+            assert!(self.resident_index.remove(key).is_some());
             self.num[taken.frame] -= 1;
             super::frame::note_frame_obligation_mutation(false, taken);
         }
         ret
+    }
+
+    /// Consume a controller-selected proof chain through its opaque tag. The
+    /// simulation adapter resolves the tag; the queue lookup itself is indexed
+    /// and does not scan or serialize every resident obligation.
+    pub fn take_resident_tag(
+        &mut self,
+        user_tag: u64,
+        max_frame: usize,
+    ) -> Option<ProofObligation> {
+        let key = crate::accel::cdcl_host::take_resident_block_selection(user_tag)?;
+        self.take_resident_key(&key, max_frame)
     }
 
     pub fn peak(&mut self) -> Option<ProofObligation> {
@@ -294,17 +310,19 @@ impl ProofObligationQueue {
     }
 
     pub fn remove(&mut self, po: &ProofObligation) -> bool {
-        let ret = self.obligations.remove(po);
-        if ret {
-            self.num[po.frame] -= 1;
-            super::frame::note_frame_obligation_mutation(false, po);
+        let ret = self.obligations.take(po);
+        if let Some(taken) = &ret {
+            assert!(self.resident_index.remove(&taken.resident_key()).is_some());
+            self.num[taken.frame] -= 1;
+            super::frame::note_frame_obligation_mutation(false, taken);
         }
-        ret
+        ret.is_some()
     }
 
     pub fn take(&mut self, po: &ProofObligation) -> Option<ProofObligation> {
         let ret = self.obligations.take(po);
         if let Some(taken) = &ret {
+            assert!(self.resident_index.remove(&taken.resident_key()).is_some());
             self.num[taken.frame] -= 1;
             super::frame::note_frame_obligation_mutation(false, taken);
         }
@@ -320,6 +338,7 @@ impl ProofObligationQueue {
             super::frame::note_frame_clear_obligations();
         }
         self.obligations.clear();
+        self.resident_index.clear();
         for n in self.num.iter_mut() {
             *n = 0;
         }

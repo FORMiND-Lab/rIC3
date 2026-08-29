@@ -132,6 +132,7 @@ struct ResidentBlockMirror {
     lemma_descriptors: HashMap<Vec<u32>, Vec<u32>>,
     next_user_tag: u64,
     pending_owned_pop: Option<PendingOwnedPop>,
+    owned_selection_keys: HashMap<u64, Vec<u32>>,
 }
 
 fn take(words: &[u32], at: &mut usize) -> Result<u32, String> {
@@ -377,7 +378,7 @@ impl ResidentBlockMirror {
         &mut self,
         hardware: &mut HardwareCdcl,
         max_frame: u32,
-    ) -> Result<Option<(u64, Vec<u32>)>, String> {
+    ) -> Result<Option<u64>, String> {
         if !self.initialized {
             return Err("resident BLOCK mirror was not rebased".to_string());
         }
@@ -426,9 +427,18 @@ impl ResidentBlockMirror {
             key: key.clone(),
             response,
         });
+        if self.owned_selection_keys.insert(user_tag, key).is_some() {
+            return Err(format!("duplicate resident queue selection tag {user_tag}"));
+        }
         QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
         OWNED_QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
-        Ok(Some((user_tag, key)))
+        Ok(Some(user_tag))
+    }
+
+    fn take_owned_key(&mut self, user_tag: u64) -> Result<Vec<u32>, String> {
+        self.owned_selection_keys
+            .remove(&user_tag)
+            .ok_or_else(|| format!("unknown resident queue selection tag {user_tag}"))
     }
 
     fn register_obligation_payloads(
@@ -546,6 +556,7 @@ impl ResidentBlockMirror {
         self.obligation_descriptors.clear();
         self.lemma_descriptors.clear();
         self.pending_owned_pop = None;
+        self.owned_selection_keys.clear();
 
         let mut registration = vec![command(BLOCK_SEMANTIC_RESET)];
         let mut set_frames = command(BLOCK_SEMANTIC_SET_LEMMA_FRAMES);
@@ -1072,12 +1083,20 @@ pub(super) fn apply(
 pub(super) fn pop_owned(
     hardware: &mut HardwareCdcl,
     max_frame: u32,
-) -> Result<Option<(u64, Vec<u32>)>, String> {
+) -> Result<Option<u64>, String> {
     MIRROR
         .get_or_init(Default::default)
         .lock()
         .map_err(|_| "resident BLOCK mirror lock poisoned".to_string())?
         .pop_owned(hardware, max_frame)
+}
+
+pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
+    MIRROR
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "resident BLOCK mirror lock poisoned".to_string())?
+        .take_owned_key(user_tag)
 }
 
 pub(super) fn report() {

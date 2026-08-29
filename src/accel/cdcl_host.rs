@@ -3684,13 +3684,12 @@ fn block_controller_owns_queue() -> bool {
 pub enum ResidentBlockPop {
     Disabled,
     Empty,
-    Selected { user_tag: u64, key: Vec<u32> },
+    Selected { user_tag: u64 },
 }
 
 /// Let the resident controller select and remove the next BLOCK obligation.
-/// The returned tag is the eventual proof-chain registry key; `key` is retained
-/// only by this simulation bridge so the current CPU BTreeSet can hand the same
-/// object to IC3 while the opaque-tag registry is being migrated.
+/// Only the opaque tag crosses this scheduling boundary; proof payloads remain
+/// resident on each side.
 pub fn pop_resident_block_obligation(max_frame: usize) -> ResidentBlockPop {
     if !block_controller_owns_queue() || !block_controller_sim_enabled() {
         return ResidentBlockPop::Disabled;
@@ -3709,11 +3708,23 @@ pub fn pop_resident_block_obligation(max_frame: usize) -> ResidentBlockPop {
             )
         });
     match result {
-        Ok(Some((user_tag, key))) => ResidentBlockPop::Selected { user_tag, key },
+        Ok(Some(user_tag)) => ResidentBlockPop::Selected { user_tag },
         Ok(None) => ResidentBlockPop::Empty,
         Err(error) => {
             finish_block_controller_sim(Err(error));
             ResidentBlockPop::Disabled
+        }
+    }
+}
+
+/// Resolve one controller-selected tag inside the simulation adapter. The
+/// production host will own this registry when it assigns tags to insertions.
+pub fn take_resident_block_selection(user_tag: u64) -> Option<Vec<u32>> {
+    match super::block_controller_sim::take_owned_key(user_tag) {
+        Ok(key) => Some(key),
+        Err(error) => {
+            finish_block_controller_sim(Err(error));
+            None
         }
     }
 }

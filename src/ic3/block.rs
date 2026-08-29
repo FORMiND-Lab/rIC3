@@ -1687,14 +1687,12 @@ impl IC3 {
             };
             let mut po = if let Some(po) = next {
                 po
-            } else if let crate::accel::cdcl_host::ResidentBlockPop::Selected {
-                user_tag,
-                key,
-            } = &resident_pop
+            } else if let crate::accel::cdcl_host::ResidentBlockPop::Selected { user_tag } =
+                &resident_pop
             {
                 let po = self
                     .obligations
-                    .take_resident_key(&key, self.level())
+                    .take_resident_tag(*user_tag, self.level())
                     .unwrap_or_else(|| {
                         panic!("resident queue selected unknown proof-chain tag {user_tag}")
                     });
