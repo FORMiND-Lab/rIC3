@@ -117,6 +117,161 @@ pub const BLOCK_SEMANTIC_COMPOSE_OBLIGATION: u32 = 24;
 pub const BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED: u32 = 25;
 pub const BLOCK_SEMANTIC_PEEK_OBLIGATION: u32 = 26;
 
+pub const BLOCK_ROOT_PROTOCOL_VERSION: u32 = 1;
+pub const BLOCK_ROOT_REQUEST_HEADER_WORDS: usize = 9;
+pub const BLOCK_ROOT_RESPONSE_HEADER_WORDS: usize = 6;
+pub const BLOCK_ROOT_WORK_WORDS: usize = 7;
+pub const BLOCK_ROOT_MAX_WORK: usize = 8;
+pub const BLOCK_ROOT_BATCH_OFFSET: usize =
+    BLOCK_ROOT_RESPONSE_HEADER_WORDS + BLOCK_ROOT_MAX_WORK * BLOCK_ROOT_WORK_WORDS;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockRootExecutionStatus {
+    Ok = 0,
+    Empty = 1,
+    CpuHandoff = 2,
+    BadArgument = 3,
+    QueryBuild = 4,
+    SolverError = 5,
+    BadResponse = 6,
+    QueueChanged = 7,
+}
+
+impl BlockRootExecutionStatus {
+    fn from_word(word: u32) -> Option<Self> {
+        Some(match word {
+            0 => Self::Ok,
+            1 => Self::Empty,
+            2 => Self::CpuHandoff,
+            3 => Self::BadArgument,
+            4 => Self::QueryBuild,
+            5 => Self::SolverError,
+            6 => Self::BadResponse,
+            7 => Self::QueueChanged,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRootWork {
+    pub frame: u32,
+    pub depth: u32,
+    pub removed: u32,
+    pub descriptor_handle: u32,
+    pub user_tag_lo: u32,
+    pub user_tag_hi: u32,
+    pub payload_handle: u32,
+}
+
+impl BlockRootWork {
+    pub fn user_tag(self) -> u64 {
+        u64::from(self.user_tag_lo) | (u64::from(self.user_tag_hi) << 32)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockRootResponse {
+    pub status: BlockRootExecutionStatus,
+    pub work: Vec<BlockRootWork>,
+    pub batch: Vec<u32>,
+}
+
+pub fn pack_block_root_request(
+    max_frame: u32,
+    requested_queries: usize,
+    next_var_by_current: &[u32],
+    decision_domain: &[u32],
+    query_flags: u32,
+    decision_budget: u32,
+    conflict_budget: u32,
+) -> Option<Vec<u32>> {
+    if requested_queries == 0
+        || requested_queries > BLOCK_ROOT_MAX_WORK
+        || next_var_by_current.is_empty()
+    {
+        return None;
+    }
+    let mut words = Vec::with_capacity(
+        BLOCK_ROOT_REQUEST_HEADER_WORDS
+            .checked_add(next_var_by_current.len())?
+            .checked_add(decision_domain.len())?,
+    );
+    words.extend([
+        BLOCK_ROOT_PROTOCOL_VERSION,
+        max_frame,
+        u32::try_from(requested_queries).ok()?,
+        u32::try_from(next_var_by_current.len()).ok()?,
+        u32::try_from(decision_domain.len()).ok()?,
+        query_flags,
+        decision_budget,
+        conflict_budget,
+        0,
+    ]);
+    words.extend_from_slice(next_var_by_current);
+    words.extend_from_slice(decision_domain);
+    Some(words)
+}
+
+pub fn decode_block_root_response(words: &[u32]) -> Option<BlockRootResponse> {
+    let header = words.get(..BLOCK_ROOT_RESPONSE_HEADER_WORDS)?;
+    if header[0] != BLOCK_ROOT_PROTOCOL_VERSION {
+        return None;
+    }
+    let status = BlockRootExecutionStatus::from_word(header[1])?;
+    let work_count = usize::try_from(header[2]).ok()?;
+    let metadata_words = usize::try_from(header[3]).ok()?;
+    let batch_offset = usize::try_from(header[4]).ok()?;
+    let batch_words = usize::try_from(header[5]).ok()?;
+    if work_count > BLOCK_ROOT_MAX_WORK
+        || metadata_words != work_count.checked_mul(BLOCK_ROOT_WORK_WORDS)?
+        || words.len() < BLOCK_ROOT_RESPONSE_HEADER_WORDS.checked_add(metadata_words)?
+    {
+        return None;
+    }
+    let mut work = Vec::with_capacity(work_count);
+    for record in words
+        [BLOCK_ROOT_RESPONSE_HEADER_WORDS..BLOCK_ROOT_RESPONSE_HEADER_WORDS + metadata_words]
+        .chunks_exact(BLOCK_ROOT_WORK_WORDS)
+    {
+        work.push(BlockRootWork {
+            frame: record[0],
+            depth: record[1],
+            removed: record[2],
+            descriptor_handle: record[3],
+            user_tag_lo: record[4],
+            user_tag_hi: record[5],
+            payload_handle: record[6],
+        });
+    }
+    let batch = if status == BlockRootExecutionStatus::Ok {
+        if work.is_empty()
+            || batch_offset != BLOCK_ROOT_BATCH_OFFSET
+            || batch_words < 4
+            || words.len() != batch_offset.checked_add(batch_words)?
+        {
+            return None;
+        }
+        words.get(batch_offset..)?.to_vec()
+    } else {
+        if batch_offset != 0
+            || batch_words != 0
+            || words.len() != BLOCK_ROOT_RESPONSE_HEADER_WORDS + metadata_words
+            || status == BlockRootExecutionStatus::CpuHandoff && work_count != 1
+            || status != BlockRootExecutionStatus::CpuHandoff && work_count != 0
+        {
+            return None;
+        }
+        Vec::new()
+    };
+    Some(BlockRootResponse {
+        status,
+        work,
+        batch,
+    })
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockSemanticCommand {
     pub command: u32,
@@ -685,5 +840,56 @@ mod tests {
         assert_eq!(decoded[0].popped_user_tag(), 0x0123456789abcdef);
         response[2] = 15;
         assert!(decode_block_semantic_batch_response(&response).is_none());
+    }
+
+    #[test]
+    fn block_root_protocol_matches_cpp_word_abi() {
+        let request = pack_block_root_request(
+            3,
+            2,
+            &[2, 3, u32::MAX, u32::MAX],
+            &[0, 1, 2, 3],
+            WANT_MODEL | WANT_CORE,
+            11,
+            17,
+        )
+        .unwrap();
+        assert_eq!(request.len(), 17);
+        assert_eq!(&request[..9], &[1, 3, 2, 4, 4, 3, 11, 17, 0]);
+
+        let mut response = vec![0u32; BLOCK_ROOT_BATCH_OFFSET];
+        response[..6].copy_from_slice(&[
+            BLOCK_ROOT_PROTOCOL_VERSION,
+            BlockRootExecutionStatus::Ok as u32,
+            2,
+            14,
+            BLOCK_ROOT_BATCH_OFFSET as u32,
+            4,
+        ]);
+        response[6..20].copy_from_slice(&[
+            1, 10, 0, 7, 0x89abcdef, 0x01234567, 3, 2, 5, 0, 8, 0x76543210, 0xfedcba98, 4,
+        ]);
+        response.extend([ABI_VERSION, 2, 0, 0]);
+        let decoded = decode_block_root_response(&response).unwrap();
+        assert_eq!(decoded.status, BlockRootExecutionStatus::Ok);
+        assert_eq!(decoded.work.len(), 2);
+        assert_eq!(decoded.work[0].user_tag(), 0x0123456789abcdef);
+        assert_eq!(decoded.batch, [ABI_VERSION, 2, 0, 0]);
+
+        response[4] = 0;
+        assert!(decode_block_root_response(&response).is_none());
+        assert_eq!(
+            decode_block_root_response(&[
+                BLOCK_ROOT_PROTOCOL_VERSION,
+                BlockRootExecutionStatus::Empty as u32,
+                0,
+                0,
+                0,
+                0,
+            ])
+            .unwrap()
+            .status,
+            BlockRootExecutionStatus::Empty,
+        );
     }
 }

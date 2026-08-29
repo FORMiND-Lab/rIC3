@@ -336,7 +336,10 @@ impl ClauseDB {
     }
 
     pub fn lemma_lits(&self) -> u64 {
-        self.lemmas.iter().map(|c| self.allocator.get(*c).len() as u64).sum()
+        self.lemmas
+            .iter()
+            .map(|c| self.allocator.get(*c).len() as u64)
+            .sum()
     }
 
     /// What a static occurrence index would visit for one query: for every

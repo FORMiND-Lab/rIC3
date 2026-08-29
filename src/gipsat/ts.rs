@@ -91,6 +91,22 @@ impl TransysSolver {
         }
     }
 
+    /// Stable current-latch -> next-latch variable map registered with the
+    /// resident BLOCK root controller. Non-latch variables are deliberately
+    /// unmapped: a proof obligation is a state cube, so encountering one is a
+    /// protocol error rather than permission to invent an identity mapping.
+    pub fn resident_block_next_var_map(&self) -> Vec<u32> {
+        let mut map = vec![u32::MAX; self.dcs.num_var()];
+        for current in self.ts.latch() {
+            let current_index = usize::from(current);
+            let next = self.ts.var_next(current);
+            if current_index < map.len() {
+                map[current_index] = u32::from(next);
+            }
+        }
+        map
+    }
+
     pub fn install_incremental_sat_model(
         &mut self,
         query: &IncrementalQuery,
@@ -104,15 +120,10 @@ impl TransysSolver {
         query: &IncrementalQuery,
         model: &[Lit],
     ) -> bool {
-        self.dcs
-            .install_trusted_incremental_sat_model(query, model)
+        self.dcs.install_trusted_incremental_sat_model(query, model)
     }
 
-    pub fn validate_incremental_sat_model(
-        &self,
-        query: &IncrementalQuery,
-        model: &[Lit],
-    ) -> bool {
+    pub fn validate_incremental_sat_model(&self, query: &IncrementalQuery, model: &[Lit]) -> bool {
         self.dcs.validate_incremental_sat_model(query, model)
     }
 
@@ -121,8 +132,7 @@ impl TransysSolver {
         query: &IncrementalQuery,
         model: &[Lit],
     ) -> bool {
-        self.dcs
-            .trusted_incremental_sat_model_shape(query, model)
+        self.dcs.trusted_incremental_sat_model_shape(query, model)
     }
 
     /// Validate a hardware assumption core with an exact reduced GipSAT
@@ -149,11 +159,10 @@ impl TransysSolver {
         core: &[Lit],
         used_constraints: bool,
     ) -> bool {
-        if !self.dcs.install_incremental_proven_unsat_core(
-            query,
-            core,
-            used_constraints,
-        ) {
+        if !self
+            .dcs
+            .install_incremental_proven_unsat_core(query, core, used_constraints)
+        {
             return false;
         }
         self.relind = LitVec::from(cube);

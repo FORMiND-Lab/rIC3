@@ -338,18 +338,17 @@ impl IC3 {
             debug!("blocking phase begin");
             loop {
                 let lvl = self.level();
-                let terminal = match crate::inductor::in_phase(
-                    inductor_trace::Phase::Block,
-                    lvl,
-                    || self.block(None),
-                ) {
-                    BlockResult::Failure(depth) => Some(McResult::SAT(depth)),
-                    BlockResult::Proved => Some(McResult::UNSAT),
-                    BlockResult::OverallTimeLimitExceeded => {
-                        Some(McResult::Unknown(Some(self.level())))
-                    }
-                    _ => None,
-                };
+                let terminal =
+                    match crate::inductor::in_phase(inductor_trace::Phase::Block, lvl, || {
+                        self.block(None)
+                    }) {
+                        BlockResult::Failure(depth) => Some(McResult::SAT(depth)),
+                        BlockResult::Proved => Some(McResult::UNSAT),
+                        BlockResult::OverallTimeLimitExceeded => {
+                            Some(McResult::Unknown(Some(self.level())))
+                        }
+                        _ => None,
+                    };
                 if let Some(result) = terminal {
                     self.statistic.block.overall_time += start.elapsed();
                     if !matches!(result, McResult::Unknown(_)) {
@@ -394,11 +393,9 @@ impl IC3 {
             self.render_progress();
             let start = Instant::now();
             let lvl = self.level();
-            let propagate = crate::inductor::in_phase(
-                inductor_trace::Phase::Push,
-                lvl,
-                || self.propagate(None),
-            );
+            let propagate = crate::inductor::in_phase(inductor_trace::Phase::Push, lvl, || {
+                self.propagate(None)
+            });
             self.statistic.propagate.overall_time += start.elapsed();
             if propagate {
                 if frame_event.is_some() {
@@ -569,11 +566,7 @@ impl Engine for IC3 {
         // snapshot is loading one of these, while the queries it replays came
         // from many. This reports how far apart those are.
         {
-            let per: Vec<(usize, u64)> = self
-                .solvers
-                .iter()
-                .map(|s| s.dcs.lemma_size())
-                .collect();
+            let per: Vec<(usize, u64)> = self.solvers.iter().map(|s| s.dcs.lemma_size()).collect();
             crate::inductor::report_solver_fanout(self.solvers.len(), &per);
         }
         self.push_prefetch.finish();

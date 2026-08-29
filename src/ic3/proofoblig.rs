@@ -274,11 +274,7 @@ impl ProofObligationQueue {
     /// Simulation bridge for FPGA-owned work scheduling. The controller has
     /// already removed this descriptor; find the matching CPU proof-chain
     /// object without imposing the CPU BTreeSet's choice on the device.
-    fn take_resident_key(
-        &mut self,
-        key: &[u32],
-        max_frame: usize,
-    ) -> Option<ProofObligation> {
+    fn take_resident_key(&mut self, key: &[u32], max_frame: usize) -> Option<ProofObligation> {
         let selected = self
             .resident_index
             .get(key)
@@ -291,6 +287,13 @@ impl ProofObligationQueue {
             super::frame::note_frame_obligation_mutation(false, taken);
         }
         ret
+    }
+
+    pub fn clone_resident_key(&self, key: &[u32], max_frame: usize) -> Option<ProofObligation> {
+        self.resident_index
+            .get(key)
+            .filter(|po| po.frame <= max_frame)
+            .cloned()
     }
 
     /// Consume a controller-selected proof chain through its opaque tag. The
@@ -382,13 +385,7 @@ mod tests {
     #[test]
     fn conditional_insert_keeps_frame_counts_consistent() {
         let lit = Lit::new(Var::from(0), true);
-        let po = ProofObligation::new(
-            2,
-            LitOrdVec::new(LitVec::from([lit])),
-            Vec::new(),
-            1,
-            None,
-        );
+        let po = ProofObligation::new(2, LitOrdVec::new(LitVec::from([lit])), Vec::new(), 1, None);
         let mut queue = ProofObligationQueue::new();
 
         assert!(queue.add_if_new(po.clone()));
@@ -402,20 +399,8 @@ mod tests {
     fn resident_selection_can_override_cpu_btree_tie_break() {
         let a = Lit::new(Var::from(0), true);
         let b = Lit::new(Var::from(1), true);
-        let po_a = ProofObligation::new(
-            2,
-            LitOrdVec::new(LitVec::from([a])),
-            Vec::new(),
-            1,
-            None,
-        );
-        let po_b = ProofObligation::new(
-            2,
-            LitOrdVec::new(LitVec::from([b])),
-            Vec::new(),
-            1,
-            None,
-        );
+        let po_a = ProofObligation::new(2, LitOrdVec::new(LitVec::from([a])), Vec::new(), 1, None);
+        let po_b = ProofObligation::new(2, LitOrdVec::new(LitVec::from([b])), Vec::new(), 1, None);
         let key_b = po_b.resident_key();
         let mut queue = ProofObligationQueue::new();
         queue.add(po_a.clone());

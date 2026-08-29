@@ -32,9 +32,7 @@ pub fn bank_aligned_domain_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("INDUCTOR_CDCL_BANK_ALIGNED_DOMAIN")
             .ok()
-            .is_some_and(|value| {
-                !matches!(value.as_str(), "" | "0" | "false" | "off")
-            })
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "off"))
     })
 }
 
@@ -78,9 +76,8 @@ impl IncrementalQuery {
         });
         let bank_aligned = bank_aligned_domain_enabled();
         let domain_words = encoded_domain_words(&self.domain);
-        let mut payload = Vec::with_capacity(
-            self.assumptions.len() + constraint_words + domain_words,
-        );
+        let mut payload =
+            Vec::with_capacity(self.assumptions.len() + constraint_words + domain_words);
         payload.extend(self.assumptions.iter().map(|l| Into::<u32>::into(*l)));
         for clause in &self.constraints {
             payload.push(clause.len() as u32);
@@ -234,8 +231,8 @@ pub fn decode_batch_results(
     if batch.error != 0 {
         return Err(BatchDecodeError::Backend(batch.error));
     }
-    let result_words = usize::try_from(batch.n_result_words)
-        .map_err(|_| BatchDecodeError::InvalidResultShape)?;
+    let result_words =
+        usize::try_from(batch.n_result_words).map_err(|_| BatchDecodeError::InvalidResultShape)?;
     if words.len() != 4 + result_words {
         return Err(BatchDecodeError::InvalidResultShape);
     }
@@ -246,44 +243,42 @@ pub fn decode_batch_results(
         let header_words = words
             .get(offset..offset + RESPONSE_HEADER_WORDS)
             .ok_or(BatchDecodeError::Truncated)?;
-        let header = ResponseHeader::from_words(header_words)
-            .ok_or(BatchDecodeError::Truncated)?;
+        let header = ResponseHeader::from_words(header_words).ok_or(BatchDecodeError::Truncated)?;
         offset += RESPONSE_HEADER_WORDS;
-        let n_model = usize::try_from(header.n_model)
-            .map_err(|_| BatchDecodeError::InvalidResultShape)?;
-        let n_core = usize::try_from(header.n_core)
-            .map_err(|_| BatchDecodeError::InvalidResultShape)?;
+        let n_model =
+            usize::try_from(header.n_model).map_err(|_| BatchDecodeError::InvalidResultShape)?;
+        let n_core =
+            usize::try_from(header.n_core).map_err(|_| BatchDecodeError::InvalidResultShape)?;
         let payload = words
             .get(offset..offset + n_model + n_core)
             .ok_or(BatchDecodeError::Truncated)?;
         offset += payload.len();
 
-        let result = match Status::from_word(header.status)
-            .ok_or(BatchDecodeError::InvalidStatus)?
-        {
-            Status::Sat if n_core == 0 && header.error == 0 => {
-                let model = if bank_aligned_domain_enabled() && packed_sat_model_enabled() {
-                    decode_packed_sat_model(query, &payload[..n_model])?
-                } else {
-                    payload[..n_model].iter().map(|w| decode_lit(*w)).collect()
-                };
-                IncrementalResult::Sat { model }
-            }
-            Status::Unsat if n_model == 0 && header.error == 0 => IncrementalResult::Unsat {
-                core: payload[..n_core].iter().map(|w| decode_lit(*w)).collect(),
-                used_constraints: !query.constraints.is_empty(),
-            },
-            Status::Unknown if n_model == 0 && n_core == 0 && header.error == 0 => {
-                let reason = UnknownReason::from_word(header.reason)
-                    .ok_or(BatchDecodeError::InvalidReason)?;
-                if reason == UnknownReason::None {
-                    return Err(BatchDecodeError::InvalidReason);
+        let result =
+            match Status::from_word(header.status).ok_or(BatchDecodeError::InvalidStatus)? {
+                Status::Sat if n_core == 0 && header.error == 0 => {
+                    let model = if bank_aligned_domain_enabled() && packed_sat_model_enabled() {
+                        decode_packed_sat_model(query, &payload[..n_model])?
+                    } else {
+                        payload[..n_model].iter().map(|w| decode_lit(*w)).collect()
+                    };
+                    IncrementalResult::Sat { model }
                 }
-                IncrementalResult::Unknown(reason)
-            }
-            Status::Error => return Err(BatchDecodeError::Backend(header.error)),
-            _ => return Err(BatchDecodeError::InvalidResultShape),
-        };
+                Status::Unsat if n_model == 0 && header.error == 0 => IncrementalResult::Unsat {
+                    core: payload[..n_core].iter().map(|w| decode_lit(*w)).collect(),
+                    used_constraints: !query.constraints.is_empty(),
+                },
+                Status::Unknown if n_model == 0 && n_core == 0 && header.error == 0 => {
+                    let reason = UnknownReason::from_word(header.reason)
+                        .ok_or(BatchDecodeError::InvalidReason)?;
+                    if reason == UnknownReason::None {
+                        return Err(BatchDecodeError::InvalidReason);
+                    }
+                    IncrementalResult::Unknown(reason)
+                }
+                Status::Error => return Err(BatchDecodeError::Backend(header.error)),
+                _ => return Err(BatchDecodeError::InvalidResultShape),
+            };
         results.push(result);
     }
     if offset != words.len() {
@@ -296,7 +291,9 @@ pub fn decode_batch_results(
 pub enum IncrementalResult {
     /// GipSAT models are intentionally sparse: unassigned variables remain
     /// `None`, just as they do after the ordinary CPU search.
-    Sat { model: LitVec },
+    Sat {
+        model: LitVec,
+    },
     /// The core contains only caller assumptions. Temporary clauses remain
     /// part of the query even when the activation literal participates.
     Unsat {
@@ -351,9 +348,7 @@ impl DagCnfSolver {
                 used_constraints: !query.constraints.is_empty()
                     && self.unsat_core.has(self.constrain_act.lit()),
             },
-            None => IncrementalResult::Unknown(
-                crate::accel::cdcl::UnknownReason::ConflictBudget,
-            ),
+            None => IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::ConflictBudget),
         }
     }
 
@@ -375,10 +370,7 @@ impl DagCnfSolver {
     /// restore a clean query boundary. This is used by the active dispatch
     /// sampler: the answer is reusable, while its measured cost predicts
     /// whether the remaining compatible inquiries belong on CPU or FPGA.
-    pub fn classify_incremental_exact(
-        &mut self,
-        query: &IncrementalQuery,
-    ) -> IncrementalResult {
+    pub fn classify_incremental_exact(&mut self, query: &IncrementalQuery) -> IncrementalResult {
         let mut exact = query.clone();
         exact.budget = QueryBudget::default();
         let result = self.solve_incremental(&exact);
@@ -402,8 +394,7 @@ impl DagCnfSolver {
         }
         let mut unmatched: Vec<Lit> = query.assumptions.iter().copied().collect();
         for &lit in core {
-            let Some(position) = unmatched.iter().position(|candidate| *candidate == lit)
-            else {
+            let Some(position) = unmatched.iter().position(|candidate| *candidate == lit) else {
                 return false;
             };
             unmatched.swap_remove(position);
@@ -549,12 +540,9 @@ impl DagCnfSolver {
         true
     }
 
-    pub fn validate_incremental_sat_model(
-        &self,
-        query: &IncrementalQuery,
-        model: &[Lit],
-    ) -> bool {
-        self.validated_incremental_assignment(query, model).is_some()
+    pub fn validate_incremental_sat_model(&self, query: &IncrementalQuery, model: &[Lit]) -> bool {
+        self.validated_incremental_assignment(query, model)
+            .is_some()
     }
 
     /// Verify only the fixed-width transport contract for a model returned by
@@ -694,9 +682,7 @@ impl IncrementalCdcl for DagCnfSolver {
                 used_constraints: !query.constraints.is_empty()
                     && self.unsat_core.has(self.constrain_act.lit()),
             },
-            None => IncrementalResult::Unknown(
-                crate::accel::cdcl::UnknownReason::RestartBudget,
-            ),
+            None => IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::RestartBudget),
         }
     }
 }
@@ -816,8 +802,7 @@ mod tests {
         solver.add_clause(&[!a, b]);
         let mut sat = IncrementalQuery::new(0, LitVec::from([a]));
         sat.domain = (0..solver.num_var()).map(Var::from).collect();
-        let IncrementalResult::Sat { model } =
-            solver.classify_incremental_preflight(&sat, 8)
+        let IncrementalResult::Sat { model } = solver.classify_incremental_preflight(&sat, 8)
         else {
             panic!("expected conclusive SAT preflight");
         };
@@ -837,17 +822,9 @@ mod tests {
         // Simulate an earlier push strengthening this frame between the
         // speculative preflight and ordered IC3 consumption.
         solver.add_clause(&[b]);
-        assert!(solver.install_incremental_proven_unsat_core(
-            &unsat,
-            &core,
-            used_constraints,
-        ));
+        assert!(solver.install_incremental_proven_unsat_core(&unsat, &core, used_constraints,));
         assert!(core.iter().all(|lit| solver.unsat_has(*lit)));
-        assert!(!solver.install_incremental_proven_unsat_core(
-            &unsat,
-            &[!a],
-            used_constraints,
-        ));
+        assert!(!solver.install_incremental_proven_unsat_core(&unsat, &[!a], used_constraints,));
     }
 
     #[test]
@@ -976,10 +953,7 @@ mod tests {
 
         // A literal outside the original assumption multiset is malformed,
         // while an insufficient subset is rejected by the exact CPU solve.
-        assert_eq!(
-            solver.validate_incremental_unsat_core(&query, &[!c]),
-            None,
-        );
+        assert_eq!(solver.validate_incremental_unsat_core(&query, &[!c]), None,);
         assert_eq!(solver.validate_incremental_unsat_core(&query, &[a]), None);
 
         let single_a = IncrementalQuery::new(0, LitVec::from([a]));

@@ -2,9 +2,9 @@ use crate::{
     accel::cdcl_host::ActivePreflight,
     gipsat::{IncrementalQuery, IncrementalResult, TransysSolver},
     ic3::{
+        IC3,
         frame::{Frame, FrameLemma},
         mic::MicType,
-        IC3,
     },
     transys::TransysIf,
 };
@@ -29,8 +29,8 @@ impl IC3 {
                     // state. Reconstruct that state from the complete device
                     // assignment instead of leaving a stale CPU trail live.
                     let install_start = Instant::now();
-                    let accepted = self.solvers[frame_idx]
-                        .install_trusted_incremental_sat_model(query, model);
+                    let accepted =
+                        self.solvers[frame_idx].install_trusted_incremental_sat_model(query, model);
                     crate::accel::cdcl_host::note_active_trusted_sat(
                         accepted,
                         install_start.elapsed().as_nanos() as u64,
@@ -46,13 +46,12 @@ impl IC3 {
                     // checks only transport shape/subset membership and does
                     // not solve the inquiry again on CPU.
                     let install_start = Instant::now();
-                    let accepted = self.solvers[frame_idx]
-                        .install_incremental_proven_unsat_core(
-                            lemma.as_litvec(),
-                            query,
-                            core,
-                            *used_constraints,
-                        );
+                    let accepted = self.solvers[frame_idx].install_incremental_proven_unsat_core(
+                        lemma.as_litvec(),
+                        query,
+                        core,
+                        *used_constraints,
+                    );
                     crate::accel::cdcl_host::note_active_trusted_unsat(
                         accepted,
                         query.assumptions.len(),
@@ -146,8 +145,8 @@ impl IC3 {
                 }
             }
         }
-        let n_candidates = eligible_candidates
-            .min(super::push_prefetch::PushPrefetchCache::launch_window());
+        let n_candidates =
+            eligible_candidates.min(super::push_prefetch::PushPrefetchCache::launch_window());
         if n_candidates < crate::accel::cdcl_host::active_min_batch_size() {
             return;
         }
@@ -199,8 +198,7 @@ impl IC3 {
     pub fn propagate(&mut self, from: Option<usize>) -> bool {
         let level = self.level();
         let from = from.unwrap_or(self.frame.early).max(1);
-        let push_prefetch_enabled =
-            crate::accel::cdcl_host::push_prefetch_enabled();
+        let push_prefetch_enabled = crate::accel::cdcl_host::push_prefetch_enabled();
         if push_prefetch_enabled {
             self.push_prefetch.begin_pass();
         }
@@ -209,8 +207,7 @@ impl IC3 {
         // from one strengthened by an earlier result in this pass. Conservative
         // mode validates both; qualified direct trust is allowed only for the
         // unchanged revision.
-        let propagation_batch_enabled =
-            crate::accel::cdcl_host::propagation_batch_enabled();
+        let propagation_batch_enabled = crate::accel::cdcl_host::propagation_batch_enabled();
         let prepare_accel_queries = propagation_batch_enabled || push_prefetch_enabled;
         let mut work: Vec<(usize, Frame, Vec<IncrementalQuery>, u64)> = Vec::new();
         for frame_idx in from..level {
@@ -220,16 +217,13 @@ impl IC3 {
                 frame
                     .iter()
                     .map(|lemma| {
-                        self.solvers[frame_idx]
-                            .incremental_inductive_query(lemma, true, vec![])
+                        self.solvers[frame_idx].incremental_inductive_query(lemma, true, vec![])
                     })
                     .collect()
             } else {
                 Vec::new()
             };
-            let context_revision = self.solvers[frame_idx]
-                .dcs
-                .incremental_context_revision();
+            let context_revision = self.solvers[frame_idx].dcs.incremental_context_revision();
             work.push((frame_idx, frame, active_queries, context_revision));
         }
         let n_queries = work
@@ -243,11 +237,10 @@ impl IC3 {
             let mut query_index = 0usize;
             for (frame_idx, _, queries, _) in &work {
                 for query in queries {
-                    preflight[query_index] =
-                        crate::accel::cdcl_host::active_preflight_classify(
-                            &mut self.solvers[*frame_idx].dcs,
-                            query,
-                        );
+                    preflight[query_index] = crate::accel::cdcl_host::active_preflight_classify(
+                        &mut self.solvers[*frame_idx].dcs,
+                        query,
+                    );
                     query_index += 1;
                 }
             }
@@ -258,10 +251,7 @@ impl IC3 {
                     sample_requests.push((solver, query));
                 }
             }
-            crate::accel::cdcl_host::active_sample_select_pass(
-                &sample_requests,
-                &mut preflight,
-            );
+            crate::accel::cdcl_host::active_sample_select_pass(&sample_requests, &mut preflight);
         }
         let active_results = if propagation_batch_enabled {
             let mut requests = Vec::new();
@@ -277,14 +267,12 @@ impl IC3 {
                     query_index += 1;
                 }
             }
-            let selected_results =
-                crate::accel::cdcl_host::solve_active_batch(requests);
-            let mut results = vec![
-                IncrementalResult::Unknown(
-                    crate::accel::cdcl::UnknownReason::BackendError,
-                );
-                n_queries
-            ];
+            let selected_results = crate::accel::cdcl_host::solve_active_batch(requests);
+            let mut results =
+                vec![
+                    IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::BackendError,);
+                    n_queries
+                ];
             for (index, result) in request_indices.into_iter().zip(selected_results) {
                 results[index] = result;
             }
@@ -297,8 +285,7 @@ impl IC3 {
         for (frame_idx, frame, active_queries, context_revision) in work {
             let frame_result_offset = result_offset;
             result_offset += active_queries.len();
-            let _op =
-                crate::inductor::macro_scope(inductor_trace::Phase::Push, frame_idx + 1);
+            let _op = crate::inductor::macro_scope(inductor_trace::Phase::Push, frame_idx + 1);
             for (lemma_index, mut lemma) in frame.into_iter().enumerate() {
                 if self.frame[frame_idx].iter().all(|l| l.ne(&lemma)) {
                     continue;
@@ -371,9 +358,7 @@ impl IC3 {
                                         &lemma,
                                         &active_queries[lemma_index],
                                         result,
-                                        self.solvers[frame_idx]
-                                            .dcs
-                                            .incremental_context_revision()
+                                        self.solvers[frame_idx].dcs.incremental_context_revision()
                                             == context_revision,
                                     )
                                 }),
@@ -409,15 +394,13 @@ impl IC3 {
                         break;
                     }
                     let (ctp, _) = self.get_pred(frame_idx + 1, false);
-                    if !self.tsctx.cube_subsume_init(&ctp)
-                        && {
-                            let _ctx = crate::inductor::set_context(
-                                inductor_trace::Phase::Push,
-                                frame_idx - 1,
-                            );
-                            self.solvers[frame_idx - 1].inductive(&ctp, true)
-                        }
-                    {
+                    if !self.tsctx.cube_subsume_init(&ctp) && {
+                        let _ctx = crate::inductor::set_context(
+                            inductor_trace::Phase::Push,
+                            frame_idx - 1,
+                        );
+                        self.solvers[frame_idx - 1].inductive(&ctp, true)
+                    } {
                         let core = self.solvers[frame_idx - 1].inductive_core().unwrap();
                         let mic =
                             self.mic(frame_idx, core, &[], MicType::DropVar(Default::default()));
@@ -475,8 +458,7 @@ impl IC3 {
         while let Some(mut lemma) = lastf.pop() {
             loop {
                 if {
-                    let _ctx =
-                        crate::inductor::set_context(inductor_trace::Phase::Inf, usize::MAX);
+                    let _ctx = crate::inductor::set_context(inductor_trace::Phase::Inf, usize::MAX);
                     self.inf_solver.inductive(&lemma, true)
                 } {
                     if let Some(po) = &mut lemma.po {

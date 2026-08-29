@@ -5,18 +5,19 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BatchHeader, BlockSemanticCommand, BlockSemanticCommandResponse,
-    MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
-    MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
-    MicHeader, MicResponseHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
-    PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS, PROFILE_LEARN,
-    PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
-    PROFILE_OCCURRENCE_UPDATES, PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
-    PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
+    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockRootExecutionStatus, BlockRootResponse,
+    BlockSemanticCommand, BlockSemanticCommandResponse, MIC_BATCH_HEADER_WORDS,
+    MIC_BATCH_RESPONSE_HEADER_WORDS, MIC_MODEL_SHRINK, MIC_PROTECT_INDEX,
+    MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS, MicHeader, MicResponseHeader,
+    PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK, PROFILE_CLEANUP, PROFILE_DECIDE,
+    PROFILE_EMIT, PROFILE_EVALUATED_LITERALS, PROFILE_LEARN, PROFILE_LEARNT_LITERALS,
+    PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS, PROFILE_OCCURRENCE_UPDATES,
+    PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT, PROFILE_SETUP,
+    PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
     RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS, STAGE_PROFILE_MAGIC,
     STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
-    UnknownReason, WANT_STAGE_PROFILE, decode_block_semantic_batch_response,
-    pack_block_semantic_batch,
+    UnknownReason, WANT_STAGE_PROFILE, decode_block_root_response,
+    decode_block_semantic_batch_response, pack_block_root_request, pack_block_semantic_batch,
 };
 #[cfg(has_cdcl_accel)]
 use crate::gipsat::decode_batch_results;
@@ -95,6 +96,13 @@ unsafe extern "C" {
         response_capacity_words: u32,
         out_response_words: *mut u32,
     ) -> i32;
+    fn ind_cdcl_run_block_root(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
     fn ind_cdcl_total_kernel_ns() -> u64;
 }
 
@@ -137,6 +145,22 @@ struct FrameRangeRegistry {
 static FRAME_RANGE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<FrameRangeRegistry>> =
     std::sync::OnceLock::new();
 
+#[derive(Default)]
+struct BlockRootRangeRegistry {
+    n_var: u32,
+    transition: Vec<LitVec>,
+    clauses: Vec<ResidentClause>,
+    seen: HashSet<(u32, Vec<u32>)>,
+}
+
+static BLOCK_ROOT_RANGE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<BlockRootRangeRegistry>> =
+    std::sync::OnceLock::new();
+
+fn block_root_range_registry() -> &'static std::sync::Mutex<BlockRootRangeRegistry> {
+    BLOCK_ROOT_RANGE_REGISTRY
+        .get_or_init(|| std::sync::Mutex::new(BlockRootRangeRegistry::default()))
+}
+
 fn frame_range_registry() -> &'static std::sync::Mutex<FrameRangeRegistry> {
     FRAME_RANGE_REGISTRY.get_or_init(|| std::sync::Mutex::new(FrameRangeRegistry::default()))
 }
@@ -145,10 +169,16 @@ fn frame_range_registry() -> &'static std::sync::Mutex<FrameRangeRegistry> {
 /// transition relation is permanent; subsequent calls record the exact frame
 /// intervals into which IC3 inserts each lemma.
 pub fn reset_frame_resident_context(solver: &DagCnfSolver) {
+    let (n_var, _, transition, _) = solver.incremental_resident_partition();
+    if let Ok(mut registry) = block_root_range_registry().lock() {
+        registry.n_var = n_var;
+        registry.transition = transition.clone();
+        registry.clauses.clear();
+        registry.seen.clear();
+    }
     if !active_frame_ranges() {
         return;
     }
-    let (n_var, _, transition, _) = solver.incremental_resident_partition();
     if let Ok(mut registry) = frame_range_registry().lock() {
         registry.n_var = n_var;
         registry.transition = transition;
@@ -491,10 +521,7 @@ fn pack_batch_request(
         .iter()
         .try_fold(0usize, |total, query| {
             let record = RESPONSE_HEADER_WORDS
-                .checked_add(
-                    encoded_domain_words(&query.domain)
-                        .max(query.assumptions.len()),
-                )?
+                .checked_add(encoded_domain_words(&query.domain).max(query.assumptions.len()))?
                 .checked_add(if want_stage_profile {
                     STAGE_PROFILE_WORDS
                 } else {
@@ -588,10 +615,7 @@ fn pack_arena_batch_request(
     Ok((request, response_capacity))
 }
 
-fn pack_arena_mic_request(
-    view: &ArenaViewUpdate,
-    mic: &[u32],
-) -> Result<Vec<u32>, HardwareError> {
+fn pack_arena_mic_request(view: &ArenaViewUpdate, mic: &[u32]) -> Result<Vec<u32>, HardwareError> {
     let total_words = view
         .words
         .len()
@@ -898,10 +922,7 @@ impl ResidentArena {
         };
     }
 
-    fn normalize_clause(
-        n_var: u32,
-        literals: &LitVec,
-    ) -> Result<Option<Vec<u32>>, HardwareError> {
+    fn normalize_clause(n_var: u32, literals: &LitVec) -> Result<Option<Vec<u32>>, HardwareError> {
         if n_var == 0 || literals.is_empty() {
             return Err(HardwareError::InvalidContext);
         }
@@ -963,14 +984,13 @@ impl ResidentArena {
         Ok((mapping, appended))
     }
 
-    fn plan_view(
-        &mut self,
-        lane: usize,
-        active: &[u32],
-    ) -> Result<ArenaViewUpdate, HardwareError> {
-        let lane = self.lanes.get_mut(lane).ok_or(HardwareError::InvalidContext)?;
-        let bitmap_words = usize::try_from((self.n_clause + 31) / 32)
-            .map_err(|_| HardwareError::Capacity)?;
+    fn plan_view(&mut self, lane: usize, active: &[u32]) -> Result<ArenaViewUpdate, HardwareError> {
+        let lane = self
+            .lanes
+            .get_mut(lane)
+            .ok_or(HardwareError::InvalidContext)?;
+        let bitmap_words =
+            usize::try_from((self.n_clause + 31) / 32).map_err(|_| HardwareError::Capacity)?;
         let mut target = vec![0u32; bitmap_words];
         for &clause in active {
             if clause >= self.n_clause {
@@ -1143,6 +1163,98 @@ impl HardwareCdcl {
                 });
             }
             Ok(records)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, request_words, response_capacity_words);
+            Err(HardwareError::Unavailable)
+        }
+    }
+
+    /// Run one failure-atomic resident queue-to-CDCL wave through the native
+    /// or RPC service. `query_template` contributes the already-qualified
+    /// decision domain, flags and budgets; assumptions are constructed from
+    /// the tagged resident state cubes by the controller itself.
+    pub fn run_block_root(
+        &mut self,
+        max_frame: u32,
+        requested_queries: usize,
+        next_var_by_current: &[u32],
+        query_template: &IncrementalQuery,
+    ) -> Result<BlockRootResponse, HardwareError> {
+        if next_var_by_current.len() != self.n_var as usize
+            || query_template.domain.is_empty()
+            || query_template.constraints.len() != 0
+        {
+            return Err(HardwareError::InvalidContext);
+        }
+        let mut domain_query = query_template.clone();
+        domain_query.frame = 0;
+        domain_query.assumptions.clear();
+        domain_query.constraints.clear();
+        let (domain_header, domain_words) = domain_query.pack();
+        if domain_header.n_assumptions != 0
+            || domain_header.n_constraint_words != 0
+            || usize::try_from(domain_header.n_domain).ok() != Some(domain_words.len())
+        {
+            return Err(HardwareError::InvalidContext);
+        }
+        let request = pack_block_root_request(
+            max_frame,
+            requested_queries,
+            next_var_by_current,
+            &domain_words,
+            domain_header.flags,
+            domain_header.decision_budget,
+            domain_header.conflict_budget,
+        )
+        .ok_or(HardwareError::Capacity)?;
+        let per_result = RESPONSE_HEADER_WORDS
+            .checked_add(next_var_by_current.len().max(domain_words.len()))
+            .ok_or(HardwareError::Capacity)?;
+        let response_capacity = BLOCK_ROOT_BATCH_OFFSET
+            .checked_add(4)
+            .and_then(|words| {
+                requested_queries
+                    .checked_mul(per_result)
+                    .and_then(|results| words.checked_add(results))
+            })
+            .ok_or(HardwareError::Capacity)?;
+        let request_words = u32::try_from(request.len()).map_err(|_| HardwareError::Capacity)?;
+        let response_capacity_words =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut response = vec![0u32; response_capacity];
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_run_block_root(
+                    request.as_ptr(),
+                    request_words,
+                    response.as_mut_ptr(),
+                    response_capacity_words,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() {
+                return Err(HardwareError::InvalidResponse);
+            }
+            response.truncate(out_words);
+            let decoded =
+                decode_block_root_response(&response).ok_or(HardwareError::InvalidResponse)?;
+            if decoded.status == BlockRootExecutionStatus::Ok
+                && (decoded.batch.len() < 4
+                    || decoded.batch[0] != ABI_VERSION
+                    || usize::try_from(decoded.batch[1]).ok() != Some(decoded.work.len())
+                    || usize::try_from(decoded.batch[2]).ok() != decoded.batch.len().checked_sub(4))
+            {
+                return Err(HardwareError::InvalidResponse);
+            }
+            Ok(decoded)
         }
         #[cfg(not(has_cdcl_accel))]
         {
@@ -1483,7 +1595,8 @@ impl HardwareCdcl {
                 self.invalidate_arena_context();
                 return Err(HardwareError::Capacity);
             }
-            let (result, record_words) = match decode_mic_chain_record(cube, &response[..out_words]) {
+            let (result, record_words) = match decode_mic_chain_record(cube, &response[..out_words])
+            {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     self.invalidate_arena_context();
@@ -1855,6 +1968,55 @@ struct ShadowContext {
     n_var: u32,
     clauses: Vec<ResidentClause>,
     scope: ShadowContextScope,
+}
+
+/// Materialize the exact union of the live IC3 frame solvers as one ranged
+/// resident formula. The append-only event registry is the fast path, but
+/// subsumption and frame promotion can legitimately make that history differ
+/// from an exact solver snapshot. A fused root still needs a correct resync
+/// path when that happens.
+fn block_root_ranged_context(solvers: &[&DagCnfSolver]) -> Option<ShadowContext> {
+    if solvers.is_empty() {
+        return None;
+    }
+    let mut registry = block_root_range_registry().lock().ok()?;
+    if registry.n_var == 0 {
+        return None;
+    }
+    for solver in solvers {
+        let (solver_n_var, frame, solver_transition, lemmas) =
+            solver.incremental_resident_partition();
+        if solver_n_var != registry.n_var || solver_transition != registry.transition {
+            return None;
+        }
+        for literals in lemmas {
+            let mut key: Vec<u32> = literals.iter().map(|literal| u32::from(*literal)).collect();
+            key.sort_unstable();
+            key.dedup();
+            if registry.seen.insert((frame, key)) {
+                // Frame solvers only gain clauses; IC3's bookkeeping may
+                // remove a subsumed FrameLemma, but DagCnfSolver deliberately
+                // retains the already-proved clause. Keeping each first-seen
+                // exact-frame occurrence therefore gives a monotonic physical
+                // prefix without changing the logical formula at that frame.
+                registry
+                    .clauses
+                    .push(ResidentClause::new(frame, frame, literals));
+            }
+        }
+    }
+    let clauses = registry
+        .transition
+        .iter()
+        .cloned()
+        .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+        .chain(registry.clauses.iter().cloned())
+        .collect();
+    Some(ShadowContext {
+        n_var: registry.n_var,
+        clauses,
+        scope: ShadowContextScope::FrameRanged,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3681,10 +3843,139 @@ fn block_controller_owns_queue() -> bool {
     })
 }
 
+pub fn block_root_executor_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_BLOCK_ROOT_EXECUTOR")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
 pub enum ResidentBlockPop {
     Disabled,
     Empty,
     Selected { user_tag: u64 },
+}
+
+pub enum ResidentBlockRoot {
+    Disabled,
+    Wave {
+        response: BlockRootResponse,
+        keys: Vec<Vec<u32>>,
+    },
+}
+
+/// Execute one controller-owned resident queue/CDCL wave. The CPU-facing
+/// return keeps opaque proof keys aligned with device work records; only the
+/// first key is consumed from the queue, while later records remain cached
+/// speculative inquiries.
+pub fn run_resident_block_root(
+    max_frame: usize,
+    requested_queries: usize,
+    solvers: &[&DagCnfSolver],
+    next_var_by_current: &[u32],
+    query_template: &IncrementalQuery,
+) -> ResidentBlockRoot {
+    if !block_root_executor_enabled()
+        || !block_controller_owns_queue()
+        || !block_controller_sim_enabled()
+    {
+        return ResidentBlockRoot::Disabled;
+    }
+    // A root wave may be the first CDCL operation in a BLOCK traversal.  The
+    // semantic queue is a separate resident state machine, so successfully
+    // rebasing it does not imply that the formula arena has been installed.
+    // Build an exact ranged snapshot here and make residency an explicit part
+    // of the root transaction's host-side precondition.
+    let Some(context) = block_root_ranged_context(solvers) else {
+        return ResidentBlockRoot::Disabled;
+    };
+    let state = active_state().lock();
+    let result = state
+        .map_err(|_| "active hardware lock poisoned".to_string())
+        .and_then(|mut state| {
+            let update = plan_context_update(state.loaded_context.as_ref(), &context);
+            let ready = match update {
+                ContextUpdate::Ready => Ok(()),
+                ContextUpdate::Append(clauses) => {
+                    let started = std::time::Instant::now();
+                    let result = state
+                        .hardware
+                        .as_mut()
+                        .ok_or(HardwareError::Unavailable)
+                        .and_then(|hardware| hardware.add_frame_clauses(&clauses));
+                    ACTIVE_CONTEXT_APPEND_NS.fetch_add(
+                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
+                    if result.is_ok() {
+                        ACTIVE_CONTEXT_APPENDS.fetch_add(1, Ordering::Relaxed);
+                        ACTIVE_CONTEXT_APPEND_CLAUSES
+                            .fetch_add(clauses.len() as u64, Ordering::Relaxed);
+                        if let Some(loaded) = state.loaded_context.as_mut() {
+                            loaded.clauses.extend(clauses.clone());
+                        }
+                    } else {
+                        ACTIVE_CONTEXT_APPEND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    result
+                }
+                ContextUpdate::Reload => {
+                    let started = std::time::Instant::now();
+                    let result = state
+                        .hardware
+                        .as_mut()
+                        .ok_or(HardwareError::Unavailable)
+                        .and_then(|hardware| {
+                            hardware.load_context(context.n_var, &context.clauses)
+                        });
+                    ACTIVE_CONTEXT_LOAD_NS.fetch_add(
+                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
+                    if result.is_ok() {
+                        ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
+                        state.loaded_context = Some(LoadedContext::from(&context));
+                    }
+                    result
+                }
+            };
+            if let Err(error) = ready {
+                state.loaded_context = None;
+                return Err(format!("resident BLOCK root context failed: {error}"));
+            }
+            let result = state
+                .hardware
+                .as_mut()
+                .ok_or_else(|| "active hardware transport unavailable".to_string())
+                .and_then(|hardware| {
+                    super::block_controller_sim::run_owned_root(
+                        hardware,
+                        max_frame.min(u32::MAX as usize) as u32,
+                        requested_queries,
+                        next_var_by_current,
+                        query_template,
+                    )
+                });
+            if result.is_err() {
+                // A failed command also means a shared service lease can no
+                // longer be assumed.  The next safe attempt will reinstall
+                // the exact ranged formula before touching the queue.
+                state.loaded_context = None;
+            }
+            result
+        });
+    match result {
+        Ok(wave) => ResidentBlockRoot::Wave {
+            response: wave.response,
+            keys: wave.keys,
+        },
+        Err(error) => {
+            finish_block_controller_sim(Err(error));
+            ResidentBlockRoot::Disabled
+        }
+    }
 }
 
 /// Let the resident controller select and remove the next BLOCK obligation.
@@ -4183,7 +4474,10 @@ pub fn finish_exact_frame_events(
     exact_push_u64(&mut words, lemmas.1);
     words.push(semantic_ops.len().min(u32::MAX as usize) as u32);
     words.push(
-        capture.initial_obligation_image.len().min(u32::MAX as usize) as u32,
+        capture
+            .initial_obligation_image
+            .len()
+            .min(u32::MAX as usize) as u32,
     );
     words.extend(capture.initial_obligation_image);
     words.push(capture.initial_lemma_image.len().min(u32::MAX as usize) as u32);
@@ -4196,7 +4490,9 @@ pub fn finish_exact_frame_events(
         words.extend(operation);
     }
     words[0] = (words.len() - 1) as u32;
-    let Ok(mut writer) = writer.lock() else { return };
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
     for word in words {
         if writer.write_all(&word.to_le_bytes()).is_err() {
             return;
@@ -4302,21 +4598,14 @@ pub fn finish_exact_block_progress(
         if captured {
             words.push(step.obligation_patch.prefix);
             words.push(step.obligation_patch.suffix);
-            words.push(
-                step.obligation_patch
-                    .append
-                    .len()
-                    .min(u32::MAX as usize) as u32,
-            );
+            words.push(step.obligation_patch.append.len().min(u32::MAX as usize) as u32);
             words.extend(step.obligation_patch.append);
             match step.lemma_patch {
                 Some(patch) => {
                     words.push(1);
                     words.push(patch.prefix);
                     words.push(patch.suffix);
-                    words.push(
-                        patch.append.len().min(u32::MAX as usize) as u32,
-                    );
+                    words.push(patch.append.len().min(u32::MAX as usize) as u32);
                     words.extend(patch.append);
                 }
                 None => words.push(0),
@@ -4961,7 +5250,10 @@ fn deterministic_active_failure(error: &HardwareError) -> bool {
 }
 
 fn active_failure_is_capacity(error: &HardwareError) -> bool {
-    matches!(error, HardwareError::Capacity | HardwareError::Command(-103))
+    matches!(
+        error,
+        HardwareError::Capacity | HardwareError::Command(-103)
+    )
 }
 
 fn disable_active_hardware(error: &HardwareError) {
@@ -5597,8 +5889,7 @@ pub fn solve_active_batch_with_min(
                     // still rechecks the process-lifetime union arena, which
                     // can be larger after switching between context groups.
                     words.saturating_add(
-                        ARENA_VIEW_PREFIX_WORDS
-                            + QUALIFIED_ARENA_MAX_CLAUSES.div_ceil(32),
+                        ARENA_VIEW_PREFIX_WORDS + QUALIFIED_ARENA_MAX_CLAUSES.div_ceil(32),
                     )
                 } else {
                     words
@@ -5657,11 +5948,10 @@ pub fn solve_active_batch_with_min(
     }
     ACTIVE_OFFERED_PASSES.fetch_add(1, Ordering::Relaxed);
     ACTIVE_OFFERED.fetch_add(planned_count as u64, Ordering::Relaxed);
-    let retain_exact_result = trace_only
-        && std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some();
-    let reference_cpu = compare_cpu.then(|| {
-        measure_reference_cpu(&requests, &planned, paired, retain_exact_result)
-    });
+    let retain_exact_result =
+        trace_only && std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some();
+    let reference_cpu = compare_cpu
+        .then(|| measure_reference_cpu(&requests, &planned, paired, retain_exact_result));
     if let Some(cpu) = reference_cpu.as_ref() {
         PAIRED_BASELINE_CPU_NS.fetch_add(
             cpu.iter().map(|work| work.elapsed_ns).sum(),
@@ -5871,15 +6161,9 @@ pub fn solve_active_batch_with_min(
                             // error for every inquiry already packed in the
                             // frontier batch.
                             if active_failure_is_capacity(&error) {
-                                ACTIVE_UNKNOWN.fetch_add(
-                                    (end - start) as u64,
-                                    Ordering::Relaxed,
-                                );
+                                ACTIVE_UNKNOWN.fetch_add((end - start) as u64, Ordering::Relaxed);
                             } else {
-                                ACTIVE_ERROR.fetch_add(
-                                    (end - start) as u64,
-                                    Ordering::Relaxed,
-                                );
+                                ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
                             }
                             disable_active_hardware(&error);
                             break 'groups;
@@ -5970,9 +6254,7 @@ pub fn solve_active_batch_with_min(
             }
             match result {
                 Ok(results) => {
-                    for ((index, _, _), result) in
-                        group.pending[start..end].iter().zip(results)
-                    {
+                    for ((index, _, _), result) in group.pending[start..end].iter().zip(results) {
                         match &result {
                             IncrementalResult::Sat { .. } => {
                                 ACTIVE_HW_SAT.fetch_add(1, Ordering::Relaxed);
@@ -6611,8 +6893,9 @@ pub fn flush_and_report() {
         // interleaved at a write boundary and is not a reliable qualification
         // record. The matrix runner aggregates one compact line per selected
         // FPGA worker.
+        let (root_waves, root_work, root_service_ns) = super::block_controller_sim::root_metrics();
         let qualification = format!(
-            "inductor-cdcl: qualification worker={} transport_attempted={} transport_unavailable={} hardware_disabled={} disable_count={} candidates={} batches={} hw_sat={} hw_unsat={} hw_unknown={} hw_errors={} batch_service_ms={:.3} mic_service_ms={:.3}\n",
+            "inductor-cdcl: qualification worker={} transport_attempted={} transport_unavailable={} hardware_disabled={} disable_count={} candidates={} batches={} hw_sat={} hw_unsat={} hw_unknown={} hw_errors={} batch_service_ms={:.3} mic_service_ms={:.3} root_waves={} root_work={} root_service_ms={:.3}\n",
             std::env::var("INDUCTOR_CDCL_PORTFOLIO_WORKER")
                 .unwrap_or_else(|_| "standalone".to_string()),
             ACTIVE_INIT_NS.load(Ordering::Relaxed) != 0,
@@ -6627,6 +6910,9 @@ pub fn flush_and_report() {
             ACTIVE_ERROR.load(Ordering::Relaxed),
             ACTIVE_BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_MIC_CHAIN_CLIENT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            root_waves,
+            root_work,
+            root_service_ns as f64 / 1_000_000.0,
         );
         let _ = std::io::stderr().lock().write_all(qualification.as_bytes());
         let kernel_ns = direct_kernel_ns();
@@ -6775,10 +7061,8 @@ pub fn flush_and_report() {
             hw_rejected.saturating_sub(block_rejected),
         );
         if shared_domain_projection_enabled() {
-            let projected_queries =
-                ACTIVE_SHARED_DOMAIN_PROJECTED_QUERIES.load(Ordering::Relaxed);
-            let projected_batches =
-                ACTIVE_SHARED_DOMAIN_PROJECTED_BATCHES.load(Ordering::Relaxed);
+            let projected_queries = ACTIVE_SHARED_DOMAIN_PROJECTED_QUERIES.load(Ordering::Relaxed);
+            let projected_batches = ACTIVE_SHARED_DOMAIN_PROJECTED_BATCHES.load(Ordering::Relaxed);
             eprintln!(
                 "inductor-cdcl: shared-domain ABI projection queries/batches/fill {}/{}/{:.3}, repeated request words removed {} (planning only; production wire unchanged)",
                 projected_queries,
@@ -7064,7 +7348,9 @@ mod tests {
     fn deterministic_device_failures_trip_the_solver_run_circuit_breaker() {
         assert!(deterministic_active_failure(&HardwareError::Capacity));
         for status in -104..=-101 {
-            assert!(deterministic_active_failure(&HardwareError::Command(status)));
+            assert!(deterministic_active_failure(&HardwareError::Command(
+                status
+            )));
         }
         assert!(deterministic_active_failure(&HardwareError::Decode(
             BatchDecodeError::Backend(1),
@@ -7424,11 +7710,7 @@ mod tests {
         let b = Lit::new(Var::from(1), true);
         let context = |literal, frame| ShadowContext {
             n_var: 2,
-            clauses: vec![ResidentClause::new(
-                0,
-                u32::MAX,
-                LitVec::from([literal]),
-            )],
+            clauses: vec![ResidentClause::new(0, u32::MAX, LitVec::from([literal]))],
             scope: ShadowContextScope::ExactFrame(frame),
         };
         let first_context = context(a, 3);
@@ -7531,8 +7813,7 @@ mod tests {
             },
         ];
         let (plain, plain_capacity) = pack_batch_request(&queries, false).unwrap();
-        let (arena, arena_capacity) =
-            pack_arena_batch_request(&queries, &views, false).unwrap();
+        let (arena, arena_capacity) = pack_arena_batch_request(&queries, &views, false).unwrap();
         let first_words = query_request_words(&queries[0]).unwrap();
         let second_words = query_request_words(&queries[1]).unwrap();
 

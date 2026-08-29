@@ -1,9 +1,6 @@
 use crate::ic3::{
     IC3,
-    frame::{
-        BlockLemmaMutation, begin_block_lemma_journal,
-        finish_block_lemma_journal,
-    },
+    frame::{BlockLemmaMutation, begin_block_lemma_journal, finish_block_lemma_journal},
     mab::branch_act,
     mic::{DropVarParameter, MicType},
     proofoblig::ProofObligation,
@@ -15,8 +12,8 @@ use rand::seq::SliceRandom;
 use std::{collections::VecDeque, time::Instant};
 
 use crate::{
-    accel::cdcl_host::ActivePreflight,
-    gipsat::{IncrementalQuery, IncrementalResult},
+    accel::{cdcl::BlockRootExecutionStatus, cdcl_host::ActivePreflight},
+    gipsat::{IncrementalQuery, IncrementalResult, decode_batch_results},
 };
 
 #[derive(Clone)]
@@ -55,17 +52,12 @@ impl PendingBlockBatch {
             .and_then(|handle| handle.join().ok())
             .unwrap_or_else(|| {
                 vec![
-                    IncrementalResult::Unknown(
-                        crate::accel::cdcl::UnknownReason::BackendError,
-                    );
+                    IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::BackendError,);
                     n_hardware
                 ]
             });
         crate::accel::cdcl_host::note_active_block_async_harvest(
-            self.launched_at
-                .elapsed()
-                .as_nanos()
-                .min(u64::MAX as u128) as u64,
+            self.launched_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
             wait_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
         );
         for (index, result) in self.hardware_indices.iter().copied().zip(results) {
@@ -405,9 +397,7 @@ impl BlockAccelPolicy {
     fn representative_ns(samples: impl Iterator<Item = u64>) -> Option<u64> {
         let mut samples: Vec<_> = samples.collect();
         samples.sort_unstable();
-        samples
-            .get(samples.len().saturating_sub(1) / 2)
-            .copied()
+        samples.get(samples.len().saturating_sub(1) / 2).copied()
     }
 
     fn representative_cpu_ns(&mut self, min_samples: usize) -> Option<u64> {
@@ -527,11 +517,7 @@ impl BlockAccelPolicy {
         let (_, service_per_batch_ns, _) = self
             .hardware_batch_ns_scratch
             .select_nth_unstable(batch_index);
-        let query_index = self
-            .hardware_batch_queries_scratch
-            .len()
-            .saturating_sub(1)
-            / 2;
+        let query_index = self.hardware_batch_queries_scratch.len().saturating_sub(1) / 2;
         let (_, queries_per_batch, _) = self
             .hardware_batch_queries_scratch
             .select_nth_unstable(query_index);
@@ -543,20 +529,16 @@ impl BlockAccelPolicy {
         let conclusive_index = conclusive_distribution.len().saturating_sub(1) / 2;
         let (_, conclusive_percent, _) =
             conclusive_distribution.select_nth_unstable(conclusive_index);
-        projected_cpu_ns = projected_cpu_ns
-            .saturating_mul(*conclusive_percent)
-            / 100;
+        projected_cpu_ns = projected_cpu_ns.saturating_mul(*conclusive_percent) / 100;
         let estimated_batches = n_candidates.div_ceil((*queries_per_batch).max(1));
-        let projected_hardware_ns = service_per_batch_ns
-            .saturating_mul(estimated_batches as u64);
+        let projected_hardware_ns = service_per_batch_ns.saturating_mul(estimated_batches as u64);
         let required_speedup = if self.batch_route_profitable == Some(true) {
             disable_speedup_pct.min(enable_speedup_pct)
         } else {
             enable_speedup_pct
         };
         let profitable = u128::from(projected_cpu_ns).saturating_mul(100)
-            >= u128::from(projected_hardware_ns)
-                .saturating_mul(u128::from(required_speedup));
+            >= u128::from(projected_hardware_ns).saturating_mul(u128::from(required_speedup));
         self.batch_route_profitable = Some(profitable);
         let decision = if profitable {
             BatchRouteDecision::Offload
@@ -618,8 +600,7 @@ impl BlockAccelPolicy {
     }
 
     fn should_offload_at(&self, resample_interval: usize) -> bool {
-        self.hardware_since_sample < resample_interval
-            && self.calibration_profitable == Some(true)
+        self.hardware_since_sample < resample_interval && self.calibration_profitable == Some(true)
     }
 
     fn needs_calibration(&self) -> bool {
@@ -629,26 +610,15 @@ impl BlockAccelPolicy {
     fn note_calibration(&mut self, elapsed_ns: u64) -> bool {
         let above_threshold = elapsed_ns >= Self::min_cpu_ns();
         let before = self.calibration_profitable;
-        let profitable = self.note_calibration_at(
-            elapsed_ns,
-            Self::calibration_samples(),
-            Self::min_cpu_ns(),
-        );
-        crate::accel::cdcl_host::note_active_block_calibration(
-            above_threshold,
-            elapsed_ns,
-        );
+        let profitable =
+            self.note_calibration_at(elapsed_ns, Self::calibration_samples(), Self::min_cpu_ns());
+        crate::accel::cdcl_host::note_active_block_calibration(above_threshold, elapsed_ns);
         if before != self.calibration_profitable
             && let Some(enabled) = self.calibration_profitable
         {
-            let representative = Self::representative_ns(
-                self.calibration_samples_ns.iter().copied(),
-            )
-            .unwrap_or(0);
-            crate::accel::cdcl_host::note_active_block_route_observation(
-                representative,
-                enabled,
-            );
+            let representative =
+                Self::representative_ns(self.calibration_samples_ns.iter().copied()).unwrap_or(0);
+            crate::accel::cdcl_host::note_active_block_route_observation(representative, enabled);
             crate::accel::cdcl_host::note_active_block_route_decision(enabled);
         }
         profitable
@@ -663,13 +633,9 @@ impl BlockAccelPolicy {
             Self::min_cpu_ns(),
             Self::disable_cpu_ns(),
         );
-        if let (Some(representative), Some(enabled)) =
-            (representative, self.calibration_profitable)
+        if let (Some(representative), Some(enabled)) = (representative, self.calibration_profitable)
         {
-            crate::accel::cdcl_host::note_active_block_route_observation(
-                representative,
-                enabled,
-            );
+            crate::accel::cdcl_host::note_active_block_route_observation(representative, enabled);
         }
         if before != self.calibration_profitable
             && let Some(enabled) = self.calibration_profitable
@@ -688,10 +654,9 @@ impl BlockAccelPolicy {
         if self.calibration_profitable.is_none() {
             self.calibration_samples_ns.push(elapsed_ns);
             if self.calibration_samples_ns.len() >= required_samples.max(1) {
-                let representative = Self::representative_ns(
-                    self.calibration_samples_ns.iter().copied(),
-                )
-                .unwrap_or(0);
+                let representative =
+                    Self::representative_ns(self.calibration_samples_ns.iter().copied())
+                        .unwrap_or(0);
                 self.calibration_profitable = Some(representative >= enable_ns);
             }
         }
@@ -836,17 +801,7 @@ mod block_accel_policy_tests {
         }
         assert_eq!(
             aggregate
-                .batch_route_at(
-                    64,
-                    8,
-                    8,
-                    4_000_000,
-                    10_000_000,
-                    50_000,
-                    125,
-                    105,
-                    256,
-                )
+                .batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256,)
                 .decision,
             BatchRouteDecision::Probe,
         );
@@ -857,17 +812,7 @@ mod block_accel_policy_tests {
         }
         assert_eq!(
             cheap
-                .batch_route_at(
-                    64,
-                    8,
-                    8,
-                    4_000_000,
-                    10_000_000,
-                    50_000,
-                    125,
-                    105,
-                    256,
-                )
+                .batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256,)
                 .decision,
             BatchRouteDecision::Reject,
         );
@@ -878,17 +823,7 @@ mod block_accel_policy_tests {
         }
         assert_eq!(
             cheap_but_numerous
-                .batch_route_at(
-                    64,
-                    8,
-                    8,
-                    2_000_000,
-                    10_000_000,
-                    50_000,
-                    125,
-                    105,
-                    256,
-                )
+                .batch_route_at(64, 8, 8, 2_000_000, 10_000_000, 50_000, 125, 105, 256,)
                 .decision,
             BatchRouteDecision::Reject,
         );
@@ -904,17 +839,7 @@ mod block_accel_policy_tests {
         // A 64-query frontier therefore predicts 12.8 ms CPU versus 8 ms FPGA.
         profitable.note_hardware_batch(32, 2, 4_000_000, 32);
         let evaluation =
-            profitable.batch_route_at(
-                64,
-                8,
-                8,
-                4_000_000,
-                10_000_000,
-                50_000,
-                125,
-                105,
-                256,
-            );
+            profitable.batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256);
         assert_eq!(evaluation.decision, BatchRouteDecision::Offload);
         assert_eq!(evaluation.projected_cpu_ns, 12_800_000);
         assert_eq!(evaluation.projected_hardware_ns, Some(8_000_000));
@@ -925,17 +850,7 @@ mod block_accel_policy_tests {
         }
         all_unknown.note_hardware_batch(32, 2, 4_000_000, 0);
         let unknown_evaluation =
-            all_unknown.batch_route_at(
-                64,
-                8,
-                8,
-                4_000_000,
-                10_000_000,
-                50_000,
-                125,
-                105,
-                256,
-            );
+            all_unknown.batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256);
         assert_eq!(unknown_evaluation.decision, BatchRouteDecision::Reject);
         assert_eq!(unknown_evaluation.projected_cpu_ns, 0);
 
@@ -946,17 +861,7 @@ mod block_accel_policy_tests {
         failed_probe.note_hardware_batch(0, 0, 0, 0);
         assert_eq!(
             failed_probe
-                .batch_route_at(
-                    64,
-                    8,
-                    8,
-                    4_000_000,
-                    10_000_000,
-                    50_000,
-                    125,
-                    105,
-                    256,
-                )
+                .batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256,)
                 .decision,
             BatchRouteDecision::Reject,
         );
@@ -967,17 +872,7 @@ mod block_accel_policy_tests {
         }
         slow.note_hardware_batch(64, 1, 5_000_000, 64);
         assert_eq!(
-            slow.batch_route_at(
-                64,
-                8,
-                8,
-                4_000_000,
-                10_000_000,
-                50_000,
-                125,
-                105,
-                256,
-            )
+            slow.batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256,)
                 .decision,
             BatchRouteDecision::Reject,
         );
@@ -985,43 +880,19 @@ mod block_accel_policy_tests {
             slow.note_cpu_at(80_000, 256, 8, 100_000, 75_000);
         }
         assert_eq!(
-            slow.batch_route_at(
-                64,
-                8,
-                8,
-                4_000_000,
-                10_000_000,
-                50_000,
-                125,
-                105,
-                256,
-            )
+            slow.batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256,)
                 .decision,
             BatchRouteDecision::Reject,
         );
         slow.note_cpu_at(80_000, 256, 8, 100_000, 75_000);
         assert_eq!(
-            slow.batch_route_at(
-                64,
-                8,
-                8,
-                4_000_000,
-                10_000_000,
-                50_000,
-                125,
-                105,
-                256,
-            )
+            slow.batch_route_at(64, 8, 8, 4_000_000, 10_000_000, 50_000, 125, 105, 256,)
                 .decision,
             BatchRouteDecision::Probe,
         );
     }
 
-    fn cached_inquiry(
-        frame: usize,
-        lit: Lit,
-        result: IncrementalResult,
-    ) -> CachedBlockInquiry {
+    fn cached_inquiry(frame: usize, lit: Lit, result: IncrementalResult) -> CachedBlockInquiry {
         CachedBlockInquiry {
             frame,
             state: LitOrdVec::new(LitVec::from([lit])),
@@ -1049,23 +920,13 @@ mod block_accel_policy_tests {
         )]);
 
         cache.advance_step();
-        let unrelated = ProofObligation::new(
-            1,
-            LitOrdVec::new(LitVec::from([b])),
-            Vec::new(),
-            0,
-            None,
-        );
+        let unrelated =
+            ProofObligation::new(1, LitOrdVec::new(LitVec::from([b])), Vec::new(), 0, None);
         assert!(cache.take(&unrelated, true).is_none());
 
         cache.advance_step();
-        let original = ProofObligation::new(
-            2,
-            LitOrdVec::new(LitVec::from([a])),
-            Vec::new(),
-            0,
-            None,
-        );
+        let original =
+            ProofObligation::new(2, LitOrdVec::new(LitVec::from([a])), Vec::new(), 0, None);
         let reused = cache.take(&original, true).unwrap();
         assert_eq!(reused.cache_age, 2);
     }
@@ -1114,9 +975,7 @@ mod block_accel_policy_tests {
         assert!(!BlockBatchCache::wavefront_result_eligible(&sat, false));
         assert!(BlockBatchCache::wavefront_result_eligible(&sat, true));
         assert!(BlockBatchCache::wavefront_result_eligible(&unsat, false));
-        assert!(!BlockBatchCache::wavefront_result_eligible(
-            &unknown, false
-        ));
+        assert!(!BlockBatchCache::wavefront_result_eligible(&unknown, false));
     }
 
     #[test]
@@ -1306,9 +1165,11 @@ impl BlockBatchCache {
             }
             inquiry.cached_at = self.epoch;
             inquiry.cache_age = 0;
-            if let Some(index) = self.inquiries.iter().position(|entry| {
-                entry.frame == inquiry.frame && entry.state == inquiry.state
-            }) {
+            if let Some(index) = self
+                .inquiries
+                .iter()
+                .position(|entry| entry.frame == inquiry.frame && entry.state == inquiry.state)
+            {
                 let replaced = self.inquiries.swap_remove(index);
                 if replaced.hardware_selected {
                     crate::accel::cdcl_host::note_active_block_cache_replaced();
@@ -1502,21 +1363,10 @@ impl IC3 {
         let Some(mut mic) = self.solvers[po.frame - 1].inductive_core() else {
             po.frame += 1;
             self.add_obligation(po.clone());
-            note_exact_obligation_op(
-                semantic_ops,
-                BLOCK_SEMANTIC_INSERT_OBLIGATION,
-                &po,
-            );
-            let proved = self.add_lemma(
-                po.frame - 1,
-                po.state.as_litvec().clone(),
-                false,
-                Some(po),
-            );
-            note_exact_lemma_mutations(
-                semantic_ops,
-                finish_block_lemma_journal(),
-            );
+            note_exact_obligation_op(semantic_ops, BLOCK_SEMANTIC_INSERT_OBLIGATION, &po);
+            let proved =
+                self.add_lemma(po.frame - 1, po.state.as_litvec().clone(), false, Some(po));
+            note_exact_lemma_mutations(semantic_ops, finish_block_lemma_journal());
             return proved;
         };
         let original_cube_size = mic.len();
@@ -1529,16 +1379,9 @@ impl IC3 {
         self.statistic.avg_po_cube_len += po.state.len();
         po.push_to(frame);
         self.add_obligation(po.clone());
-        note_exact_obligation_op(
-            semantic_ops,
-            BLOCK_SEMANTIC_INSERT_OBLIGATION,
-            &po,
-        );
+        note_exact_obligation_op(semantic_ops, BLOCK_SEMANTIC_INSERT_OBLIGATION, &po);
         let proved = self.add_lemma(frame - 1, mic.clone(), false, Some(po));
-        note_exact_lemma_mutations(
-            semantic_ops,
-            finish_block_lemma_journal(),
-        );
+        note_exact_lemma_mutations(semantic_ops, finish_block_lemma_journal());
         if proved {
             return true;
         }
@@ -1575,11 +1418,7 @@ impl IC3 {
     ) {
         while let Some(po) = block_wave.pop_front() {
             if !po.removed && !self.obligations.contains(&po) {
-                note_exact_obligation_op(
-                    semantic_ops,
-                    BLOCK_SEMANTIC_INSERT_OBLIGATION,
-                    &po,
-                );
+                note_exact_obligation_op(semantic_ops, BLOCK_SEMANTIC_INSERT_OBLIGATION, &po);
                 self.obligations.add(po);
             }
         }
@@ -1611,10 +1450,7 @@ impl IC3 {
         // MIC traversals. Scope the operation at its implementation boundary
         // so every caller and every early return retains the same exact-replay
         // root for a future resident BLOCK program.
-        let _op = crate::inductor::macro_scope(
-            inductor_trace::Phase::Block,
-            self.level(),
-        );
+        let _op = crate::inductor::macro_scope(inductor_trace::Phase::Block, self.level());
         let mut progress = crate::accel::cdcl_host::exact_block_progress_enabled()
             .then(|| {
                 crate::accel::cdcl_host::begin_exact_block_progress(
@@ -1655,8 +1491,8 @@ impl IC3 {
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
         let mut block_wave = VecDeque::new();
-        let block_wave_enabled = crate::accel::cdcl_host::block_batch_enabled()
-            && BlockBatchCache::wavefront_enabled();
+        let block_wave_enabled =
+            crate::accel::cdcl_host::block_batch_enabled() && BlockBatchCache::wavefront_enabled();
         loop {
             let mut semantic_ops = progress.as_ref().map(|_| Vec::new());
             let mut from_wave = false;
@@ -1680,8 +1516,113 @@ impl IC3 {
                 from_wave = true;
                 break;
             }
+            let mut resident_root_inquiries = None;
+            let mut resident_root_attempted = false;
             let resident_pop = if next.is_none() {
-                crate::accel::cdcl_host::pop_resident_block_obligation(self.level())
+                let root = self.solvers.first().map_or(
+                    crate::accel::cdcl_host::ResidentBlockRoot::Disabled,
+                    |solver| {
+                        let next_var_by_current = solver.resident_block_next_var_map();
+                        let query_template = solver.incremental_inductive_query(&[], false, vec![]);
+                        let resident_solvers = self
+                            .solvers
+                            .iter()
+                            .map(|solver| &solver.dcs)
+                            .collect::<Vec<_>>();
+                        crate::accel::cdcl_host::run_resident_block_root(
+                            self.level(),
+                            BlockBatchCache::window().min(8),
+                            &resident_solvers,
+                            &next_var_by_current,
+                            &query_template,
+                        )
+                    },
+                );
+                match root {
+                    crate::accel::cdcl_host::ResidentBlockRoot::Wave { response, keys } => {
+                        match response.status {
+                            BlockRootExecutionStatus::Ok => {
+                                resident_root_attempted = true;
+                                let current_tag = response.work[0].user_tag();
+                                if response.work.len() == keys.len() {
+                                    let mut prepared = Vec::with_capacity(keys.len());
+                                    let mut queries = Vec::with_capacity(keys.len());
+                                    for (work, key) in response.work.iter().zip(&keys) {
+                                        let Some(candidate) =
+                                            self.obligations.clone_resident_key(key, self.level())
+                                        else {
+                                            prepared.clear();
+                                            queries.clear();
+                                            break;
+                                        };
+                                        if candidate.frame != work.frame as usize
+                                            || candidate.depth != work.depth as usize
+                                            || u32::from(candidate.removed) != work.removed
+                                            || candidate.frame == 0
+                                        {
+                                            prepared.clear();
+                                            queries.clear();
+                                            break;
+                                        }
+                                        let query = self.solvers[candidate.frame - 1]
+                                            .incremental_inductive_query(
+                                                &candidate.state,
+                                                false,
+                                                vec![],
+                                            );
+                                        let revision = self.solvers[candidate.frame - 1]
+                                            .dcs
+                                            .incremental_context_revision();
+                                        queries.push(query.clone());
+                                        prepared.push((candidate, query, revision));
+                                    }
+                                    if prepared.len() == keys.len()
+                                        && let Ok(results) =
+                                            decode_batch_results(&queries, &response.batch)
+                                        && results.len() == prepared.len()
+                                    {
+                                        resident_root_inquiries = Some(
+                                            prepared
+                                                .into_iter()
+                                                .zip(results)
+                                                .map(|((candidate, query, revision), result)| {
+                                                    CachedBlockInquiry {
+                                                        frame: candidate.frame,
+                                                        state: candidate.state.clone(),
+                                                        query,
+                                                        context_revision: revision,
+                                                        result,
+                                                        trusted_cpu: false,
+                                                        hardware_selected: true,
+                                                        cached_at: 0,
+                                                        cache_age: 0,
+                                                    }
+                                                })
+                                                .collect(),
+                                        );
+                                    }
+                                }
+                                crate::accel::cdcl_host::ResidentBlockPop::Selected {
+                                    user_tag: current_tag,
+                                }
+                            }
+                            BlockRootExecutionStatus::CpuHandoff => {
+                                crate::accel::cdcl_host::ResidentBlockPop::Selected {
+                                    user_tag: response.work[0].user_tag(),
+                                }
+                            }
+                            BlockRootExecutionStatus::Empty => {
+                                crate::accel::cdcl_host::ResidentBlockPop::Empty
+                            }
+                            _ => {
+                                crate::accel::cdcl_host::pop_resident_block_obligation(self.level())
+                            }
+                        }
+                    }
+                    crate::accel::cdcl_host::ResidentBlockRoot::Disabled => {
+                        crate::accel::cdcl_host::pop_resident_block_obligation(self.level())
+                    }
+                }
             } else {
                 crate::accel::cdcl_host::ResidentBlockPop::Disabled
             };
@@ -1698,22 +1639,17 @@ impl IC3 {
                     });
                 note_exact_obligation_pop(&mut semantic_ops, self.level(), &po);
                 po
-            } else if matches!(resident_pop, crate::accel::cdcl_host::ResidentBlockPop::Empty) {
-                self.note_exact_block_step(
-                    progress,
-                    BLOCK_STEP_SUCCESS,
-                    semantic_ops,
-                );
+            } else if matches!(
+                resident_pop,
+                crate::accel::cdcl_host::ResidentBlockPop::Empty
+            ) {
+                self.note_exact_block_step(progress, BLOCK_STEP_SUCCESS, semantic_ops);
                 break;
             } else if let Some(po) = self.obligations.pop(self.level()) {
                 note_exact_obligation_pop(&mut semantic_ops, self.level(), &po);
                 po
             } else {
-                self.note_exact_block_step(
-                    progress,
-                    BLOCK_STEP_SUCCESS,
-                    semantic_ops,
-                );
+                self.note_exact_block_step(progress, BLOCK_STEP_SUCCESS, semantic_ops);
                 break;
             };
             if from_wave {
@@ -1721,17 +1657,16 @@ impl IC3 {
             }
             block_batch.advance_step();
             block_batch.harvest_ready();
+            if let Some(inquiries) = resident_root_inquiries.take() {
+                block_batch.insert(inquiries);
+            }
             // Remove a previously speculated answer even when this obligation
             // is discarded by one of the cheap guards below. Otherwise stale
             // entries would prevent the cache from naturally draining.
             let mut cached_block = block_batch.take(&po, true);
             self.render_progress();
             if po.removed {
-                self.note_exact_block_step(
-                    progress,
-                    BLOCK_STEP_DISCARD_REMOVED,
-                    semantic_ops,
-                );
+                self.note_exact_block_step(progress, BLOCK_STEP_DISCARD_REMOVED, semantic_ops);
                 continue;
             }
             if let Some(limit) = limit
@@ -1762,21 +1697,13 @@ impl IC3 {
                         &po,
                     );
                     if self.check_cex_by_bmc(po.depth) {
-                        self.note_exact_block_step(
-                            progress,
-                            BLOCK_STEP_FAILURE,
-                            semantic_ops,
-                        );
+                        self.note_exact_block_step(progress, BLOCK_STEP_FAILURE, semantic_ops);
                         return BlockResult::Failure(po.depth);
                     }
                     self.obligations.clear();
                     note_exact_clear_obligations(&mut semantic_ops);
                     self.frame.clear_po();
-                    self.note_exact_block_step(
-                        progress,
-                        BLOCK_STEP_SUBSUME_CLEAR,
-                        semantic_ops,
-                    );
+                    self.note_exact_block_step(progress, BLOCK_STEP_SUBSUME_CLEAR, semantic_ops);
                     continue;
                 } else if po.frame > 0 {
                     let lemma = po.state.as_litvec();
@@ -1788,11 +1715,7 @@ impl IC3 {
                         BLOCK_SEMANTIC_INSERT_OBLIGATION,
                         &po,
                     );
-                    self.note_exact_block_step(
-                        progress,
-                        BLOCK_STEP_FAILURE,
-                        semantic_ops,
-                    );
+                    self.note_exact_block_step(progress, BLOCK_STEP_FAILURE, semantic_ops);
                     return BlockResult::Failure(po.depth);
                 }
             }
@@ -1806,20 +1729,12 @@ impl IC3 {
                         &po,
                     );
                 }
-                self.note_exact_block_step(
-                    progress,
-                    BLOCK_STEP_TRIVIAL_REQUEUE,
-                    semantic_ops,
-                );
+                self.note_exact_block_step(progress, BLOCK_STEP_TRIVIAL_REQUEUE, semantic_ops);
                 continue;
             }
             po.bump_act();
             if self.cfg.drop_po && po.act > 20.0 {
-                self.note_exact_block_step(
-                    progress,
-                    BLOCK_STEP_DROP_ACTIVITY,
-                    semantic_ops,
-                );
+                self.note_exact_block_step(progress, BLOCK_STEP_DROP_ACTIVITY, semantic_ops);
                 continue;
             }
             let blocked_start = Instant::now();
@@ -1833,8 +1748,7 @@ impl IC3 {
             let needs_calibration = self.block_accel_policy.needs_calibration();
             let direct_cost_eligible =
                 needs_calibration || self.block_accel_policy.should_offload();
-            let batch_economics =
-                crate::accel::cdcl_host::block_batch_economics_enabled();
+            let batch_economics = crate::accel::cdcl_host::block_batch_economics_enabled();
             let batch_plan_eligible = batch_economics
                 && (needs_calibration
                     || (self.block_accel_policy.batch_route_profitable != Some(false)
@@ -1849,8 +1763,7 @@ impl IC3 {
                             BlockAccelPolicy::batch_cpu_cap_ns(),
                             BlockAccelPolicy::batch_probe_min_cpu_ns(),
                         ));
-            let block_cost_eligible =
-                po.frame > 0 && (direct_cost_eligible || batch_plan_eligible);
+            let block_cost_eligible = po.frame > 0 && (direct_cost_eligible || batch_plan_eligible);
             if po.frame > 0
                 && !block_cost_eligible
                 && crate::accel::cdcl_host::block_batch_enabled()
@@ -1858,12 +1771,12 @@ impl IC3 {
                 crate::accel::cdcl_host::note_active_block_cost_rejected();
             }
             if cached_block.is_none()
+                && !resident_root_attempted
                 && block_batch.can_launch()
                 && po.frame > 0
                 && crate::accel::cdcl_host::block_batch_enabled()
                 && block_cost_eligible
-                && self.solvers[po.frame - 1].dcs.num_var()
-                    >= BlockBatchCache::min_context_vars()
+                && self.solvers[po.frame - 1].dcs.num_var() >= BlockBatchCache::min_context_vars()
             {
                 if !BlockBatchCache::async_enabled() && !BlockBatchCache::reuse_enabled() {
                     // The synchronous policy intentionally refreshes the
@@ -1888,8 +1801,7 @@ impl IC3 {
                     if candidate.frame == 0
                         || candidate.frame > self.level()
                         || candidate.removed
-                        || (BlockBatchCache::async_enabled()
-                            || BlockBatchCache::reuse_enabled())
+                        || (BlockBatchCache::async_enabled() || BlockBatchCache::reuse_enabled())
                             && block_batch.contains(candidate.frame, &candidate.state)
                         || candidates
                             .iter()
@@ -1922,8 +1834,7 @@ impl IC3 {
                         sample_solver.classify_incremental_exact(&queries[sample_index]);
                     let sample_ns = sample_start.ns();
                     self.block_accel_policy.note_cpu(sample_ns);
-                    direct_route_profitable =
-                        self.block_accel_policy.note_calibration(sample_ns);
+                    direct_route_profitable = self.block_accel_policy.note_calibration(sample_ns);
                     decisions[sample_index] = match sample_result {
                         IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. } => {
                             ActivePreflight::Conclusive(sample_result)
@@ -1956,14 +1867,11 @@ impl IC3 {
                         if !matches!(decisions[index], ActivePreflight::Fpga) {
                             continue;
                         }
-                        decisions[index] =
-                            crate::accel::cdcl_host::active_preflight_classify(
-                                &mut self.solvers[*frame - 1].dcs,
-                                query,
-                            );
-                        crate::accel::cdcl_host::note_active_block_preflight(
-                            &decisions[index],
+                        decisions[index] = crate::accel::cdcl_host::active_preflight_classify(
+                            &mut self.solvers[*frame - 1].dcs,
+                            query,
                         );
+                        crate::accel::cdcl_host::note_active_block_preflight(&decisions[index]);
                     }
                 }
                 let requests: Vec<_> = candidates
@@ -1987,21 +1895,20 @@ impl IC3 {
                         .iter()
                         .filter(|decision| matches!(decision, ActivePreflight::Fpga))
                         .count();
-                    let route_selected = if selected
-                        >= crate::accel::cdcl_host::active_min_batch_size()
-                    {
-                        let evaluation = self.block_accel_policy.batch_route(selected);
-                        let selected = evaluation.decision != BatchRouteDecision::Reject;
-                        crate::accel::cdcl_host::note_active_block_batch_economics(
-                            evaluation.projected_cpu_ns,
-                            evaluation.projected_hardware_ns,
-                            evaluation.decision == BatchRouteDecision::Probe,
-                            selected,
-                        );
-                        selected
-                    } else {
-                        false
-                    };
+                    let route_selected =
+                        if selected >= crate::accel::cdcl_host::active_min_batch_size() {
+                            let evaluation = self.block_accel_policy.batch_route(selected);
+                            let selected = evaluation.decision != BatchRouteDecision::Reject;
+                            crate::accel::cdcl_host::note_active_block_batch_economics(
+                                evaluation.projected_cpu_ns,
+                                evaluation.projected_hardware_ns,
+                                evaluation.decision == BatchRouteDecision::Probe,
+                                selected,
+                            );
+                            selected
+                        } else {
+                            false
+                        };
                     if !route_selected {
                         for decision in &mut decisions {
                             if matches!(decision, ActivePreflight::Fpga) {
@@ -2067,8 +1974,7 @@ impl IC3 {
                     .collect();
                 let asynchronous = BlockBatchCache::async_enabled()
                     && crate::accel::cdcl_host::active_enabled()
-                    && hardware_indices.len()
-                        >= crate::accel::cdcl_host::active_min_batch_size();
+                    && hardware_indices.len() >= crate::accel::cdcl_host::active_min_batch_size();
                 if asynchronous {
                     let prepare_start = Instant::now();
                     let mut solver_frames = Vec::new();
@@ -2089,10 +1995,8 @@ impl IC3 {
                         };
                         owned_requests.push((solver_index, requests[*index].1.clone()));
                     }
-                    let prepare_ns = prepare_start
-                        .elapsed()
-                        .as_nanos()
-                        .min(u64::MAX as u128) as u64;
+                    let prepare_ns =
+                        prepare_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     crate::accel::cdcl_host::note_active_block_async_launch(prepare_ns);
                     let launched_at = Instant::now();
                     let handle = std::thread::spawn(move || {
@@ -2112,8 +2016,7 @@ impl IC3 {
                         launched_at,
                     });
                 } else {
-                    let service_before =
-                        crate::accel::cdcl_host::active_batch_service_snapshot();
+                    let service_before = crate::accel::cdcl_host::active_batch_service_snapshot();
                     let hardware_results =
                         crate::accel::cdcl_host::solve_active_batch(hardware_requests);
                     let hardware_conclusive = hardware_results
@@ -2121,22 +2024,18 @@ impl IC3 {
                         .filter(|result| {
                             matches!(
                                 result,
-                                IncrementalResult::Sat { .. }
-                                    | IncrementalResult::Unsat { .. }
+                                IncrementalResult::Sat { .. } | IncrementalResult::Unsat { .. }
                             )
                         })
                         .count() as u64;
-                    let service_after =
-                        crate::accel::cdcl_host::active_batch_service_snapshot();
+                    let service_after = crate::accel::cdcl_host::active_batch_service_snapshot();
                     self.block_accel_policy.note_hardware_batch(
                         service_after.1.saturating_sub(service_before.1),
                         service_after.0.saturating_sub(service_before.0),
                         service_after.2.saturating_sub(service_before.2),
                         hardware_conclusive,
                     );
-                    for (index, result) in
-                        hardware_indices.iter().copied().zip(hardware_results)
-                    {
+                    for (index, result) in hardware_indices.iter().copied().zip(hardware_results) {
                         inquiries[index].result = result;
                     }
                     if reserve_wave {
@@ -2232,8 +2131,8 @@ impl IC3 {
                         let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check()
                             && snapshot_fresh
                             && !BlockBatchCache::async_enabled();
-                        let stale_trusted = crate::accel::cdcl_host::active_skip_cpu_check()
-                            && !direct_trust;
+                        let stale_trusted =
+                            crate::accel::cdcl_host::active_skip_cpu_check() && !direct_trust;
                         if direct_trust && entry.cache_age > 0 {
                             crate::accel::cdcl_host::note_active_trusted_sat_revision_reused();
                         }
@@ -2308,11 +2207,7 @@ impl IC3 {
                             )
                         } else {
                             let cpu_core_len = self.solvers[po.frame - 1]
-                                .validate_incremental_unsat_core(
-                                    &po.state,
-                                    &entry.query,
-                                    &core,
-                                );
+                                .validate_incremental_unsat_core(&po.state, &entry.query, &core);
                             (cpu_core_len.is_some(), cpu_core_len.unwrap_or(0))
                         };
                         if direct_trust {
@@ -2392,18 +2287,10 @@ impl IC3 {
                     MicType::from_config(&self.cfg)
                 };
                 if self.generalize(po, mic_type, &mut semantic_ops) {
-                    self.note_exact_block_step(
-                        progress,
-                        BLOCK_STEP_PROVED,
-                        semantic_ops,
-                    );
+                    self.note_exact_block_step(progress, BLOCK_STEP_PROVED, semantic_ops);
                     return BlockResult::Proved;
                 }
-                self.note_exact_block_step(
-                    progress,
-                    BLOCK_STEP_GENERALIZED,
-                    semantic_ops,
-                );
+                self.note_exact_block_step(progress, BLOCK_STEP_GENERALIZED, semantic_ops);
                 debug!("{}", self.frame.statistic(false));
             } else {
                 let (model, inputs) = speculative_pred
@@ -2449,11 +2336,7 @@ impl IC3 {
                         &po,
                     );
                 }
-                self.note_exact_block_step(
-                    progress,
-                    BLOCK_STEP_PREDECESSOR,
-                    semantic_ops,
-                );
+                self.note_exact_block_step(progress, BLOCK_STEP_PREDECESSOR, semantic_ops);
             }
         }
         BlockResult::Success

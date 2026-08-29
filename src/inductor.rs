@@ -201,7 +201,11 @@ pub fn report_solver_fanout(n_solver: usize, per_solver: &[(usize, u64)]) {
     eprintln!(
         "inductor: {n_solver} solvers; lemma clauses {total_cls} total, {mx} in the \
          largest, {:.1} literals each",
-        if total_cls > 0 { total_lits as f64 / total_cls as f64 } else { 0.0 }
+        if total_cls > 0 {
+            total_lits as f64 / total_cls as f64
+        } else {
+            0.0
+        }
     );
 }
 
@@ -300,7 +304,11 @@ pub fn init(model: &str, shape: NetlistShape) -> bool {
     REPLAY_LIMIT.store(replay_n, Ordering::Relaxed);
     let header = Header {
         version: inductor_trace::FORMAT_VERSION,
-        mode: if replay_n > 0 { Mode::Replay } else { Mode::Stats },
+        mode: if replay_n > 0 {
+            Mode::Replay
+        } else {
+            Mode::Stats
+        },
         n_var,
         n_clause,
         n_gate,
@@ -449,7 +457,10 @@ pub fn in_phase<R>(phase: Phase, frame: usize, body: impl FnOnce() -> R) -> R {
 }
 
 fn now_ns() -> u64 {
-    WRITER.get().map(|w| w.lock().unwrap().now_ns()).unwrap_or(0)
+    WRITER
+        .get()
+        .map(|w| w.lock().unwrap().now_ns())
+        .unwrap_or(0)
 }
 
 fn peek_qid() -> u64 {
@@ -844,12 +855,7 @@ impl ThreadCpuTimer {
         self.cpu_ns
             .zip(thread_cpu_time_ns())
             .and_then(|(start, end)| end.checked_sub(start))
-            .unwrap_or_else(|| {
-                self.wall
-                    .elapsed()
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64
-            })
+            .unwrap_or_else(|| self.wall.elapsed().as_nanos().min(u64::MAX as u128) as u64)
     }
 }
 
@@ -891,9 +897,7 @@ impl Timer {
         // reads intentionally; normal runs retain their zero-cost timestamps.
         static SELECT_TIMING: OnceLock<bool> = OnceLock::new();
         let timing = enabled()
-            || *SELECT_TIMING.get_or_init(|| {
-                std::env::var("INDUCTOR_CORE_SELECTIVE").is_ok()
-            });
+            || *SELECT_TIMING.get_or_init(|| std::env::var("INDUCTOR_CORE_SELECTIVE").is_ok());
         Timer(timing.then(Instant::now))
     }
 

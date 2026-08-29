@@ -11,9 +11,9 @@
 //! path on real runs without depending on the card being quick -- at a 6.7 us
 //! round trip against a 7.3 us median query, it will not be for small ones.
 
+mod block_controller_sim;
 pub mod cdcl;
 pub mod cdcl_host;
-mod block_controller_sim;
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,15 +78,36 @@ unsafe extern "C" {
         out_len: *mut u32,
     ) -> i32;
     fn ind_accel_last_call(dom: *mut u32, n: *mut u32);
-    fn ind_accel_down(con_flat: *const u32, n_con_word: u32, assump: *const u32,
-                      n_assump: u32, level: u32, out_core: *mut u32, cap: u32,
-                      out_len: *mut u32) -> i32;
-    fn ind_accel_mic(extra: *const u32, n_extra_word: u32, pairs: *const u32, n_lit: u32,
-                     level: u32, out_cube: *mut u32, cap: u32, out_len: *mut u32) -> i32;
+    fn ind_accel_down(
+        con_flat: *const u32,
+        n_con_word: u32,
+        assump: *const u32,
+        n_assump: u32,
+        level: u32,
+        out_core: *mut u32,
+        cap: u32,
+        out_len: *mut u32,
+    ) -> i32;
+    fn ind_accel_mic(
+        extra: *const u32,
+        n_extra_word: u32,
+        pairs: *const u32,
+        n_lit: u32,
+        level: u32,
+        out_cube: *mut u32,
+        cap: u32,
+        out_len: *mut u32,
+    ) -> i32;
     fn ind_accel_stats_size() -> u64;
     fn ind_accel_set_constraint(flat: *const u32, n_word: u32) -> i32;
-    fn ind_accel_core(assump: *const u32, n: u32, level: u32, out: *mut u32, cap: u32,
-                      out_len: *mut u32) -> i32;
+    fn ind_accel_core(
+        assump: *const u32,
+        n: u32,
+        level: u32,
+        out: *mut u32,
+        cap: u32,
+        out_len: *mut u32,
+    ) -> i32;
     fn ind_accel_get_stats(out: *mut AccelStats);
 }
 
@@ -275,7 +296,9 @@ pub fn init(path: &str, n_var: u32, flat: &[u32]) -> Result<(), String> {
     // not fit, and each wants a different response.
     let r = unsafe { ind_accel_open(c.as_ptr()) };
     if r != 0 {
-        return Err(format!("could not open the device or load {path} (code {r})"));
+        return Err(format!(
+            "could not open the device or load {path} (code {r})"
+        ));
     }
     let r = unsafe { ind_accel_load_netlist(n_var, flat.as_ptr(), flat.len() as u64) };
     if r != 0 {
@@ -367,8 +390,8 @@ pub fn level_arg(frame: u32) -> u32 {
 /// and settled none of 2033 unsat queries.
 pub fn add_lemma(lits: &[u32], lo: u32, hi: u32) -> bool {
     LEMMA_OFFERED.fetch_add(1, Ordering::Relaxed);
-    let ok = ready()
-        && unsafe { ind_accel_add_lemma(lits.as_ptr(), lits.len() as u32, lo, hi) } == 0;
+    let ok =
+        ready() && unsafe { ind_accel_add_lemma(lits.as_ptr(), lits.len() as u32, lo, hi) } == 0;
     if ok {
         LEMMA_TAKEN.fetch_add(1, Ordering::Relaxed);
     }
@@ -442,7 +465,11 @@ pub fn verdict(assump: &[u32], level: u32, got: &mut Vec<u32>) -> Option<bool> {
     if r >= 0 {
         return Some(r == 1);
     }
-    if r == -6 { propagate(assump, level, got) } else { None }
+    if r == -6 {
+        propagate(assump, level, got)
+    } else {
+        None
+    }
 }
 
 /// Refuse to read counters through a layout the library disagrees with.
@@ -519,8 +546,16 @@ pub fn mic(extra: &[u32], pairs: &[u32], level: u32, out: &mut Vec<u32>) -> Opti
     out.resize(n_lit as usize, 0);
     let mut n: u32 = 0;
     let rc = unsafe {
-        ind_accel_mic(extra.as_ptr(), extra.len() as u32, pairs.as_ptr(), n_lit, level,
-                      out.as_mut_ptr(), n_lit, &mut n)
+        ind_accel_mic(
+            extra.as_ptr(),
+            extra.len() as u32,
+            pairs.as_ptr(),
+            n_lit,
+            level,
+            out.as_mut_ptr(),
+            n_lit,
+            &mut n,
+        )
     };
     if rc < 0 {
         return None;
@@ -540,7 +575,16 @@ pub fn have_mic() -> bool {
         let mut o: Vec<u32> = vec![0; 1];
         let mut n: u32 = 0;
         let rc = unsafe {
-            ind_accel_mic(std::ptr::null(), 0, pairs.as_ptr(), 1, 0, o.as_mut_ptr(), 1, &mut n)
+            ind_accel_mic(
+                std::ptr::null(),
+                0,
+                pairs.as_ptr(),
+                1,
+                0,
+                o.as_mut_ptr(),
+                1,
+                &mut n,
+            )
         };
         rc != -2
     })
@@ -597,7 +641,16 @@ pub fn have_down() -> bool {
         // anything else means the mode exists and this query simply did or did
         // not conflict.
         let rc = unsafe {
-            ind_accel_down(std::ptr::null(), 0, a.as_ptr(), 1, 0, o.as_mut_ptr(), 1, &mut n)
+            ind_accel_down(
+                std::ptr::null(),
+                0,
+                a.as_ptr(),
+                1,
+                0,
+                o.as_mut_ptr(),
+                1,
+                &mut n,
+            )
         };
         rc != -2
     })
@@ -611,8 +664,14 @@ pub fn core(assump: &[u32], level: u32, out: &mut Vec<u32>) -> Option<usize> {
     out.resize(assump.len(), 0);
     let mut n: u32 = 0;
     let r = unsafe {
-        ind_accel_core(assump.as_ptr(), assump.len() as u32, level, out.as_mut_ptr(),
-                       out.len() as u32, &mut n)
+        ind_accel_core(
+            assump.as_ptr(),
+            assump.len() as u32,
+            level,
+            out.as_mut_ptr(),
+            out.len() as u32,
+            &mut n,
+        )
     };
     if r <= 0 || n == 0 {
         return None;
@@ -783,9 +842,7 @@ fn core_select_decision(
     // With a zero warm-up, a non-zero learned threshold still needs one real
     // observation. Setting all thresholds to zero intentionally restores
     // ask-every-eligible-query behaviour.
-    if seen < cfg.warmup
-        || (seen == 0 && (cfg.min_unsat_pct != 0 || cfg.min_bcp_ns != 0))
-    {
+    if seen < cfg.warmup || (seen == 0 && (cfg.min_unsat_pct != 0 || cfg.min_bcp_ns != 0)) {
         return CoreSelectDecision::Warmup;
     }
     if unsat.saturating_mul(100) < seen.saturating_mul(cfg.min_unsat_pct) {
@@ -800,37 +857,53 @@ fn core_select_decision(
     if card_seen < cfg.card_warmup {
         return CoreSelectDecision::Selected;
     }
-    if card_hit.saturating_mul(100)
-        < card_seen.saturating_mul(cfg.min_card_hit_pct)
-    {
+    if card_hit.saturating_mul(100) < card_seen.saturating_mul(cfg.min_card_hit_pct) {
         return CoreSelectDecision::LowCardHit;
     }
     CoreSelectDecision::Selected
 }
 
 static CORE_CPU_SEEN: [AtomicU64; CORE_SELECT_BUCKETS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static CORE_CPU_UNSAT: [AtomicU64; CORE_SELECT_BUCKETS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static CORE_CPU_BCP_NS: [AtomicU64; CORE_SELECT_BUCKETS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static CORE_CARD_SEEN: [AtomicU64; CORE_SELECT_BUCKETS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static CORE_CARD_HIT: [AtomicU64; CORE_SELECT_BUCKETS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static CORE_CARD_REJECTED: [AtomicU64; CORE_SELECT_BUCKETS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 pub static CORE_SELECT_OFFERED: AtomicU64 = AtomicU64::new(0);
@@ -986,9 +1059,12 @@ pub fn report() {
             eprintln!(
                 "inductor: constraint {:.1} ms over {} calls, domain {:.1} ms over {}, \
                  core probe {:.1} ms, core minimise {:.1} ms",
-                s.ns_constraint as f64 / 1e6, s.n_constraint,
-                s.ns_domain as f64 / 1e6, s.n_domain,
-                s.ns_core_probe as f64 / 1e6, s.ns_core_min as f64 / 1e6
+                s.ns_constraint as f64 / 1e6,
+                s.n_constraint,
+                s.ns_domain as f64 / 1e6,
+                s.n_domain,
+                s.ns_core_probe as f64 / 1e6,
+                s.ns_core_min as f64 / 1e6
             );
             // A constraint is inserted into slack reserved in the occurrence
             // index. When the slack does not fit, it is rebuilt in instead --
@@ -1001,8 +1077,10 @@ pub fn report() {
                 );
             }
             if s.lem_full_rebuilds > 0 {
-                eprintln!("inductor: {} lemma appends rebuilt the whole index",
-                          s.lem_full_rebuilds);
+                eprintln!(
+                    "inductor: {} lemma appends rebuilt the whole index",
+                    s.lem_full_rebuilds
+                );
             }
             if s.con_full_rebuilds > 0 {
                 eprintln!(
@@ -1015,42 +1093,67 @@ pub fn report() {
             }
         }
         if s.n_down > 0 {
-            eprintln!("inductor: fused down {:.1} ms over {} calls ({:.1} us each)",
-                      s.ns_down as f64 / 1e6, s.n_down,
-                      s.ns_down as f64 / 1e3 / s.n_down as f64);
+            eprintln!(
+                "inductor: fused down {:.1} ms over {} calls ({:.1} us each)",
+                s.ns_down as f64 / 1e6,
+                s.n_down,
+                s.ns_down as f64 / 1e3 / s.n_down as f64
+            );
         }
         if s.n_mic > 0 {
             eprintln!(
                 "inductor: card mic {:.1} ms over {} calls, {} drops tried, {} literals in {} out ({:.2}x smaller)",
-                s.ns_mic as f64 / 1e6, s.n_mic, s.mic_tried, s.mic_in, s.mic_out,
-                if s.mic_out > 0 { s.mic_in as f64 / s.mic_out as f64 } else { 0.0 }
+                s.ns_mic as f64 / 1e6,
+                s.n_mic,
+                s.mic_tried,
+                s.mic_in,
+                s.mic_out,
+                if s.mic_out > 0 {
+                    s.mic_in as f64 / s.mic_out as f64
+                } else {
+                    0.0
+                }
             );
         }
         let cs = CON_SET.load(O::Relaxed);
         if cs > 0 {
-            eprintln!("inductor: constraints set {} times, {} refused by the card",
-                      cs, CON_FAIL.load(O::Relaxed));
+            eprintln!(
+                "inductor: constraints set {} times, {} refused by the card",
+                cs,
+                CON_FAIL.load(O::Relaxed)
+            );
         }
         let mt = MIC_TAKEN.load(O::Relaxed);
         if mt > 0 {
-            eprintln!("inductor: {} cubes started from the card's generalization", mt);
+            eprintln!(
+                "inductor: {} cubes started from the card's generalization",
+                mt
+            );
         }
         let ct = CORE_THIN.load(O::Relaxed);
         if ct > 0 {
-            eprintln!("inductor: {} cores declined for generalizing less than {} literal(s)",
-                      ct, core_gain());
+            eprintln!(
+                "inductor: {} cores declined for generalizing less than {} literal(s)",
+                ct,
+                core_gain()
+            );
         }
         let ca = CORE_ASKED.load(O::Relaxed);
         if ca > 0 {
             let cg = CORE_GOT.load(O::Relaxed);
             eprintln!(
                 "inductor: cores asked {} got {} ({:.1}%), {} used by IC3, {} literals in {} out ({:.2}x smaller)",
-                ca, cg, 100.0 * cg as f64 / ca as f64,
+                ca,
+                cg,
+                100.0 * cg as f64 / ca as f64,
                 CORE_USED.load(O::Relaxed),
-                CORE_IN.load(O::Relaxed), CORE_OUT.load(O::Relaxed),
+                CORE_IN.load(O::Relaxed),
+                CORE_OUT.load(O::Relaxed),
                 if CORE_OUT.load(O::Relaxed) > 0 {
                     CORE_IN.load(O::Relaxed) as f64 / CORE_OUT.load(O::Relaxed) as f64
-                } else { 0.0 }
+                } else {
+                    0.0
+                }
             );
             if !unchecked_core() {
                 eprintln!(
@@ -1073,7 +1176,11 @@ pub fn report() {
                 "inductor: selective core offered {}, selected {} ({:.1}%); rejected short {}, warm-up {}, low-UNSAT {}, cheap-BCP {}, low-card-hit {}",
                 offered,
                 selected,
-                if offered > 0 { 100.0 * selected as f64 / offered as f64 } else { 0.0 },
+                if offered > 0 {
+                    100.0 * selected as f64 / offered as f64
+                } else {
+                    0.0
+                },
                 CORE_SELECT_SHORT.load(O::Relaxed),
                 CORE_SELECT_WARMUP.load(O::Relaxed),
                 CORE_SELECT_LOW_UNSAT.load(O::Relaxed),
@@ -1083,8 +1190,16 @@ pub fn report() {
             eprintln!(
                 "inductor: selective calibration {} CPU queries, {:.1}% UNSAT, mean BCP {:.1} us; thresholds cube >= {}, bucket warm-up {}, UNSAT >= {}%, BCP >= {:.1} us",
                 seen,
-                if seen > 0 { 100.0 * unsat as f64 / seen as f64 } else { 0.0 },
-                if seen > 0 { bcp_ns as f64 / seen as f64 / 1000.0 } else { 0.0 },
+                if seen > 0 {
+                    100.0 * unsat as f64 / seen as f64
+                } else {
+                    0.0
+                },
+                if seen > 0 {
+                    bcp_ns as f64 / seen as f64 / 1000.0
+                } else {
+                    0.0
+                },
                 cfg.min_cube,
                 cfg.warmup,
                 cfg.min_unsat_pct,
@@ -1094,7 +1209,11 @@ pub fn report() {
                 "inductor: selective card calibration {} probes, {} cores ({:.2}%); thresholds card warm-up {}, hit >= {}%, reprobe every {} rejects",
                 card_seen,
                 card_hit,
-                if card_seen > 0 { 100.0 * card_hit as f64 / card_seen as f64 } else { 0.0 },
+                if card_seen > 0 {
+                    100.0 * card_hit as f64 / card_seen as f64
+                } else {
+                    0.0
+                },
                 cfg.card_warmup,
                 cfg.min_card_hit_pct,
                 cfg.reprobe_every,
@@ -1135,7 +1254,11 @@ pub fn report() {
          {} disagree; gate {} chunks, {} lemmas resident, {} visits ({} blocked)",
         s.calls,
         s.conflicts,
-        if s.calls > 0 { s.ns_total as f64 / s.calls as f64 / 1000.0 } else { 0.0 },
+        if s.calls > 0 {
+            s.ns_total as f64 / s.calls as f64 / 1000.0
+        } else {
+            0.0
+        },
         ok,
         bad,
         s.gate_chunks,
@@ -1173,13 +1296,34 @@ mod core_select_tests {
 
     #[test]
     fn selector_applies_all_three_profitability_gates() {
-        assert_eq!(core_select_decision(cfg(), 7, 100, 100, 99_000_000, 2, 2), CoreSelectDecision::Short);
-        assert_eq!(core_select_decision(cfg(), 8, 3, 3, 3_000_000, 2, 2), CoreSelectDecision::Warmup);
-        assert_eq!(core_select_decision(cfg(), 8, 4, 0, 4_000_000, 2, 2), CoreSelectDecision::LowUnsat);
-        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 199_999, 2, 2), CoreSelectDecision::CheapBcp);
-        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 200_000, 0, 0), CoreSelectDecision::Selected);
-        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 200_000, 2, 0), CoreSelectDecision::LowCardHit);
-        assert_eq!(core_select_decision(cfg(), 8, 4, 1, 200_000, 100, 1), CoreSelectDecision::Selected);
+        assert_eq!(
+            core_select_decision(cfg(), 7, 100, 100, 99_000_000, 2, 2),
+            CoreSelectDecision::Short
+        );
+        assert_eq!(
+            core_select_decision(cfg(), 8, 3, 3, 3_000_000, 2, 2),
+            CoreSelectDecision::Warmup
+        );
+        assert_eq!(
+            core_select_decision(cfg(), 8, 4, 0, 4_000_000, 2, 2),
+            CoreSelectDecision::LowUnsat
+        );
+        assert_eq!(
+            core_select_decision(cfg(), 8, 4, 1, 199_999, 2, 2),
+            CoreSelectDecision::CheapBcp
+        );
+        assert_eq!(
+            core_select_decision(cfg(), 8, 4, 1, 200_000, 0, 0),
+            CoreSelectDecision::Selected
+        );
+        assert_eq!(
+            core_select_decision(cfg(), 8, 4, 1, 200_000, 2, 0),
+            CoreSelectDecision::LowCardHit
+        );
+        assert_eq!(
+            core_select_decision(cfg(), 8, 4, 1, 200_000, 100, 1),
+            CoreSelectDecision::Selected
+        );
     }
 
     #[test]
@@ -1193,6 +1337,9 @@ mod core_select_tests {
             min_card_hit_pct: 0,
             reprobe_every: 0,
         };
-        assert_eq!(core_select_decision(all, 0, 0, 0, 0, 0, 0), CoreSelectDecision::Selected);
+        assert_eq!(
+            core_select_decision(all, 0, 0, 0, 0, 0, 0),
+            CoreSelectDecision::Selected
+        );
     }
 }

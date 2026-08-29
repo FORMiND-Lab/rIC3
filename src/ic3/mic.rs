@@ -109,8 +109,11 @@ impl MicChainPolicy {
         use std::sync::OnceLock;
         static WINDOW: OnceLock<usize> = OnceLock::new();
         *WINDOW.get_or_init(|| {
-            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_CPU_WINDOW").ok()
-                .and_then(|value| value.parse().ok()).unwrap_or(64).clamp(4, 4096)
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_CPU_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64)
+                .clamp(4, 4096)
         })
     }
 
@@ -118,8 +121,10 @@ impl MicChainPolicy {
         use std::sync::OnceLock;
         static SAMPLES: OnceLock<usize> = OnceLock::new();
         *SAMPLES.get_or_init(|| {
-            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_CPU_SAMPLES").ok()
-                .and_then(|value| value.parse().ok()).unwrap_or(8)
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_CPU_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8)
                 .clamp(1, Self::cpu_window())
         })
     }
@@ -128,8 +133,11 @@ impl MicChainPolicy {
         use std::sync::OnceLock;
         static WINDOW: OnceLock<usize> = OnceLock::new();
         *WINDOW.get_or_init(|| {
-            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_HW_WINDOW").ok()
-                .and_then(|value| value.parse().ok()).unwrap_or(8).clamp(1, 64)
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_HW_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8)
+                .clamp(1, 64)
         })
     }
 
@@ -137,8 +145,10 @@ impl MicChainPolicy {
         use std::sync::OnceLock;
         static SAMPLES: OnceLock<usize> = OnceLock::new();
         *SAMPLES.get_or_init(|| {
-            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_HW_SAMPLES").ok()
-                .and_then(|value| value.parse().ok()).unwrap_or(4)
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_HW_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4)
                 .clamp(1, Self::hardware_window())
         })
     }
@@ -147,8 +157,11 @@ impl MicChainPolicy {
         use std::sync::OnceLock;
         static PERCENT: OnceLock<u64> = OnceLock::new();
         *PERCENT.get_or_init(|| {
-            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_SPEEDUP_PCT").ok()
-                .and_then(|value| value.parse().ok()).unwrap_or(125).clamp(100, 10_000)
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_SPEEDUP_PCT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(125)
+                .clamp(100, 10_000)
         })
     }
 
@@ -156,13 +169,20 @@ impl MicChainPolicy {
         use std::sync::OnceLock;
         static MICS: OnceLock<usize> = OnceLock::new();
         *MICS.get_or_init(|| {
-            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_REPROBE_CPU_MICS").ok()
-                .and_then(|value| value.parse().ok()).unwrap_or(2048).clamp(1, 1 << 24)
+            std::env::var("INDUCTOR_CDCL_MIC_CHAIN_REPROBE_CPU_MICS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2048)
+                .clamp(1, 1 << 24)
         })
     }
 
-    fn bucket_index(cube_len: usize) -> usize { cube_len.saturating_sub(2).min(7) }
-    fn residency_index(context_reusable: bool) -> usize { usize::from(context_reusable) }
+    fn bucket_index(cube_len: usize) -> usize {
+        cube_len.saturating_sub(2).min(7)
+    }
+    fn residency_index(context_reusable: bool) -> usize {
+        usize::from(context_reusable)
+    }
 
     fn lower_median(values: impl Iterator<Item = u64>) -> Option<u64> {
         let mut values: Vec<_> = values.collect();
@@ -170,36 +190,57 @@ impl MicChainPolicy {
         values.get(values.len().saturating_sub(1) / 2).copied()
     }
 
-    fn route(&self, cube_len: usize, context_reusable: bool)
-        -> (MicChainRoute, u64, Option<u64>)
-    {
+    fn route(&self, cube_len: usize, context_reusable: bool) -> (MicChainRoute, u64, Option<u64>) {
         if !Self::economics_enabled() {
             return (MicChainRoute::Offload, 0, None);
         }
-        self.route_at(cube_len, context_reusable, Self::min_cpu_samples(),
-            Self::min_hardware_samples(), Self::reprobe_cpu_mics(), Self::speedup_percent())
+        self.route_at(
+            cube_len,
+            context_reusable,
+            Self::min_cpu_samples(),
+            Self::min_hardware_samples(),
+            Self::reprobe_cpu_mics(),
+            Self::speedup_percent(),
+        )
     }
 
-    fn route_at(&self, cube_len: usize, context_reusable: bool, min_cpu_samples: usize,
-        min_hardware_samples: usize, reprobe_cpu_mics: usize, speedup_percent: u64)
-        -> (MicChainRoute, u64, Option<u64>)
-    {
+    fn route_at(
+        &self,
+        cube_len: usize,
+        context_reusable: bool,
+        min_cpu_samples: usize,
+        min_hardware_samples: usize,
+        reprobe_cpu_mics: usize,
+        speedup_percent: u64,
+    ) -> (MicChainRoute, u64, Option<u64>) {
         let bucket = &self.buckets[Self::bucket_index(cube_len)];
         let Some(cpu_ns) = (bucket.cpu_samples_ns.len() >= min_cpu_samples)
-            .then(|| Self::lower_median(bucket.cpu_samples_ns.iter().copied())).flatten()
-        else { return (MicChainRoute::Reject, 0, None); };
+            .then(|| Self::lower_median(bucket.cpu_samples_ns.iter().copied()))
+            .flatten()
+        else {
+            return (MicChainRoute::Reject, 0, None);
+        };
         let residency = Self::residency_index(context_reusable);
         let samples = &bucket.hardware_samples[residency];
         if samples.len() < min_hardware_samples {
             return (MicChainRoute::Probe, cpu_ns, None);
         }
-        let Some(hardware_ns) = Self::lower_median(samples.iter().map(|s| s.client_ns))
-        else { return (MicChainRoute::Probe, cpu_ns, None); };
-        let replaceable_percent = samples.iter().filter(|s| s.replaceable).count()
-            .saturating_mul(100) / samples.len();
+        let Some(hardware_ns) = Self::lower_median(samples.iter().map(|s| s.client_ns)) else {
+            return (MicChainRoute::Probe, cpu_ns, None);
+        };
+        let replaceable_percent = samples
+            .iter()
+            .filter(|s| s.replaceable)
+            .count()
+            .saturating_mul(100)
+            / samples.len();
         let replaceable_cpu_ns = cpu_ns.saturating_mul(replaceable_percent as u64) / 100;
         if replaceable_cpu_ns.saturating_mul(100) >= hardware_ns.saturating_mul(speedup_percent) {
-            (MicChainRoute::Offload, replaceable_cpu_ns, Some(hardware_ns))
+            (
+                MicChainRoute::Offload,
+                replaceable_cpu_ns,
+                Some(hardware_ns),
+            )
         } else if bucket.cpu_since_probe[residency] >= reprobe_cpu_mics {
             (MicChainRoute::Probe, replaceable_cpu_ns, Some(hardware_ns))
         } else {
@@ -209,22 +250,35 @@ impl MicChainPolicy {
 
     fn note_cpu(&mut self, cube_len: usize, context_reusable: bool, elapsed_ns: u64) {
         let bucket = &mut self.buckets[Self::bucket_index(cube_len)];
-        if bucket.cpu_samples_ns.len() == Self::cpu_window() { bucket.cpu_samples_ns.pop_front(); }
+        if bucket.cpu_samples_ns.len() == Self::cpu_window() {
+            bucket.cpu_samples_ns.pop_front();
+        }
         bucket.cpu_samples_ns.push_back(elapsed_ns);
         let residency = Self::residency_index(context_reusable);
         bucket.cpu_since_probe[residency] = bucket.cpu_since_probe[residency].saturating_add(1);
     }
 
-    fn note_hardware(&mut self, cube_len: usize, context_reusable: bool,
-        client_ns: u64, replaceable: bool)
-    {
+    fn note_hardware(
+        &mut self,
+        cube_len: usize,
+        context_reusable: bool,
+        client_ns: u64,
+        replaceable: bool,
+    ) {
         let bucket = &mut self.buckets[Self::bucket_index(cube_len)];
         let residency = Self::residency_index(context_reusable);
         bucket.cpu_since_probe[residency] = 0;
-        if client_ns == 0 { return; }
+        if client_ns == 0 {
+            return;
+        }
         let samples = &mut bucket.hardware_samples[residency];
-        if samples.len() == Self::hardware_window() { samples.pop_front(); }
-        samples.push_back(MicChainHardwareSample { client_ns, replaceable });
+        if samples.len() == Self::hardware_window() {
+            samples.pop_front();
+        }
+        samples.push_back(MicChainHardwareSample {
+            client_ns,
+            replaceable,
+        });
     }
 }
 
@@ -365,11 +419,11 @@ impl MicBatchPolicy {
                 None,
             );
         }
-        let Some(service_per_query_ns) =
-            Self::lower_median(self.hardware_samples.iter().map(|sample| {
-                sample.service_per_query_ns
-            }))
-        else {
+        let Some(service_per_query_ns) = Self::lower_median(
+            self.hardware_samples
+                .iter()
+                .map(|sample| sample.service_per_query_ns),
+        ) else {
             return (
                 MicBatchRoute::Probe,
                 cpu_per_query_ns.saturating_mul(queries as u64),
@@ -513,8 +567,9 @@ impl IC3 {
     ) {
         debug_assert!(prefetched.proof_neutral);
         let replaceable = match &prefetched.result {
-            IncrementalResult::Sat { model } if !cpu_blocked => self.solvers[frame - 1]
-                .validate_incremental_sat_model(&prefetched.query, model),
+            IncrementalResult::Sat { model } if !cpu_blocked => {
+                self.solvers[frame - 1].validate_incremental_sat_model(&prefetched.query, model)
+            }
             IncrementalResult::Unsat { core, .. } if cpu_blocked => {
                 core_is_assumption_subset(&prefetched.query, core)
             }
@@ -642,8 +697,7 @@ impl IC3 {
                     self.solvers[frame - 1]
                         .trusted_incremental_sat_model_shape(&prefetched.query, model)
                 } else {
-                    self.solvers[frame - 1]
-                        .validate_incremental_sat_model(&prefetched.query, model)
+                    self.solvers[frame - 1].validate_incremental_sat_model(&prefetched.query, model)
                 };
                 if direct_trust {
                     crate::accel::cdcl_host::note_active_trusted_sat(
@@ -684,8 +738,11 @@ impl IC3 {
                         0,
                     )
                 } else {
-                    let cpu_core_len = self.solvers[frame - 1]
-                        .validate_incremental_unsat_core(cube, &prefetched.query, core);
+                    let cpu_core_len = self.solvers[frame - 1].validate_incremental_unsat_core(
+                        cube,
+                        &prefetched.query,
+                        core,
+                    );
                     (cpu_core_len.is_some(), cpu_core_len.unwrap_or(0))
                 };
                 if direct_trust {
@@ -704,10 +761,7 @@ impl IC3 {
                         validation_start.elapsed().as_nanos() as u64,
                     );
                 }
-                crate::accel::cdcl_host::note_active_mic_consumed(
-                    true,
-                    accepted,
-                );
+                crate::accel::cdcl_host::note_active_mic_consumed(true, accepted);
                 accepted.then_some(MicDropAnswer::Blocked)
             }
             IncrementalResult::Unknown(_) => {
@@ -856,31 +910,22 @@ impl IC3 {
                             true
                         } else {
                             let mut verifier = self.solvers[frame - 1].clone();
-                            verifier.inductive_by_propagation(
-                                &ans,
-                                true,
-                                constraint.to_vec(),
-                            )
+                            verifier.inductive_by_propagation(&ans, true, constraint.to_vec())
                         };
                         if validated {
                             if !crate::accel::unchecked_core() {
-                                crate::accel::CORE_VALIDATED.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                crate::accel::CORE_VALIDATED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             crate::accel::CORE_USED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             crate::accel::observe_card_core_query(cube.len(), true);
                             return Some(ans);
                         }
-                        crate::accel::CORE_VALIDATION_FAILED.fetch_add(
-                            1,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    } else {
-                        crate::accel::CORE_THIN
+                        crate::accel::CORE_VALIDATION_FAILED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        crate::accel::CORE_THIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 // The selector learns the probability of a *usable* core, not
@@ -913,9 +958,8 @@ impl IC3 {
                         .with_strengthen()
                         .with_constraint(constraint)
                         .check();
-                    self.mic_batch_policy.note_cpu(
-                        cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    );
+                    self.mic_batch_policy
+                        .note_cpu(cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
                     blocked
                 }
                 None => self
@@ -1052,9 +1096,8 @@ impl IC3 {
                         .with_act_order(false)
                         .with_strengthen()
                         .check();
-                    self.mic_batch_policy.note_cpu(
-                        cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    );
+                    self.mic_batch_policy
+                        .note_cpu(cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
                     blocked
                 }
                 None => self
@@ -1217,7 +1260,8 @@ impl IC3 {
             let context_reusable = crate::accel::cdcl_host::active_mic_chain_context_reusable(
                 &self.solvers[frame - 1].dcs,
             );
-            let (route, projected_cpu_ns, projected_hardware_ns) = self.mic_chain_policy
+            let (route, projected_cpu_ns, projected_hardware_ns) = self
+                .mic_chain_policy
                 .route(mic_chain_input_len, context_reusable);
             crate::accel::cdcl_host::note_active_mic_chain_economics(
                 match route {
@@ -1225,7 +1269,9 @@ impl IC3 {
                     MicChainRoute::Probe => 1,
                     MicChainRoute::Offload => 2,
                 },
-                context_reusable, projected_cpu_ns, projected_hardware_ns,
+                context_reusable,
+                projected_cpu_ns,
+                projected_hardware_ns,
             );
             mic_chain_answered = true;
             if route != MicChainRoute::Offload {
@@ -1235,8 +1281,10 @@ impl IC3 {
             // every returned cube. Its original index is carried to the
             // device, so protecting it does not reorder GipSAT's drop loop.
             if route != MicChainRoute::Reject {
-                let pairs: Vec<_> = cube.iter()
-                    .map(|lit| (*lit, self.tsctx.next(*lit))).collect();
+                let pairs: Vec<_> = cube
+                    .iter()
+                    .map(|lit| (*lit, self.tsctx.next(*lit)))
+                    .collect();
                 if let Some(chain) = crate::accel::cdcl_host::solve_active_mic_chain(
                     &self.solvers[frame - 1].dcs,
                     &pairs,
@@ -1247,103 +1295,106 @@ impl IC3 {
                         && !chain.cube.is_empty()
                         && !self.tsctx.cube_subsume_init(&chain.cube);
                     self.mic_chain_policy.note_hardware(
-                        mic_chain_input_len, chain.context_reused, chain.client_ns,
+                        mic_chain_input_len,
+                        chain.context_reused,
+                        chain.client_ns,
                         chain.complete && candidate_valid,
                     );
                     if route == MicChainRoute::Probe {
                         // Proof-neutral calibration: ignore the candidate.
                     } else if candidate_valid {
-                // A complete chain may legitimately return the input cube:
-                // every attempted drop was SAT. In stable mode we still
-                // re-check once in CPU so a successful complete command can
-                // replace, rather than precede, the CPU literal-by-literal
-                // traversal. After optional stabilisation, enabling
-                // INDUCTOR_CDCL_MIC_CHAIN_SKIP_CPU_CHECK lets this skip the
-                // exact replay.
-                if (chain.complete || chain.cube.len() < cube.len())
-                    && !chain.cube.is_empty()
-                    && !self.tsctx.cube_subsume_init(&chain.cube)
-                {
-                    let mut adopted = false;
-                    if crate::accel::cdcl_host::mic_chain_skip_cpu_check() {
-                        if !chain.cube.is_empty() && !self.tsctx.cube_subsume_init(&chain.cube) {
-                            adopted = true;
-                            mic_chain_adopted = true;
-                            cube = chain.cube.clone();
-                            mic_chain_finished = chain.complete;
-                            if mic_chain_finished {
-                                crate::accel::cdcl_host::note_active_mic_chain_cpu_replaced(
-                                    chain.trials,
+                        // A complete chain may legitimately return the input cube:
+                        // every attempted drop was SAT. In stable mode we still
+                        // re-check once in CPU so a successful complete command can
+                        // replace, rather than precede, the CPU literal-by-literal
+                        // traversal. After optional stabilisation, enabling
+                        // INDUCTOR_CDCL_MIC_CHAIN_SKIP_CPU_CHECK lets this skip the
+                        // exact replay.
+                        if (chain.complete || chain.cube.len() < cube.len())
+                            && !chain.cube.is_empty()
+                            && !self.tsctx.cube_subsume_init(&chain.cube)
+                        {
+                            let mut adopted = false;
+                            if crate::accel::cdcl_host::mic_chain_skip_cpu_check() {
+                                if !chain.cube.is_empty()
+                                    && !self.tsctx.cube_subsume_init(&chain.cube)
+                                {
+                                    adopted = true;
+                                    mic_chain_adopted = true;
+                                    cube = chain.cube.clone();
+                                    mic_chain_finished = chain.complete;
+                                    if mic_chain_finished {
+                                        crate::accel::cdcl_host::note_active_mic_chain_cpu_replaced(
+                                            chain.trials,
+                                        );
+                                    }
+                                    if !mic_chain_finished {
+                                        self.solvers[frame - 1].unset_domain();
+                                        self.solvers[frame - 1].set_domain(
+                                            self.tsctx
+                                                .lits_next(&cube)
+                                                .iter()
+                                                .copied()
+                                                .chain(cube.iter().copied()),
+                                        );
+                                    }
+                                }
+                                crate::accel::cdcl_host::note_active_mic_chain_validation(
+                                    adopted, 0,
                                 );
-                            }
-                            if !mic_chain_finished {
-                                self.solvers[frame - 1].unset_domain();
-                                self.solvers[frame - 1].set_domain(
-                                    self.tsctx
-                                        .lits_next(&cube)
-                                        .iter()
-                                        .copied()
-                                        .chain(cube.iter().copied()),
-                                );
-                            }
-                        }
-                        crate::accel::cdcl_host::note_active_mic_chain_validation(adopted, 0);
-                    } else {
-                        let verify_start = Instant::now();
-                        let blocked = self
-                            .blocked(frame, &chain.cube)
-                            .in_phase(inductor_trace::Phase::Gen)
-                            .with_act_order(false)
-                            .with_strengthen()
-                            .with_constraint(constraint)
-                            .check();
-                        let verify_ns = verify_start
-                            .elapsed()
-                            .as_nanos()
-                            .min(u64::MAX as u128) as u64;
-                        if blocked {
-                            let exact = self.solvers[frame - 1]
-                                .inductive_core()
-                                .unwrap_or_else(|| chain.cube.clone());
-                            let exact = LitVec::from_iter(
-                                cube.iter().filter(|lit| exact.contains(lit)).copied(),
-                            );
-                            if !exact.is_empty() && !self.tsctx.cube_subsume_init(&exact) {
-                                adopted = true;
-                                mic_chain_adopted = true;
-                                cube = exact;
-                                // Once an exact solve proves the result of a
-                                // complete hardware traversal, repeating every
-                                // attempted drop on the CPU cannot improve
-                                // correctness.  Partial traversals still fall
-                                // through to the ordinary loop for the remaining
-                                // minimisation work.
-                                mic_chain_finished = chain.complete;
-                                if mic_chain_finished {
-                                    crate::accel::cdcl_host::note_active_mic_chain_cpu_replaced(
+                            } else {
+                                let verify_start = Instant::now();
+                                let blocked = self
+                                    .blocked(frame, &chain.cube)
+                                    .in_phase(inductor_trace::Phase::Gen)
+                                    .with_act_order(false)
+                                    .with_strengthen()
+                                    .with_constraint(constraint)
+                                    .check();
+                                let verify_ns =
+                                    verify_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                                if blocked {
+                                    let exact = self.solvers[frame - 1]
+                                        .inductive_core()
+                                        .unwrap_or_else(|| chain.cube.clone());
+                                    let exact = LitVec::from_iter(
+                                        cube.iter().filter(|lit| exact.contains(lit)).copied(),
+                                    );
+                                    if !exact.is_empty() && !self.tsctx.cube_subsume_init(&exact) {
+                                        adopted = true;
+                                        mic_chain_adopted = true;
+                                        cube = exact;
+                                        // Once an exact solve proves the result of a
+                                        // complete hardware traversal, repeating every
+                                        // attempted drop on the CPU cannot improve
+                                        // correctness.  Partial traversals still fall
+                                        // through to the ordinary loop for the remaining
+                                        // minimisation work.
+                                        mic_chain_finished = chain.complete;
+                                        if mic_chain_finished {
+                                            crate::accel::cdcl_host::note_active_mic_chain_cpu_replaced(
                                         chain.trials,
                                     );
+                                        }
+                                        if !mic_chain_finished {
+                                            self.solvers[frame - 1].unset_domain();
+                                            self.solvers[frame - 1].set_domain(
+                                                self.tsctx
+                                                    .lits_next(&cube)
+                                                    .iter()
+                                                    .copied()
+                                                    .chain(cube.iter().copied()),
+                                            );
+                                        }
+                                    }
                                 }
-                                if !mic_chain_finished {
-                                    self.solvers[frame - 1].unset_domain();
-                                    self.solvers[frame - 1].set_domain(
-                                        self.tsctx
-                                            .lits_next(&cube)
-                                            .iter()
-                                            .copied()
-                                            .chain(cube.iter().copied()),
-                                    );
-                                }
+                                crate::accel::cdcl_host::note_active_mic_chain_validation(
+                                    adopted, verify_ns,
+                                );
                             }
                         }
-                        crate::accel::cdcl_host::note_active_mic_chain_validation(
-                            adopted,
-                            verify_ns,
-                        );
-                    }
                     }
                 }
-            }
             }
             if route == MicChainRoute::Offload && !mic_chain_adopted {
                 mic_chain_cpu_sample = Some((mic_chain_input_len, context_reusable));
@@ -1352,8 +1403,7 @@ impl IC3 {
         // Cache this once per MIC.  The default CPU path must not repeatedly
         // inspect the environment, clone the parent cube, time queries, or
         // maintain experimental telemetry when the opt-in experiment is off.
-        let mic_batch_enabled = crate::accel::cdcl_host::mic_batch_enabled()
-            && !mic_chain_answered;
+        let mic_batch_enabled = crate::accel::cdcl_host::mic_batch_enabled() && !mic_chain_answered;
         let mut prefetched_parent: Option<LitVec> = None;
         let mut prefetched_wave = Vec::new();
 
@@ -1416,14 +1466,8 @@ impl IC3 {
             }
             if mic_batch_enabled && prefetched_parent.as_ref() != Some(&cube) {
                 self.note_mic_wave_invalidated(&prefetched_wave);
-                prefetched_wave = self.launch_mic_drop_wave(
-                    frame,
-                    &cube,
-                    &keep,
-                    constraint,
-                    parameter.level,
-                    i,
-                );
+                prefetched_wave =
+                    self.launch_mic_drop_wave(frame, &cube, &keep, constraint, parameter.level, i);
                 prefetched_parent = Some(cube.clone());
             }
             let mut removed_cube = cube.clone();
@@ -1483,7 +1527,8 @@ impl IC3 {
         self.note_mic_wave_invalidated(&prefetched_wave);
         if let Some(((cube_len, context_reusable), cpu_started)) = cpu_loop_started {
             let elapsed_ns = cpu_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            self.mic_chain_policy.note_cpu(cube_len, context_reusable, elapsed_ns);
+            self.mic_chain_policy
+                .note_cpu(cube_len, context_reusable, elapsed_ns);
         }
         if parameter.level == 0 {
             self.solvers[frame - 1].unset_domain();
@@ -1513,8 +1558,10 @@ impl IC3 {
 
 #[cfg(test)]
 mod mic_batch_policy_tests {
-    use super::{MicBatchPolicy, MicBatchRoute, MicChainHardwareSample, MicChainPolicy,
-        MicChainRoute, shrink_down_cube_from_model};
+    use super::{
+        MicBatchPolicy, MicBatchRoute, MicChainHardwareSample, MicChainPolicy, MicChainRoute,
+        shrink_down_cube_from_model,
+    };
     use giputils::hash::GHashSet;
     use logicrs::{LitVec, Var};
 
@@ -1529,7 +1576,9 @@ mod mic_batch_policy_tests {
     fn chain_cpu_trained(cube_len: usize) -> MicChainPolicy {
         let mut policy = MicChainPolicy::default();
         let bucket = &mut policy.buckets[MicChainPolicy::bucket_index(cube_len)];
-        for _ in 0..8 { bucket.cpu_samples_ns.push_back(200_000); }
+        for _ in 0..8 {
+            bucket.cpu_samples_ns.push_back(200_000);
+        }
         policy
     }
 
@@ -1537,43 +1586,68 @@ mod mic_batch_policy_tests {
     fn mic_chain_economics_separates_warm_and_cold_contexts() {
         let mut policy = chain_cpu_trained(4);
         for _ in 0..4 {
-            policy.buckets[MicChainPolicy::bucket_index(4)].hardware_samples[0]
-                .push_back(MicChainHardwareSample { client_ns: 1_000_000, replaceable: true });
+            policy.buckets[MicChainPolicy::bucket_index(4)].hardware_samples[0].push_back(
+                MicChainHardwareSample {
+                    client_ns: 1_000_000,
+                    replaceable: true,
+                },
+            );
         }
-        assert_eq!(policy.route_at(4, false, 8, 4, 2048, 125).0, MicChainRoute::Reject);
-        assert_eq!(policy.route_at(4, true, 8, 4, 2048, 125).0, MicChainRoute::Probe);
+        assert_eq!(
+            policy.route_at(4, false, 8, 4, 2048, 125).0,
+            MicChainRoute::Reject
+        );
+        assert_eq!(
+            policy.route_at(4, true, 8, 4, 2048, 125).0,
+            MicChainRoute::Probe
+        );
         for _ in 0..4 {
-            policy.buckets[MicChainPolicy::bucket_index(4)].hardware_samples[1]
-                .push_back(MicChainHardwareSample { client_ns: 100_000, replaceable: true });
+            policy.buckets[MicChainPolicy::bucket_index(4)].hardware_samples[1].push_back(
+                MicChainHardwareSample {
+                    client_ns: 100_000,
+                    replaceable: true,
+                },
+            );
         }
-        assert_eq!(policy.route_at(4, true, 8, 4, 2048, 125),
-            (MicChainRoute::Offload, 200_000, Some(100_000)));
+        assert_eq!(
+            policy.route_at(4, true, 8, 4, 2048, 125),
+            (MicChainRoute::Offload, 200_000, Some(100_000))
+        );
     }
 
     #[test]
     fn mic_chain_economics_charges_incomplete_chains_as_zero_replacement() {
         let mut policy = chain_cpu_trained(3);
         for replaceable in [true, false, false, false] {
-            policy.buckets[MicChainPolicy::bucket_index(3)].hardware_samples[1]
-                .push_back(MicChainHardwareSample { client_ns: 20_000, replaceable });
+            policy.buckets[MicChainPolicy::bucket_index(3)].hardware_samples[1].push_back(
+                MicChainHardwareSample {
+                    client_ns: 20_000,
+                    replaceable,
+                },
+            );
         }
-        assert_eq!(policy.route_at(3, true, 8, 4, 2048, 125),
-            (MicChainRoute::Offload, 50_000, Some(20_000)));
+        assert_eq!(
+            policy.route_at(3, true, 8, 4, 2048, 125),
+            (MicChainRoute::Offload, 50_000, Some(20_000))
+        );
         for sample in &mut policy.buckets[MicChainPolicy::bucket_index(3)].hardware_samples[1] {
             sample.replaceable = false;
         }
-        assert_eq!(policy.route_at(3, true, 8, 4, 2048, 125).0, MicChainRoute::Reject);
+        assert_eq!(
+            policy.route_at(3, true, 8, 4, 2048, 125).0,
+            MicChainRoute::Reject
+        );
         policy.buckets[MicChainPolicy::bucket_index(3)].cpu_since_probe[1] = 2048;
-        assert_eq!(policy.route_at(3, true, 8, 4, 2048, 125).0, MicChainRoute::Probe);
+        assert_eq!(
+            policy.route_at(3, true, 8, 4, 2048, 125).0,
+            MicChainRoute::Probe
+        );
     }
 
     #[test]
     fn mic_batch_economics_probes_once_then_rejects_slow_hardware() {
         let mut policy = cpu_trained();
-        assert_eq!(
-            policy.route_at(16, 8, 1, 4096, 125).0,
-            MicBatchRoute::Probe
-        );
+        assert_eq!(policy.route_at(16, 8, 1, 4096, 125).0, MicBatchRoute::Probe);
         for replaceable in [true; 8].into_iter().chain([false; 8]) {
             policy.note_shadow_result(replaceable);
         }
@@ -1584,10 +1658,7 @@ mod mic_batch_policy_tests {
         assert_eq!(evaluation.2, Some(4_000_000));
 
         policy.cpu_since_probe = 4096;
-        assert_eq!(
-            policy.route_at(16, 8, 1, 4096, 125).0,
-            MicBatchRoute::Probe
-        );
+        assert_eq!(policy.route_at(16, 8, 1, 4096, 125).0, MicBatchRoute::Probe);
     }
 
     #[test]
@@ -1632,9 +1703,7 @@ mod mic_batch_policy_tests {
 
         let keep_b = GHashSet::from_iter([b]);
         assert!(shrink_down_cube_from_model(&cube, &keep_b, &model).is_none());
-        assert!(
-            shrink_down_cube_from_model(&cube, &GHashSet::new(), &[a, !b]).is_none()
-        );
+        assert!(shrink_down_cube_from_model(&cube, &GHashSet::new(), &[a, !b]).is_none());
     }
 
     #[test]
@@ -1644,10 +1713,7 @@ mod mic_batch_policy_tests {
             policy.note_shadow_result(replaceable);
         }
         policy.note_hardware(16, 4_000_000);
-        assert_eq!(
-            policy.route_at(16, 8, 2, 4096, 125).0,
-            MicBatchRoute::Probe
-        );
+        assert_eq!(policy.route_at(16, 8, 2, 4096, 125).0, MicBatchRoute::Probe);
         policy.note_hardware(16, 4_000_000);
         assert_eq!(
             policy.route_at(16, 8, 2, 4096, 125).0,

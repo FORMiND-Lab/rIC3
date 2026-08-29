@@ -14,11 +14,12 @@ use super::{
         BLOCK_SEMANTIC_EVENT_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_INSERT_LEMMA,
         BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED, BLOCK_SEMANTIC_POP_OBLIGATION,
         BLOCK_SEMANTIC_REGISTER_LEMMA, BLOCK_SEMANTIC_REGISTER_STATE_FULL, BLOCK_SEMANTIC_RESET,
-        BLOCK_SEMANTIC_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_STATS, BlockSemanticCommand,
-        BlockSemanticCommandResponse,
+        BLOCK_SEMANTIC_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_STATS, BlockRootExecutionStatus,
+        BlockRootResponse, BlockSemanticCommand, BlockSemanticCommandResponse,
     },
     cdcl_host::HardwareCdcl,
 };
+use crate::gipsat::IncrementalQuery;
 use std::{
     collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
@@ -52,6 +53,11 @@ static MAX_STATE_ARENA: AtomicU64 = AtomicU64::new(0);
 static MAX_INPUT_ARENA: AtomicU64 = AtomicU64::new(0);
 static QUEUE_POPS: AtomicU64 = AtomicU64::new(0);
 static OWNED_QUEUE_POPS: AtomicU64 = AtomicU64::new(0);
+static ROOT_WAVES: AtomicU64 = AtomicU64::new(0);
+static ROOT_WORK: AtomicU64 = AtomicU64::new(0);
+static ROOT_OK: AtomicU64 = AtomicU64::new(0);
+static ROOT_CPU_HANDOFFS: AtomicU64 = AtomicU64::new(0);
+static ROOT_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct Obligation {
@@ -133,6 +139,11 @@ struct ResidentBlockMirror {
     next_user_tag: u64,
     pending_owned_pop: Option<PendingOwnedPop>,
     owned_selection_keys: HashMap<u64, Vec<u32>>,
+}
+
+pub(super) struct OwnedBlockRootWave {
+    pub response: BlockRootResponse,
+    pub keys: Vec<Vec<u32>>,
 }
 
 fn take(words: &[u32], at: &mut usize) -> Result<u32, String> {
@@ -325,10 +336,8 @@ fn issue(
         let response = hardware
             .run_block_semantic_batch(chunk)
             .map_err(|error| error.to_string())?;
-        SERVICE_NS.fetch_add(
-            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        SERVICE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
         BATCHES.fetch_add(1, Ordering::Relaxed);
         COMMANDS.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         MAX_BATCH.fetch_max(chunk.len() as u64, Ordering::Relaxed);
@@ -433,6 +442,122 @@ impl ResidentBlockMirror {
         QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
         OWNED_QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
         Ok(Some(user_tag))
+    }
+
+    fn run_owned_root(
+        &mut self,
+        hardware: &mut HardwareCdcl,
+        max_frame: u32,
+        requested_queries: usize,
+        next_var_by_current: &[u32],
+        query_template: &IncrementalQuery,
+    ) -> Result<OwnedBlockRootWave, String> {
+        if !self.initialized {
+            return Err("resident BLOCK mirror was not rebased".to_string());
+        }
+        if self.pending_owned_pop.is_some() {
+            return Err("resident queue has an unconsumed owned pop".to_string());
+        }
+        let started = Instant::now();
+        let response = hardware
+            .run_block_root(
+                max_frame,
+                requested_queries,
+                next_var_by_current,
+                query_template,
+            )
+            .map_err(|error| format!("resident BLOCK root command failed: {error}"))?;
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        SERVICE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        ROOT_SERVICE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        let mut selections = Vec::with_capacity(response.work.len());
+        for work in &response.work {
+            let user_tag = work.user_tag();
+            let selected = self
+                .obligation_descriptors
+                .iter()
+                .find_map(|(key, descriptors)| {
+                    descriptors
+                        .iter()
+                        .position(|descriptor| {
+                            descriptor.handle == work.descriptor_handle
+                                && descriptor.user_tag == user_tag
+                        })
+                        .map(|position| (key.clone(), position))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "resident root returned unknown handle {} tag {}",
+                        work.descriptor_handle, user_tag,
+                    )
+                })?;
+            selections.push((selected.0, selected.1, user_tag));
+        }
+        if matches!(
+            response.status,
+            BlockRootExecutionStatus::Ok | BlockRootExecutionStatus::CpuHandoff
+        ) {
+            let (key, position, user_tag) = selections
+                .first()
+                .cloned()
+                .ok_or_else(|| "resident root committed without work".to_string())?;
+            let descriptors = self
+                .obligation_descriptors
+                .get_mut(&key)
+                .ok_or_else(|| "resident root selection disappeared".to_string())?;
+            descriptors.swap_remove(position);
+            if descriptors.is_empty() {
+                self.obligation_descriptors.remove(&key);
+            }
+            let work = response.work[0];
+            let (lemma_frame_count, _) = decode_lemmas(&self.lemma_image)?;
+            let semantic = BlockSemanticCommandResponse {
+                found: 1,
+                obligation_count: self
+                    .obligation_descriptors
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    .min(u32::MAX as usize) as u32,
+                lemma_count: self
+                    .lemma_descriptors
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    .min(u32::MAX as usize) as u32,
+                output_handle: work.descriptor_handle,
+                popped_frame: work.frame,
+                popped_depth: work.depth,
+                popped_removed: work.removed,
+                lemma_frame_count,
+                popped_user_tag_lo: work.user_tag_lo,
+                popped_user_tag_hi: work.user_tag_hi,
+                ..BlockSemanticCommandResponse::default()
+            };
+            self.pending_owned_pop = Some(PendingOwnedPop {
+                max_frame,
+                key: key.clone(),
+                response: semantic,
+            });
+            if self.owned_selection_keys.insert(user_tag, key).is_some() {
+                return Err(format!("duplicate resident root selection tag {user_tag}"));
+            }
+            QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
+            OWNED_QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
+        }
+        ROOT_WAVES.fetch_add(1, Ordering::Relaxed);
+        ROOT_WORK.fetch_add(response.work.len() as u64, Ordering::Relaxed);
+        match response.status {
+            BlockRootExecutionStatus::Ok => {
+                ROOT_OK.fetch_add(1, Ordering::Relaxed);
+            }
+            BlockRootExecutionStatus::CpuHandoff => {
+                ROOT_CPU_HANDOFFS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        let keys = selections.into_iter().map(|(key, _, _)| key).collect();
+        Ok(OwnedBlockRootWave { response, keys })
     }
 
     fn take_owned_key(&mut self, user_tag: u64) -> Result<Vec<u32>, String> {
@@ -1091,6 +1216,26 @@ pub(super) fn pop_owned(
         .pop_owned(hardware, max_frame)
 }
 
+pub(super) fn run_owned_root(
+    hardware: &mut HardwareCdcl,
+    max_frame: u32,
+    requested_queries: usize,
+    next_var_by_current: &[u32],
+    query_template: &IncrementalQuery,
+) -> Result<OwnedBlockRootWave, String> {
+    MIRROR
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "resident BLOCK mirror lock poisoned".to_string())?
+        .run_owned_root(
+            hardware,
+            max_frame,
+            requested_queries,
+            next_var_by_current,
+            query_template,
+        )
+}
+
 pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
     MIRROR
         .get_or_init(Default::default)
@@ -1101,7 +1246,7 @@ pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
 
 pub(super) fn report() {
     eprintln!(
-        "inductor-cdcl: live BLOCK controller steps {}, rebases {}, root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}",
+        "inductor-cdcl: live BLOCK controller steps {}, rebases {}, root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
         STEPS.load(Ordering::Relaxed),
         REBASES.load(Ordering::Relaxed),
         ROOT_RECONCILES.load(Ordering::Relaxed),
@@ -1117,5 +1262,18 @@ pub(super) fn report() {
         MAX_INPUT_ARENA.load(Ordering::Relaxed),
         QUEUE_POPS.load(Ordering::Relaxed),
         OWNED_QUEUE_POPS.load(Ordering::Relaxed),
+        ROOT_WAVES.load(Ordering::Relaxed),
+        ROOT_WORK.load(Ordering::Relaxed),
+        ROOT_OK.load(Ordering::Relaxed),
+        ROOT_CPU_HANDOFFS.load(Ordering::Relaxed),
+        ROOT_SERVICE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
     );
+}
+
+pub(super) fn root_metrics() -> (u64, u64, u64) {
+    (
+        ROOT_WAVES.load(Ordering::Relaxed),
+        ROOT_WORK.load(Ordering::Relaxed),
+        ROOT_SERVICE_NS.load(Ordering::Relaxed),
+    )
 }

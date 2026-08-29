@@ -86,10 +86,7 @@ impl TsLift {
             // the external model is independently certified.
             let continue_after = !states.is_empty() && order(iteration, &mut states);
             let previous_len = states.len();
-            states = match self
-                .slv
-                .minimal_premise(&inputs_flatten, &states, &cls)
-            {
+            states = match self.slv.minimal_premise(&inputs_flatten, &states, &cls) {
                 Some(states) => states,
                 None => {
                     self.slv.unset_domain();

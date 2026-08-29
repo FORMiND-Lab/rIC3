@@ -22,15 +22,15 @@ use logicrs::satif::Satif;
 use logicrs::{DagCnf, Lbool, VarAssign, VarRange};
 use logicrs::{Lit, LitSet, LitVec, Var, VarMap};
 use propagate::Watchers;
-use rand::RngExt;
-use rand::{SeedableRng, rngs::SmallRng};
-use simplify::Simplify;
-pub use statistic::SolverStatistic;
 pub use query::{
     BatchDecodeError, IncrementalCdcl, IncrementalQuery, IncrementalResult, QueryBudget,
     decode_batch_results, encoded_domain_words, pack_batch, solve_on_cpu_after_hardware_unknown,
     solve_with_cpu_fallback,
 };
+use rand::RngExt;
+use rand::{SeedableRng, rngs::SmallRng};
+use simplify::Simplify;
+pub use statistic::SolverStatistic;
 use std::iter::empty;
 use std::time::Instant;
 pub use ts::*;
@@ -132,9 +132,7 @@ impl DagCnfSolver {
     /// log. A batched accelerator can keep the former resident and attach the
     /// latter to each query, avoiding a context reload every time IC3 grows a
     /// frame while preserving the exact formula seen by GipSAT.
-    pub fn incremental_resident_partition(
-        &self,
-    ) -> (u32, u32, Vec<LitVec>, Vec<LitVec>) {
+    pub fn incremental_resident_partition(&self) -> (u32, u32, Vec<LitVec>, Vec<LitVec>) {
         (
             self.num_var() as u32,
             self.accel_level,
@@ -209,16 +207,10 @@ impl DagCnfSolver {
         solver
     }
 
-    fn record_solve_time(
-        &mut self,
-        start: Instant,
-        cpu_start: crate::inductor::ThreadCpuTimer,
-    ) {
+    fn record_solve_time(&mut self, start: Instant, cpu_start: crate::inductor::ThreadCpuTimer) {
         let elapsed = start.elapsed();
         self.statistic.avg_solve_time += elapsed;
-        self.solve_time_ns = self
-            .solve_time_ns
-            .saturating_add(cpu_start.ns());
+        self.solve_time_ns = self.solve_time_ns.saturating_add(cpu_start.ns());
         self.solve_time_samples = self.solve_time_samples.saturating_add(1);
     }
 
@@ -258,10 +250,12 @@ impl DagCnfSolver {
                     _ => {
                         self.assign(clause[0], CREF_NONE);
                         let probe_sbcp = crate::inductor::Timer::start();
-        let setup_conflict = self.propagate();
-        crate::inductor::SETUP_BCP_NS
-            .fetch_add(probe_sbcp.ns() as u64, std::sync::atomic::Ordering::Relaxed);
-        if setup_conflict != CREF_NONE {
+                        let setup_conflict = self.propagate();
+                        crate::inductor::SETUP_BCP_NS.fetch_add(
+                            probe_sbcp.ns() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if setup_conflict != CREF_NONE {
                             self.trivial_unsat = true;
                         }
                         CREF_NONE
@@ -453,12 +447,7 @@ impl DagCnfSolver {
         };
 
         let probe_search = crate::inductor::Timer::start();
-        let res = self.search_with_restart(
-            assump,
-            restart_limit,
-            conflict_limit,
-            retain_learnts,
-        );
+        let res = self.search_with_restart(assump, restart_limit, conflict_limit, retain_learnts);
         // Core extraction happens inside the search loop, so subtract it out to
         // leave `t_search` as decide/BCP/conflict-analysis only.
         self.probe.t_search_ns = probe_search.ns().saturating_sub(self.probe.t_core_ns);
@@ -537,7 +526,9 @@ impl DagCnfSolver {
             // than the datapath runs for, and nothing here waits on the answer.
             if crate::accel::batching() {
                 crate::accel::queue_verdict(&raw, res == Some(true));
-            } else if let Some(conflict) = crate::accel::verdict(&raw, crate::accel::level_arg(self.accel_level), &mut got) {
+            } else if let Some(conflict) =
+                crate::accel::verdict(&raw, crate::accel::level_arg(self.accel_level), &mut got)
+            {
                 use std::sync::atomic::Ordering as O;
                 if conflict && res == Some(true) {
                     // The card derived a contradiction from a query the solver
@@ -568,23 +559,21 @@ impl DagCnfSolver {
             if n % 1000 == 0 {
                 let n_lit = (self.dc.num_var() + 1) * 2;
                 let (visits, lits) = self.cdb.lemma_occurrence_visits(&self.trail, n_lit);
-                let (_v, sat, raw, blk) = self.cdb.lemma_blocker_saving(&self.trail, n_lit, |l| {
-                    match self.value.v(l) {
-                        logicrs::Lbool::TRUE => Some(true),
-                        logicrs::Lbool::FALSE => Some(false),
-                        _ => None,
-                    }
-                });
+                let (_v, sat, raw, blk) =
+                    self.cdb
+                        .lemma_blocker_saving(&self.trail, n_lit, |l| match self.value.v(l) {
+                            logicrs::Lbool::TRUE => Some(true),
+                            logicrs::Lbool::FALSE => Some(false),
+                            _ => None,
+                        });
                 crate::inductor::OCC_SAT.fetch_add(sat, O::Relaxed);
                 crate::inductor::OCC_RAW.fetch_add(raw, O::Relaxed);
                 crate::inductor::OCC_BLK.fetch_add(blk, O::Relaxed);
                 crate::inductor::OCC_VISITS.fetch_add(visits, O::Relaxed);
                 crate::inductor::OCC_LITS.fetch_add(lits, O::Relaxed);
                 crate::inductor::OCC_SAMPLES.fetch_add(1, O::Relaxed);
-                crate::inductor::OCC_WATCH.store(
-                    crate::inductor::W_OTHER.load(O::Relaxed),
-                    O::Relaxed,
-                );
+                crate::inductor::OCC_WATCH
+                    .store(crate::inductor::W_OTHER.load(O::Relaxed), O::Relaxed);
             }
         }
         {
@@ -636,11 +625,7 @@ impl DagCnfSolver {
     /// It deliberately stops after BCP: no branching, conflict analysis,
     /// learning or restart. The selective FPGA path runs it on a clone, so a
     /// rejected hardware core cannot perturb the live incremental solver.
-    pub fn conflicts_by_propagation(
-        &mut self,
-        assump: &[Lit],
-        constraint: Vec<LitVec>,
-    ) -> bool {
+    pub fn conflicts_by_propagation(&mut self, assump: &[Lit], constraint: Vec<LitVec>) -> bool {
         self.assump = assump.into();
         self.constraint = constraint.clone();
         if self.trivial_unsat {
@@ -660,10 +645,7 @@ impl DagCnfSolver {
             activated.extend_from_slice(assump);
             let constraint_lits: Vec<Lit> = constraint.iter().flatten().copied().collect();
             if !self.new_round(
-                assump
-                    .iter()
-                    .chain(constraint_lits.iter())
-                    .map(|l| l.var()),
+                assump.iter().chain(constraint_lits.iter()).map(|l| l.var()),
                 constraint,
                 true,
             ) {
@@ -856,12 +838,21 @@ mod propagation_validation_tests {
 
         let mut implication = DagCnfSolver::new(&dc);
         implication.add_clause(&[!a, b]);
-        assert!(implication.clone().conflicts_by_propagation(&[a, !b], vec![]));
-        assert!(!implication.clone().conflicts_by_propagation(&[a, b], vec![]));
-        assert!(implication.clone().conflicts_by_propagation(
-            &[a],
-            vec![LitVec::from([!a])],
-        ));
+        assert!(
+            implication
+                .clone()
+                .conflicts_by_propagation(&[a, !b], vec![])
+        );
+        assert!(
+            !implication
+                .clone()
+                .conflicts_by_propagation(&[a, b], vec![])
+        );
+        assert!(
+            implication
+                .clone()
+                .conflicts_by_propagation(&[a], vec![LitVec::from([!a])],)
+        );
 
         // Globally UNSAT but with no unit propagation at level zero. A
         // validator that branches would prove this; the FPGA proof boundary

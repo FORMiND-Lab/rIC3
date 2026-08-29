@@ -6,8 +6,8 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=INDUCTOR_ACCEL_LIB");
     println!("cargo:rerun-if-env-changed=XRT_ROOT");
-    let lib = std::env::var("INDUCTOR_ACCEL_LIB")
-        .unwrap_or_else(|_| "../../hls/build/hw".to_string());
+    let lib =
+        std::env::var("INDUCTOR_ACCEL_LIB").unwrap_or_else(|_| "../../hls/build/hw".to_string());
     let legacy_accel = std::path::Path::new(&format!("{lib}/libinductor_accel.a")).exists();
     let cdcl_accel = std::path::Path::new(&format!("{lib}/libinductor_cdcl_host.a")).exists();
     if legacy_accel || cdcl_accel {

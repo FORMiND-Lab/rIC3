@@ -53,22 +53,19 @@ pub(super) fn begin_frame_maintenance_journal(enabled: bool) {
 }
 
 pub(super) fn finish_frame_maintenance_journal() -> Vec<Vec<u32>> {
-    FRAME_MAINTENANCE_JOURNAL.with(|journal| {
-        journal.borrow_mut().take().unwrap_or_default()
-    })
+    FRAME_MAINTENANCE_JOURNAL.with(|journal| journal.borrow_mut().take().unwrap_or_default())
 }
 
 pub(super) fn frame_maintenance_journal_enabled() -> bool {
     FRAME_MAINTENANCE_JOURNAL.with(|journal| journal.borrow().is_some())
 }
 
-pub(super) fn note_frame_obligation_mutation(
-    insert: bool,
-    po: &ProofObligation,
-) {
+pub(super) fn note_frame_obligation_mutation(insert: bool, po: &ProofObligation) {
     FRAME_MAINTENANCE_JOURNAL.with(|journal| {
         let mut journal = journal.borrow_mut();
-        let Some(journal) = journal.as_mut() else { return };
+        let Some(journal) = journal.as_mut() else {
+            return;
+        };
         let mut payload = Vec::new();
         payload.push(po.state.len().min(u32::MAX as usize) as u32);
         payload.extend(po.state.iter().map(|lit| u32::from(*lit)));
@@ -104,7 +101,9 @@ pub(super) fn note_frame_clear_obligations() {
 fn note_frame_lemma_mutation(insert: bool, frame: usize, lemma: &LitOrdVec) {
     FRAME_MAINTENANCE_JOURNAL.with(|journal| {
         let mut journal = journal.borrow_mut();
-        let Some(journal) = journal.as_mut() else { return };
+        let Some(journal) = journal.as_mut() else {
+            return;
+        };
         let mut operation = vec![
             if insert {
                 RESIDENT_INSERT_LEMMA
@@ -123,7 +122,9 @@ fn note_frame_lemma_mutation(insert: bool, frame: usize, lemma: &LitOrdVec) {
 fn note_frame_lemma_move(source: usize, destination: usize, lemma: &LitOrdVec) {
     FRAME_MAINTENANCE_JOURNAL.with(|journal| {
         let mut journal = journal.borrow_mut();
-        let Some(journal) = journal.as_mut() else { return };
+        let Some(journal) = journal.as_mut() else {
+            return;
+        };
         let mut operation = vec![
             RESIDENT_MOVE_LEMMA,
             source.min(u32::MAX as usize) as u32,
@@ -600,11 +601,7 @@ impl IC3 {
         assert_eq!(lastf.len() + 1, olen);
         note_frame_lemma_move(last_frame, usize::MAX, &lemma);
         let clause = !lemma.as_litvec();
-        crate::accel::cdcl_host::register_frame_resident_clause(
-            &clause,
-            0,
-            u32::MAX,
-        );
+        crate::accel::cdcl_host::register_frame_resident_clause(&clause, 0, u32::MAX);
         // Mirror at every frame. An infinity lemma holds unconditionally, and
         // every frame solver is a clone of `inf_solver`, so a card that never
         // saw these holds strictly less than the solver it is shadowing. That

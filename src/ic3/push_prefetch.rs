@@ -714,8 +714,8 @@ impl Drop for PushPrefetchCache {
 #[cfg(test)]
 mod tests {
     use super::{
-        result_cacheable, CachedPushInquiry, FinishedPushBatch, PendingPushBatch, PushBatchStat,
-        PushPrefetchCache,
+        CachedPushInquiry, FinishedPushBatch, PendingPushBatch, PushBatchStat, PushPrefetchCache,
+        result_cacheable,
     };
     use crate::{accel::cdcl::UnknownReason, gipsat::IncrementalResult};
     use logicrs::{Lit, LitOrdVec, LitVec, Var};
