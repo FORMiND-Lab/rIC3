@@ -190,6 +190,27 @@ impl ProofObligationQueue {
         (self.obligations.len(), hash)
     }
 
+    /// Canonical word image paired with `progress_snapshot`. The image is
+    /// trace-only input for an independent resident-controller interpreter;
+    /// it is never consumed by the proof algorithm itself.
+    pub fn progress_image(&self) -> Vec<u32> {
+        let mut words = Vec::new();
+        words.push(self.obligations.len().min(u32::MAX as usize) as u32);
+        for po in &self.obligations {
+            words.push(po.frame.min(u32::MAX as usize) as u32);
+            words.push(po.depth.min(u32::MAX as usize) as u32);
+            words.push(u32::from(po.removed));
+            words.push(po.state.len().min(u32::MAX as usize) as u32);
+            words.extend(po.state.iter().map(|lit| u32::from(*lit)));
+            words.push(po.input.len().min(u32::MAX as usize) as u32);
+            for inputs in &po.input {
+                words.push(inputs.len().min(u32::MAX as usize) as u32);
+                words.extend(inputs.iter().map(|lit| u32::from(*lit)));
+            }
+        }
+        words
+    }
+
     pub fn add(&mut self, po: ProofObligation) {
         if self.num.len() <= po.frame {
             self.num.resize(po.frame + 1, 0);

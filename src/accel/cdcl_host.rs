@@ -3504,7 +3504,7 @@ fn measure_reference_cpu(
 // ring model for every query. The server remains the sole SQ producer: it
 // resolves the lease/epoch and assigns a physical lane before constructing the
 // 64-byte ABI-v2 descriptor.
-const EXACT_REPLAY_VERSION: u32 = 5;
+const EXACT_REPLAY_VERSION: u32 = 6;
 const EXACT_REPLAY_BATCH: u32 = 1;
 const EXACT_REPLAY_MIC: u32 = 2;
 const EXACT_REPLAY_BLOCK_PROGRESS_RECORD: u32 = 3;
@@ -3549,13 +3549,25 @@ pub struct ExactBlockProgressCapture {
     frame: u32,
     obligations: (usize, u64),
     lemmas: (usize, u64),
+    obligation_image: Vec<u32>,
+    lemma_image: Vec<u32>,
+    current_obligation_image: Vec<u32>,
+    current_lemma_image: Vec<u32>,
     steps: Vec<ExactBlockProgressStep>,
+}
+
+struct ExactImagePatch {
+    prefix: u32,
+    suffix: u32,
+    append: Vec<u32>,
 }
 
 struct ExactBlockProgressStep {
     event: u32,
     obligations: (usize, u64),
     lemmas: (usize, u64),
+    obligation_patch: ExactImagePatch,
+    lemma_patch: Option<ExactImagePatch>,
 }
 
 fn exact_replay_roots() -> &'static std::sync::Mutex<HashSet<u32>> {
@@ -3858,6 +3870,8 @@ pub fn begin_exact_block_progress(
     frame: usize,
     obligations: (usize, u64),
     lemmas: (usize, u64),
+    obligation_image: Vec<u32>,
+    lemma_image: Vec<u32>,
 ) -> Option<ExactBlockProgressCapture> {
     if std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_none() {
         return None;
@@ -3871,8 +3885,16 @@ pub fn begin_exact_block_progress(
         frame: frame.min(u32::MAX as usize) as u32,
         obligations,
         lemmas,
+        current_obligation_image: obligation_image.clone(),
+        current_lemma_image: lemma_image.clone(),
+        obligation_image,
+        lemma_image,
         steps: Vec::new(),
     })
+}
+
+pub fn exact_block_progress_enabled() -> bool {
+    std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some()
 }
 
 /// Append one algorithm-level instruction to the buffered BLOCK program. The
@@ -3883,12 +3905,38 @@ pub fn note_exact_block_progress_step(
     event: u32,
     obligations: (usize, u64),
     lemmas: (usize, u64),
+    obligation_image: Vec<u32>,
+    lemma_image: Option<Vec<u32>>,
 ) {
     let Some(capture) = capture else { return };
+    fn patch(previous: &mut Vec<u32>, next: Vec<u32>) -> ExactImagePatch {
+        let prefix = previous
+            .iter()
+            .zip(&next)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = previous[prefix..]
+            .iter()
+            .rev()
+            .zip(next[prefix..].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let append = next[prefix..next.len() - suffix].to_vec();
+        *previous = next;
+        ExactImagePatch {
+            prefix: prefix.min(u32::MAX as usize) as u32,
+            suffix: suffix.min(u32::MAX as usize) as u32,
+            append,
+        }
+    }
+    let obligation_patch = patch(&mut capture.current_obligation_image, obligation_image);
+    let lemma_patch = lemma_image.map(|image| patch(&mut capture.current_lemma_image, image));
     capture.steps.push(ExactBlockProgressStep {
         event,
         obligations,
         lemmas,
+        obligation_patch,
+        lemma_patch,
     });
 }
 
@@ -3926,12 +3974,30 @@ pub fn finish_exact_block_progress(
     words.push(lemmas.0.min(u32::MAX as usize) as u32);
     exact_push_u64(&mut words, lemmas.1);
     words.push(capture.steps.len().min(u32::MAX as usize) as u32);
+    words.push(capture.obligation_image.len().min(u32::MAX as usize) as u32);
+    words.extend(capture.obligation_image);
+    words.push(capture.lemma_image.len().min(u32::MAX as usize) as u32);
+    words.extend(capture.lemma_image);
     for step in capture.steps {
         words.push(step.event);
         words.push(step.obligations.0.min(u32::MAX as usize) as u32);
         exact_push_u64(&mut words, step.obligations.1);
         words.push(step.lemmas.0.min(u32::MAX as usize) as u32);
         exact_push_u64(&mut words, step.lemmas.1);
+        words.push(step.obligation_patch.prefix);
+        words.push(step.obligation_patch.suffix);
+        words.push(step.obligation_patch.append.len().min(u32::MAX as usize) as u32);
+        words.extend(step.obligation_patch.append);
+        match step.lemma_patch {
+            Some(patch) => {
+                words.push(1);
+                words.push(patch.prefix);
+                words.push(patch.suffix);
+                words.push(patch.append.len().min(u32::MAX as usize) as u32);
+                words.extend(patch.append);
+            }
+            None => words.push(0),
+        }
     }
     words[0] = (words.len() - 1) as u32;
     let Ok(mut writer) = writer.lock() else {
@@ -6086,8 +6152,10 @@ pub fn flush_and_report() {
             SHADOW_ERROR.load(Ordering::Relaxed),
         );
     }
-    if architecture_trace_enabled() {
-        flush_architecture_trace_writer();
+    if architecture_trace_enabled() || exact_block_progress_enabled() {
+        if architecture_trace_enabled() {
+            flush_architecture_trace_writer();
+        }
         flush_exact_replay_writer();
         eprintln!(
             "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK progress {}, file {}; ranged snapshot fallbacks {}",

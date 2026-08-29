@@ -1458,6 +1458,9 @@ impl IC3 {
             event,
             self.obligations.progress_snapshot(),
             self.frame.progress_snapshot(),
+            self.obligations.progress_image(),
+            matches!(event, BLOCK_STEP_GENERALIZED | BLOCK_STEP_PROVED)
+                .then(|| self.frame.progress_image()),
         );
     }
 
@@ -1470,11 +1473,17 @@ impl IC3 {
             inductor_trace::Phase::Block,
             self.level(),
         );
-        let mut progress = crate::accel::cdcl_host::begin_exact_block_progress(
-            self.level(),
-            self.obligations.progress_snapshot(),
-            self.frame.progress_snapshot(),
-        );
+        let mut progress = crate::accel::cdcl_host::exact_block_progress_enabled()
+            .then(|| {
+                crate::accel::cdcl_host::begin_exact_block_progress(
+                    self.level(),
+                    self.obligations.progress_snapshot(),
+                    self.frame.progress_snapshot(),
+                    self.obligations.progress_image(),
+                    self.frame.progress_image(),
+                )
+            })
+            .flatten();
         let result = self.block_inner(limit, &mut progress);
         let (result_code, result_aux) = match &result {
             BlockResult::Success => (0, 0),

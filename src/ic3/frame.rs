@@ -139,6 +139,27 @@ impl Frames {
         (count, hash)
     }
 
+    /// Canonical word image paired with `progress_snapshot`. Frame indices are
+    /// implicit in vector order; the final section contains infinite-frame
+    /// lemmas. The exact replay interpreter decodes this independently.
+    pub fn progress_image(&self) -> Vec<u32> {
+        let mut words = Vec::new();
+        words.push(self.frames.len().min(u32::MAX as usize) as u32);
+        for frame in &self.frames {
+            words.push(frame.len().min(u32::MAX as usize) as u32);
+            for lemma in frame.iter() {
+                words.push(lemma.len().min(u32::MAX as usize) as u32);
+                words.extend(lemma.iter().map(|lit| u32::from(*lit)));
+            }
+        }
+        words.push(self.inf.len().min(u32::MAX as usize) as u32);
+        for lemma in self.inf.iter() {
+            words.push(lemma.len().min(u32::MAX as usize) as u32);
+            words.extend(lemma.iter().map(|lit| u32::from(*lit)));
+        }
+        words
+    }
+
     pub fn last(&self) -> &Frame {
         self.frames.last().unwrap()
     }
