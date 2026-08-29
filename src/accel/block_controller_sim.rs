@@ -379,6 +379,23 @@ fn multiset<T>(items: &[T], key: impl Fn(&T) -> Vec<u32>) -> HashMap<Vec<u32>, u
 }
 
 impl ResidentBlockMirror {
+    fn has_equivalent_obligation(
+        &self,
+        frame: u32,
+        depth: u32,
+        removed: u32,
+        state: &[u32],
+    ) -> Option<&Vec<u32>> {
+        self.obligation_descriptors.keys().find(|key| {
+            let state_words = key.get(3).copied().unwrap_or(u32::MAX) as usize;
+            key.get(0) == Some(&frame)
+                && key.get(1) == Some(&depth)
+                && key.get(2) == Some(&removed)
+                && state_words == state.len()
+                && key.get(4..4usize.saturating_add(state_words)) == Some(state)
+        })
+    }
+
     fn allocate_user_tag(&mut self) -> u64 {
         self.next_user_tag = self.next_user_tag.wrapping_add(1).max(1);
         self.next_user_tag
@@ -607,6 +624,7 @@ impl ResidentBlockMirror {
         hardware: &mut HardwareCdcl,
         max_frame: u32,
         step_limit: usize,
+        frontier_limit: usize,
         next_var_by_current: &[u32],
         init_value_by_current: &[u32],
         latch_variables: &[u32],
@@ -624,6 +642,7 @@ impl ResidentBlockMirror {
             .run_block_full_root(
                 max_frame,
                 step_limit,
+                frontier_limit,
                 next_var_by_current,
                 init_value_by_current,
                 latch_variables,
@@ -636,7 +655,7 @@ impl ResidentBlockMirror {
         ROOT_SERVICE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
 
         let mut source_keys = Vec::with_capacity(response.events.len());
-        for event in &response.events {
+        for (event_index, event) in response.events.iter().enumerate() {
             match event {
                 BlockFullRootEvent::SatPredecessor {
                     child_tag,
@@ -655,13 +674,53 @@ impl ResidentBlockMirror {
                         return Err("resident SAT journal source tag mismatch".to_string());
                     }
                     source_keys.push(source_key.clone());
-                    self.obligation_descriptors
-                        .entry(source_key)
-                        .or_default()
-                        .push(ResidentObligationDescriptor {
-                            handle: *parent_descriptor_handle,
-                            user_tag: *parent_tag,
-                        });
+                    let source_state_words = source_key
+                        .get(3)
+                        .copied()
+                        .ok_or_else(|| "resident SAT source key is truncated".to_string())?
+                        as usize;
+                    let source_state = source_key
+                        .get(4..4usize.saturating_add(source_state_words))
+                        .ok_or_else(|| "resident SAT source state is truncated".to_string())?;
+                    let parent_duplicate = self.has_equivalent_obligation(
+                        source_key[0],
+                        source_key[1],
+                        source_key[2],
+                        source_state,
+                    );
+                    let child_duplicate =
+                        self.has_equivalent_obligation(*frame, *depth, 0u32, state);
+                    if (*parent_descriptor_handle == u32::MAX) != parent_duplicate.is_some()
+                        || (*child_descriptor_handle == u32::MAX) != child_duplicate.is_some()
+                    {
+                        let matching_tags = child_duplicate
+                            .and_then(|key| self.obligation_descriptors.get(key))
+                            .map(|descriptors| {
+                                descriptors
+                                    .iter()
+                                    .map(|descriptor| descriptor.user_tag)
+                                    .collect::<Vec<_>>()
+                            });
+                        return Err(format!(
+                            "resident SAT device dedup mismatch at event {event_index}: source tag {parent_tag}, parent omitted/duplicate {}/{}, child omitted/duplicate {}/{}, child state {:?}, existing child {:?}, matching tags {:?}",
+                            *parent_descriptor_handle == u32::MAX,
+                            parent_duplicate.is_some(),
+                            *child_descriptor_handle == u32::MAX,
+                            child_duplicate.is_some(),
+                            state,
+                            child_duplicate,
+                            matching_tags,
+                        ));
+                    }
+                    if *parent_descriptor_handle != u32::MAX {
+                        self.obligation_descriptors
+                            .entry(source_key)
+                            .or_default()
+                            .push(ResidentObligationDescriptor {
+                                handle: *parent_descriptor_handle,
+                                user_tag: *parent_tag,
+                            });
+                    }
 
                     let mut payload = Vec::with_capacity(state.len() + input.len() + 3);
                     payload.push(state.len().min(u32::MAX as usize) as u32);
@@ -675,13 +734,15 @@ impl ResidentBlockMirror {
                         .insert(payload.clone(), *child_payload_handle);
                     self.obligation_state_payloads
                         .insert(state.clone(), *child_payload_handle);
-                    self.obligation_descriptors
-                        .entry(child_key)
-                        .or_default()
-                        .push(ResidentObligationDescriptor {
-                            handle: *child_descriptor_handle,
-                            user_tag: *child_tag,
-                        });
+                    if *child_descriptor_handle != u32::MAX {
+                        self.obligation_descriptors
+                            .entry(child_key)
+                            .or_default()
+                            .push(ResidentObligationDescriptor {
+                                handle: *child_descriptor_handle,
+                                user_tag: *child_tag,
+                            });
+                    }
                 }
                 BlockFullRootEvent::UnsatLemma {
                     frame,
@@ -717,8 +778,8 @@ impl ResidentBlockMirror {
                 ));
             }
         }
-        ROOT_WAVES.fetch_add(1, Ordering::Relaxed);
-        ROOT_WORK.fetch_add(response.cdcl_waves as u64, Ordering::Relaxed);
+        ROOT_WAVES.fetch_add(response.cdcl_waves as u64, Ordering::Relaxed);
+        ROOT_WORK.fetch_add(response.cdcl_inquiries as u64, Ordering::Relaxed);
         ROOT_OK.fetch_add(1, Ordering::Relaxed);
         Ok(OwnedBlockFullRootWave {
             response,
@@ -1445,6 +1506,7 @@ pub(super) fn run_owned_full_root(
     hardware: &mut HardwareCdcl,
     max_frame: u32,
     step_limit: usize,
+    frontier_limit: usize,
     next_var_by_current: &[u32],
     init_value_by_current: &[u32],
     latch_variables: &[u32],
@@ -1459,6 +1521,7 @@ pub(super) fn run_owned_full_root(
             hardware,
             max_frame,
             step_limit,
+            frontier_limit,
             next_var_by_current,
             init_value_by_current,
             latch_variables,

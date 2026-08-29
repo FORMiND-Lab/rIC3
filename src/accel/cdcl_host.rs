@@ -1279,6 +1279,7 @@ impl HardwareCdcl {
         &mut self,
         max_frame: u32,
         step_limit: usize,
+        frontier_limit: usize,
         next_var_by_current: &[u32],
         init_value_by_current: &[u32],
         latch_variables: &[u32],
@@ -1306,6 +1307,7 @@ impl HardwareCdcl {
         let request = pack_block_full_root_request(
             max_frame,
             step_limit,
+            frontier_limit,
             next_var_by_current,
             init_value_by_current,
             &domain_words,
@@ -4124,6 +4126,11 @@ pub fn run_resident_block_full_root(
     } else {
         return ResidentBlockFullRoot::Disabled;
     };
+    let frontier_limit = std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_LANES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(crate::accel::cdcl::BLOCK_ROOT_MAX_WORK)
+        .clamp(1, crate::accel::cdcl::BLOCK_ROOT_MAX_WORK);
     let state = active_state().lock();
     let result = state
         .map_err(|_| "active hardware lock poisoned".to_string())
@@ -4176,6 +4183,7 @@ pub fn run_resident_block_full_root(
                         hardware,
                         max_frame.min(u32::MAX as usize) as u32,
                         step_limit,
+                        frontier_limit,
                         next_var_by_current,
                         init_value_by_current,
                         latch_variables,

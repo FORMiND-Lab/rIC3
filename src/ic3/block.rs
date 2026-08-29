@@ -1292,6 +1292,8 @@ impl IC3 {
                 .ok_or_else(|| "resident full-root consumed unknown CPU obligation".to_string())?;
             match event {
                 BlockFullRootEvent::SatPredecessor {
+                    parent_descriptor_handle,
+                    child_descriptor_handle,
                     frame,
                     depth,
                     state,
@@ -1308,13 +1310,28 @@ impl IC3 {
                     let input = decode(input)?;
                     let predecessor = ProofObligation::new(
                         *frame as usize,
-                        LitOrdVec::new(state),
+                        LitOrdVec::new(state.clone()),
                         vec![input],
                         *depth as usize,
                         Some(source.clone()),
                     );
-                    self.add_obligation(source);
-                    self.add_obligation(predecessor);
+                    let parent_inserted = self.add_obligation_if_new(source.clone());
+                    let child_inserted = self.add_obligation_if_new(predecessor);
+                    if parent_inserted != (*parent_descriptor_handle != u32::MAX)
+                        || child_inserted != (*child_descriptor_handle != u32::MAX)
+                    {
+                        return Err(format!(
+                            "resident SAT predecessor deduplication mismatch: parent CPU/device {parent_inserted}/{}, child CPU/device {child_inserted}/{}, source frame/depth/state {}/{}/{:?}, child frame/depth/state {}/{}/{:?}",
+                            *parent_descriptor_handle != u32::MAX,
+                            *child_descriptor_handle != u32::MAX,
+                            source.frame,
+                            source.depth,
+                            source.state,
+                            frame,
+                            depth,
+                            state,
+                        ));
+                    }
                 }
                 BlockFullRootEvent::UnsatLemma { frame, cube, .. } => {
                     if source.frame == 0 || *frame as usize != source.frame {

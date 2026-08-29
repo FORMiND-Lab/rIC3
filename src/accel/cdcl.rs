@@ -125,7 +125,7 @@ pub const BLOCK_ROOT_MAX_WORK: usize = 8;
 pub const BLOCK_ROOT_BATCH_OFFSET: usize =
     BLOCK_ROOT_RESPONSE_HEADER_WORDS + BLOCK_ROOT_MAX_WORK * BLOCK_ROOT_WORK_WORDS;
 
-pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 2;
+pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 3;
 pub const BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS: usize = 12;
 pub const BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS: usize = 10;
 pub const BLOCK_FULL_ROOT_WORK_WORDS: usize = 7;
@@ -336,6 +336,7 @@ pub struct BlockFullRootResponse {
     pub handoff: Option<BlockRootWork>,
     pub events: Vec<BlockFullRootEvent>,
     pub cdcl_waves: u32,
+    pub cdcl_inquiries: u32,
     pub mic_waves: u32,
     pub sat_commits: u32,
     pub unsat_commits: u32,
@@ -361,6 +362,7 @@ pub fn block_full_root_required_response_capacity(
 pub fn pack_block_full_root_request(
     max_frame: u32,
     step_limit: usize,
+    frontier_limit: usize,
     next_var_by_current: &[u32],
     init_value_by_current: &[u32],
     decision_domain: &[u32],
@@ -372,6 +374,8 @@ pub fn pack_block_full_root_request(
 ) -> Option<Vec<u32>> {
     if step_limit == 0
         || step_limit > BLOCK_FULL_ROOT_MAX_STEPS
+        || frontier_limit == 0
+        || frontier_limit > BLOCK_ROOT_MAX_WORK
         || next_var_by_current.is_empty()
         || init_value_by_current.len() != next_var_by_current.len()
         || init_value_by_current.iter().any(|value| *value > 2)
@@ -399,7 +403,7 @@ pub fn pack_block_full_root_request(
         conflict_budget,
         u32::try_from(latch_variables.len()).ok()?,
         u32::try_from(input_variables.len()).ok()?,
-        0,
+        u32::try_from(frontier_limit).ok()?,
         0,
     ]);
     words.extend_from_slice(next_var_by_current);
@@ -412,7 +416,7 @@ pub fn pack_block_full_root_request(
 
 pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootResponse> {
     let header = words.get(..BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS)?;
-    if header[0] != BLOCK_FULL_ROOT_PROTOCOL_VERSION || header[9] != 0 {
+    if header[0] != BLOCK_FULL_ROOT_PROTOCOL_VERSION {
         return None;
     }
     let status = BlockFullRootStatus::from_word(header[1])?;
@@ -518,11 +522,16 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
     if at != words.len() || sat_events != header[6] || unsat_events != header[7] {
         return None;
     }
+    let committed = header[6].checked_add(header[7])?;
+    if committed > header[9] || header[4] > header[9] {
+        return None;
+    }
     Some(BlockFullRootResponse {
         status,
         handoff,
         events,
         cdcl_waves: header[4],
+        cdcl_inquiries: header[9],
         mic_waves: header[5],
         sat_commits: header[6],
         unsat_commits: header[7],
@@ -1159,6 +1168,7 @@ mod tests {
         let request = pack_block_full_root_request(
             3,
             4,
+            2,
             &[4, 6, u32::MAX, u32::MAX],
             &[1, 0, 2, 2],
             &[0x8000_0000, 0x8001_0001, 0x8002_0002, 0x8003_0003],
@@ -1183,7 +1193,7 @@ mod tests {
                 17,
                 2,
                 1,
-                0,
+                2,
                 0,
             ],
         );
@@ -1202,7 +1212,7 @@ mod tests {
             1,
             1,
             33,
-            0,
+            2,
             // CPU handoff work.
             0,
             6,
@@ -1244,6 +1254,7 @@ mod tests {
         assert_eq!(decoded.status, BlockFullRootStatus::CpuHandoff);
         assert_eq!(decoded.handoff.unwrap().user_tag(), 0x8000_0000_0000_0022);
         assert_eq!(decoded.events.len(), 2);
+        assert_eq!(decoded.cdcl_inquiries, 2);
         assert!(matches!(
             &decoded.events[0],
             BlockFullRootEvent::SatPredecessor { state, input, .. }
