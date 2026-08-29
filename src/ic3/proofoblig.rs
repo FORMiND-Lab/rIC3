@@ -100,6 +100,22 @@ impl ProofObligation {
         }
         self.frame = frame;
     }
+
+    fn resident_key(&self) -> Vec<u32> {
+        let mut key = vec![
+            self.frame.min(u32::MAX as usize) as u32,
+            self.depth.min(u32::MAX as usize) as u32,
+            u32::from(self.removed),
+            self.state.len().min(u32::MAX as usize) as u32,
+        ];
+        key.extend(self.state.iter().map(|lit| u32::from(*lit)));
+        key.push(self.input.len().min(u32::MAX as usize) as u32);
+        for inputs in &self.input {
+            key.push(inputs.len().min(u32::MAX as usize) as u32);
+            key.extend(inputs.iter().map(|lit| u32::from(*lit)));
+        }
+        key
+    }
 }
 
 impl Deref for ProofObligation {
@@ -252,6 +268,27 @@ impl ProofObligationQueue {
         }
     }
 
+    /// Simulation bridge for FPGA-owned work scheduling. The controller has
+    /// already removed this descriptor; find the matching CPU proof-chain
+    /// object without imposing the CPU BTreeSet's choice on the device.
+    pub fn take_resident_key(
+        &mut self,
+        key: &[u32],
+        max_frame: usize,
+    ) -> Option<ProofObligation> {
+        let selected = self
+            .obligations
+            .iter()
+            .find(|po| po.frame <= max_frame && po.resident_key() == key)
+            .cloned()?;
+        let ret = self.obligations.take(&selected);
+        if let Some(taken) = &ret {
+            self.num[taken.frame] -= 1;
+            super::frame::note_frame_obligation_mutation(false, taken);
+        }
+        ret
+    }
+
     pub fn peak(&mut self) -> Option<ProofObligation> {
         self.obligations.last().cloned()
     }
@@ -340,5 +377,35 @@ mod tests {
         assert_eq!(queue.num[2], 1);
         assert!(queue.pop(2).is_some());
         assert_eq!(queue.num[2], 0);
+    }
+
+    #[test]
+    fn resident_selection_can_override_cpu_btree_tie_break() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), true);
+        let po_a = ProofObligation::new(
+            2,
+            LitOrdVec::new(LitVec::from([a])),
+            Vec::new(),
+            1,
+            None,
+        );
+        let po_b = ProofObligation::new(
+            2,
+            LitOrdVec::new(LitVec::from([b])),
+            Vec::new(),
+            1,
+            None,
+        );
+        let key_b = po_b.resident_key();
+        let mut queue = ProofObligationQueue::new();
+        queue.add(po_a.clone());
+        queue.add(po_b.clone());
+
+        let selected = queue.take_resident_key(&key_b, 2).unwrap();
+        assert_eq!(selected.state, po_b.state);
+        assert!(queue.contains(&po_a));
+        assert!(!queue.contains(&po_b));
+        assert_eq!(queue.num[2], 1);
     }
 }

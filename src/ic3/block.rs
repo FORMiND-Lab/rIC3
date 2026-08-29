@@ -1680,8 +1680,33 @@ impl IC3 {
                 from_wave = true;
                 break;
             }
+            let resident_pop = if next.is_none() {
+                crate::accel::cdcl_host::pop_resident_block_obligation(self.level())
+            } else {
+                crate::accel::cdcl_host::ResidentBlockPop::Disabled
+            };
             let mut po = if let Some(po) = next {
                 po
+            } else if let crate::accel::cdcl_host::ResidentBlockPop::Selected {
+                user_tag,
+                key,
+            } = &resident_pop
+            {
+                let po = self
+                    .obligations
+                    .take_resident_key(&key, self.level())
+                    .unwrap_or_else(|| {
+                        panic!("resident queue selected unknown proof-chain tag {user_tag}")
+                    });
+                note_exact_obligation_pop(&mut semantic_ops, self.level(), &po);
+                po
+            } else if matches!(resident_pop, crate::accel::cdcl_host::ResidentBlockPop::Empty) {
+                self.note_exact_block_step(
+                    progress,
+                    BLOCK_STEP_SUCCESS,
+                    semantic_ops,
+                );
+                break;
             } else if let Some(po) = self.obligations.pop(self.level()) {
                 note_exact_obligation_pop(&mut semantic_ops, self.level(), &po);
                 po

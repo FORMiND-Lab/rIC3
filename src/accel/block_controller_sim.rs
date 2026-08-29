@@ -51,6 +51,7 @@ static MAX_LEMMA_ARENA: AtomicU64 = AtomicU64::new(0);
 static MAX_STATE_ARENA: AtomicU64 = AtomicU64::new(0);
 static MAX_INPUT_ARENA: AtomicU64 = AtomicU64::new(0);
 static QUEUE_POPS: AtomicU64 = AtomicU64::new(0);
+static OWNED_QUEUE_POPS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct Obligation {
@@ -112,6 +113,13 @@ struct ResidentObligationDescriptor {
     user_tag: u64,
 }
 
+#[derive(Clone, Debug)]
+struct PendingOwnedPop {
+    max_frame: u32,
+    key: Vec<u32>,
+    response: BlockSemanticCommandResponse,
+}
+
 #[derive(Default)]
 struct ResidentBlockMirror {
     initialized: bool,
@@ -123,6 +131,7 @@ struct ResidentBlockMirror {
     obligation_descriptors: HashMap<Vec<u32>, Vec<ResidentObligationDescriptor>>,
     lemma_descriptors: HashMap<Vec<u32>, Vec<u32>>,
     next_user_tag: u64,
+    pending_owned_pop: Option<PendingOwnedPop>,
 }
 
 fn take(words: &[u32], at: &mut usize) -> Result<u32, String> {
@@ -364,6 +373,64 @@ impl ResidentBlockMirror {
         (insert, user_tag)
     }
 
+    fn pop_owned(
+        &mut self,
+        hardware: &mut HardwareCdcl,
+        max_frame: u32,
+    ) -> Result<Option<(u64, Vec<u32>)>, String> {
+        if !self.initialized {
+            return Err("resident BLOCK mirror was not rebased".to_string());
+        }
+        if self.pending_owned_pop.is_some() {
+            return Err("resident queue has an unconsumed owned pop".to_string());
+        }
+        let mut pop = command(BLOCK_SEMANTIC_POP_OBLIGATION);
+        pop.frame = max_frame;
+        let response = issue(hardware, &[pop])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "missing resident queue pop response".to_string())?;
+        if response.found == 0 {
+            return Ok(None);
+        }
+        let user_tag = response.popped_user_tag();
+        let selected = self
+            .obligation_descriptors
+            .iter()
+            .find_map(|(key, descriptors)| {
+                descriptors
+                    .iter()
+                    .position(|descriptor| {
+                        descriptor.handle == response.output_handle
+                            && descriptor.user_tag == user_tag
+                    })
+                    .map(|position| (key.clone(), position))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "resident queue returned unknown handle {} tag {}",
+                    response.output_handle, user_tag,
+                )
+            })?;
+        let (key, position) = selected;
+        let descriptors = self
+            .obligation_descriptors
+            .get_mut(&key)
+            .ok_or_else(|| "resident queue selection disappeared".to_string())?;
+        descriptors.swap_remove(position);
+        if descriptors.is_empty() {
+            self.obligation_descriptors.remove(&key);
+        }
+        self.pending_owned_pop = Some(PendingOwnedPop {
+            max_frame,
+            key: key.clone(),
+            response,
+        });
+        QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
+        OWNED_QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
+        Ok(Some((user_tag, key)))
+    }
+
     fn register_obligation_payloads(
         &mut self,
         hardware: &mut HardwareCdcl,
@@ -478,6 +545,7 @@ impl ResidentBlockMirror {
         self.lemma_payloads.clear();
         self.obligation_descriptors.clear();
         self.lemma_descriptors.clear();
+        self.pending_owned_pop = None;
 
         let mut registration = vec![command(BLOCK_SEMANTIC_RESET)];
         let mut set_frames = command(BLOCK_SEMANTIC_SET_LEMMA_FRAMES);
@@ -797,6 +865,18 @@ impl ResidentBlockMirror {
                         &mut pending_lemmas,
                     )?;
                     let key = expected.key();
+                    if let Some(pending) = self.pending_owned_pop.take() {
+                        if pending.max_frame != max_frame || pending.key != key {
+                            return Err(format!(
+                                "owned resident pop diverged max-frame {}/{} tag {}",
+                                pending.max_frame,
+                                max_frame,
+                                pending.response.popped_user_tag(),
+                            ));
+                        }
+                        last_response = Some(pending.response);
+                        continue;
+                    }
                     let mut pop = command(BLOCK_SEMANTIC_POP_OBLIGATION);
                     pop.frame = max_frame;
                     let response = issue(hardware, &[pop])?
@@ -989,9 +1069,20 @@ pub(super) fn apply(
         .apply(hardware, semantic_ops, obligation_image, lemma_image)
 }
 
+pub(super) fn pop_owned(
+    hardware: &mut HardwareCdcl,
+    max_frame: u32,
+) -> Result<Option<(u64, Vec<u32>)>, String> {
+    MIRROR
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "resident BLOCK mirror lock poisoned".to_string())?
+        .pop_owned(hardware, max_frame)
+}
+
 pub(super) fn report() {
     eprintln!(
-        "inductor-cdcl: live BLOCK controller steps {}, rebases {}, root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}",
+        "inductor-cdcl: live BLOCK controller steps {}, rebases {}, root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}",
         STEPS.load(Ordering::Relaxed),
         REBASES.load(Ordering::Relaxed),
         ROOT_RECONCILES.load(Ordering::Relaxed),
@@ -1006,5 +1097,6 @@ pub(super) fn report() {
         MAX_STATE_ARENA.load(Ordering::Relaxed),
         MAX_INPUT_ARENA.load(Ordering::Relaxed),
         QUEUE_POPS.load(Ordering::Relaxed),
+        OWNED_QUEUE_POPS.load(Ordering::Relaxed),
     );
 }

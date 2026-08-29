@@ -3672,6 +3672,52 @@ fn block_controller_sim_strict() -> bool {
         .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
 }
 
+fn block_controller_owns_queue() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_BLOCK_CONTROLLER_OWNS_QUEUE")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
+pub enum ResidentBlockPop {
+    Disabled,
+    Empty,
+    Selected { user_tag: u64, key: Vec<u32> },
+}
+
+/// Let the resident controller select and remove the next BLOCK obligation.
+/// The returned tag is the eventual proof-chain registry key; `key` is retained
+/// only by this simulation bridge so the current CPU BTreeSet can hand the same
+/// object to IC3 while the opaque-tag registry is being migrated.
+pub fn pop_resident_block_obligation(max_frame: usize) -> ResidentBlockPop {
+    if !block_controller_owns_queue() || !block_controller_sim_enabled() {
+        return ResidentBlockPop::Disabled;
+    }
+    let state = active_state().lock();
+    let result = state
+        .map_err(|_| "active hardware lock poisoned".to_string())
+        .and_then(|mut state| {
+            let hardware = state
+                .hardware
+                .as_mut()
+                .ok_or_else(|| "active hardware transport unavailable".to_string())?;
+            super::block_controller_sim::pop_owned(
+                hardware,
+                max_frame.min(u32::MAX as usize) as u32,
+            )
+        });
+    match result {
+        Ok(Some((user_tag, key))) => ResidentBlockPop::Selected { user_tag, key },
+        Ok(None) => ResidentBlockPop::Empty,
+        Err(error) => {
+            finish_block_controller_sim(Err(error));
+            ResidentBlockPop::Disabled
+        }
+    }
+}
+
 fn finish_block_controller_sim(result: Result<(), String>) {
     if let Err(error) = result {
         if !BLOCK_CONTROLLER_SIM_FAILED.swap(true, Ordering::Relaxed) {
