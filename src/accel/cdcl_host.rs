@@ -2213,6 +2213,7 @@ static EXACT_REPLAY_BATCHES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_MICS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_BLOCK_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_BLOCK_EVENTS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_ROOTS: std::sync::OnceLock<std::sync::Mutex<HashSet<u32>>> =
     std::sync::OnceLock::new();
 static PROFILE_QUERIES: AtomicU64 = AtomicU64::new(0);
@@ -3508,10 +3509,14 @@ fn measure_reference_cpu(
 // instruction.  Unlike the version-6 image patch, these operands are emitted
 // at the queue/frame mutation sites and can therefore drive a resident
 // controller without reconstructing work from CPU post-images.
-const EXACT_REPLAY_VERSION: u32 = 7;
+// Version 8 also emits compact event-only records for BLOCK roots that did not
+// launch an exact SAT inquiry. This keeps the resident proof state continuous
+// instead of accumulating their mutations into the next full checkpoint.
+const EXACT_REPLAY_VERSION: u32 = 8;
 const EXACT_REPLAY_BATCH: u32 = 1;
 const EXACT_REPLAY_MIC: u32 = 2;
 const EXACT_REPLAY_BLOCK_PROGRESS_RECORD: u32 = 3;
+const EXACT_REPLAY_BLOCK_EVENT_RECORD: u32 = 4;
 const RING_INDEPENDENT_SET: u32 = 1 << 3;
 const RING_END_OF_BATCH: u32 = 1 << 2;
 
@@ -3869,8 +3874,8 @@ pub fn finish_exact_mic_replay(capture: Option<ExactMicReplayCapture>, output: &
 }
 
 /// Capture the CPU proof-state boundary for one algorithm-owned BLOCK root.
-/// Only roots that actually emitted an exact query/MIC record are serialized,
-/// keeping the stream bounded by the existing query limits.
+/// Roots with exact query/MIC work become full image checkpoints; all others
+/// become compact event-only records in version 8.
 pub fn begin_exact_block_progress(
     frame: usize,
     obligations: (usize, u64),
@@ -3902,9 +3907,7 @@ pub fn exact_block_progress_enabled() -> bool {
     std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some()
 }
 
-/// Append one algorithm-level instruction to the buffered BLOCK program. The
-/// records are emitted only if this root actually used the exact accelerator
-/// path, so cheap CPU-only roots do not inflate the replay stream.
+/// Append one algorithm-level instruction to the buffered BLOCK program.
 pub fn note_exact_block_progress_step(
     capture: Option<&mut ExactBlockProgressCapture>,
     event: u32,
@@ -3958,15 +3961,16 @@ pub fn finish_exact_block_progress(
     let captured = exact_replay_roots()
         .lock()
         .is_ok_and(|roots| roots.contains(&capture.op_id));
-    if !captured {
-        return;
-    }
     let Some(writer) = exact_replay_writer() else {
         return;
     };
     let mut words = vec![
         0,
-        EXACT_REPLAY_BLOCK_PROGRESS_RECORD,
+        if captured {
+            EXACT_REPLAY_BLOCK_PROGRESS_RECORD
+        } else {
+            EXACT_REPLAY_BLOCK_EVENT_RECORD
+        },
         capture.op_id,
         capture.frame,
         result,
@@ -3981,6 +3985,9 @@ pub fn finish_exact_block_progress(
     words.push(lemmas.0.min(u32::MAX as usize) as u32);
     exact_push_u64(&mut words, lemmas.1);
     words.push(capture.steps.len().min(u32::MAX as usize) as u32);
+    // Both checkpoint and event-only roots carry their initial images as a
+    // trace-only oracle. Event-only roots omit every per-step image patch;
+    // their production model is still the direct semantic handle stream.
     words.push(capture.obligation_image.len().min(u32::MAX as usize) as u32);
     words.extend(capture.obligation_image);
     words.push(capture.lemma_image.len().min(u32::MAX as usize) as u32);
@@ -3991,19 +3998,28 @@ pub fn finish_exact_block_progress(
         exact_push_u64(&mut words, step.obligations.1);
         words.push(step.lemmas.0.min(u32::MAX as usize) as u32);
         exact_push_u64(&mut words, step.lemmas.1);
-        words.push(step.obligation_patch.prefix);
-        words.push(step.obligation_patch.suffix);
-        words.push(step.obligation_patch.append.len().min(u32::MAX as usize) as u32);
-        words.extend(step.obligation_patch.append);
-        match step.lemma_patch {
-            Some(patch) => {
-                words.push(1);
-                words.push(patch.prefix);
-                words.push(patch.suffix);
-                words.push(patch.append.len().min(u32::MAX as usize) as u32);
-                words.extend(patch.append);
+        if captured {
+            words.push(step.obligation_patch.prefix);
+            words.push(step.obligation_patch.suffix);
+            words.push(
+                step.obligation_patch
+                    .append
+                    .len()
+                    .min(u32::MAX as usize) as u32,
+            );
+            words.extend(step.obligation_patch.append);
+            match step.lemma_patch {
+                Some(patch) => {
+                    words.push(1);
+                    words.push(patch.prefix);
+                    words.push(patch.suffix);
+                    words.push(
+                        patch.append.len().min(u32::MAX as usize) as u32,
+                    );
+                    words.extend(patch.append);
+                }
+                None => words.push(0),
             }
-            None => words.push(0),
         }
         words.push(step.semantic_ops.len().min(u32::MAX as usize) as u32);
         for operation in step.semantic_ops {
@@ -4019,7 +4035,11 @@ pub fn finish_exact_block_progress(
             return;
         }
     }
-    EXACT_REPLAY_BLOCK_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    if captured {
+        EXACT_REPLAY_BLOCK_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        EXACT_REPLAY_BLOCK_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn flush_exact_replay_writer() {
@@ -6169,7 +6189,7 @@ pub fn flush_and_report() {
         }
         flush_exact_replay_writer();
         eprintln!(
-            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK progress {}, file {}; ranged snapshot fallbacks {}",
+            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK checkpoints {}, event-only roots {}, file {}; ranged snapshot fallbacks {}",
             ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
             ARCH_TRACE_QUERIES.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_TRACE_CSV").unwrap_or_else(|_| "disabled".to_string()),
@@ -6177,6 +6197,7 @@ pub fn flush_and_report() {
             EXACT_REPLAY_QUERIES.load(Ordering::Relaxed),
             EXACT_REPLAY_MICS.load(Ordering::Relaxed),
             EXACT_REPLAY_BLOCK_PROGRESS.load(Ordering::Relaxed),
+            EXACT_REPLAY_BLOCK_EVENTS.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_EXACT_REPLAY").unwrap_or_else(|_| "disabled".to_string()),
             FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
         );
