@@ -91,15 +91,16 @@ impl TransysSolver {
         }
     }
 
-    /// Stable current-latch -> next-latch variable map registered with the
-    /// resident BLOCK root controller. Non-latch variables are deliberately
-    /// unmapped: a proof obligation is a state cube, so encountering one is a
-    /// protocol error rather than permission to invent an identity mapping.
+    /// Stable positive-current-latch -> next-literal map registered with the
+    /// resident BLOCK root controller. The value includes the next literal's
+    /// polarity: TransysCtx may represent a latch through an inverted next
+    /// literal, so a variable-only map silently flips Q_block assumptions.
+    /// Non-latch variables are deliberately unmapped.
     pub fn resident_block_next_var_map(&self) -> Vec<u32> {
         let mut map = vec![u32::MAX; self.dcs.num_var()];
         for current in self.ts.latch() {
             let current_index = usize::from(current);
-            let next = self.ts.var_next(current);
+            let next = self.ts.next(current.lit());
             if current_index < map.len() {
                 map[current_index] = u32::from(next);
             }

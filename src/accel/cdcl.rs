@@ -117,7 +117,7 @@ pub const BLOCK_SEMANTIC_COMPOSE_OBLIGATION: u32 = 24;
 pub const BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED: u32 = 25;
 pub const BLOCK_SEMANTIC_PEEK_OBLIGATION: u32 = 26;
 
-pub const BLOCK_ROOT_PROTOCOL_VERSION: u32 = 1;
+pub const BLOCK_ROOT_PROTOCOL_VERSION: u32 = 2;
 pub const BLOCK_ROOT_REQUEST_HEADER_WORDS: usize = 9;
 pub const BLOCK_ROOT_RESPONSE_HEADER_WORDS: usize = 6;
 pub const BLOCK_ROOT_WORK_WORDS: usize = 7;
@@ -125,13 +125,13 @@ pub const BLOCK_ROOT_MAX_WORK: usize = 8;
 pub const BLOCK_ROOT_BATCH_OFFSET: usize =
     BLOCK_ROOT_RESPONSE_HEADER_WORDS + BLOCK_ROOT_MAX_WORK * BLOCK_ROOT_WORK_WORDS;
 
-pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 1;
+pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 2;
 pub const BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS: usize = 12;
 pub const BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS: usize = 10;
 pub const BLOCK_FULL_ROOT_WORK_WORDS: usize = 7;
 pub const BLOCK_FULL_ROOT_EVENT_HEADER_WORDS: usize = 2;
 pub const BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS: usize = 6;
-pub const BLOCK_FULL_ROOT_SAT_HEADER_WORDS: usize = 10;
+pub const BLOCK_FULL_ROOT_SAT_HEADER_WORDS: usize = 11;
 pub const BLOCK_FULL_ROOT_MAX_STEPS: usize = 256;
 pub const BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR: u32 = 1;
 pub const BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA: u32 = 2;
@@ -315,6 +315,7 @@ pub enum BlockFullRootEvent {
         parent_tag: u64,
         parent_descriptor_handle: u32,
         child_descriptor_handle: u32,
+        child_payload_handle: u32,
         frame: u32,
         depth: u32,
         state: Vec<u32>,
@@ -485,8 +486,8 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
                 if record.len() < BLOCK_FULL_ROOT_SAT_HEADER_WORDS {
                     return None;
                 }
-                let state_words = usize::try_from(record[8]).ok()?;
-                let input_words = usize::try_from(record[9]).ok()?;
+                let state_words = usize::try_from(record[9]).ok()?;
+                let input_words = usize::try_from(record[10]).ok()?;
                 if record.len()
                     != BLOCK_FULL_ROOT_SAT_HEADER_WORDS
                         .checked_add(state_words)?
@@ -502,8 +503,9 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
                     parent_tag: u64::from(record[2]) | (u64::from(record[3]) << 32),
                     parent_descriptor_handle: record[4],
                     child_descriptor_handle: record[5],
-                    frame: record[6],
-                    depth: record[7],
+                    child_payload_handle: record[6],
+                    frame: record[7],
+                    depth: record[8],
                     state: record[state_begin..input_begin].to_vec(),
                     input: record[input_begin..].to_vec(),
                 }
@@ -1102,7 +1104,7 @@ mod tests {
         let request = pack_block_root_request(
             3,
             2,
-            &[2, 3, u32::MAX, u32::MAX],
+            &[4, 6, u32::MAX, u32::MAX],
             &[0, 1, 2, 3],
             WANT_MODEL | WANT_CORE,
             11,
@@ -1110,7 +1112,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.len(), 17);
-        assert_eq!(&request[..9], &[1, 3, 2, 4, 4, 3, 11, 17, 0]);
+        assert_eq!(
+            &request[..9],
+            &[BLOCK_ROOT_PROTOCOL_VERSION, 3, 2, 4, 4, 3, 11, 17, 0],
+        );
 
         let mut response = vec![0u32; BLOCK_ROOT_BATCH_OFFSET];
         response[..6].copy_from_slice(&[
@@ -1154,7 +1159,7 @@ mod tests {
         let request = pack_block_full_root_request(
             3,
             4,
-            &[2, 3, u32::MAX, u32::MAX],
+            &[4, 6, u32::MAX, u32::MAX],
             &[1, 0, 2, 2],
             &[0x8000_0000, 0x8001_0001, 0x8002_0002, 0x8003_0003],
             &[0, 1],
@@ -1165,10 +1170,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.len(), 27);
-        assert_eq!(&request[..12], &[1, 3, 4, 4, 4, flags, 11, 17, 2, 1, 0, 0]);
+        assert_eq!(
+            &request[..12],
+            &[
+                BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+                3,
+                4,
+                4,
+                4,
+                flags,
+                11,
+                17,
+                2,
+                1,
+                0,
+                0,
+            ],
+        );
         assert_eq!(
             block_full_root_required_response_capacity(4, 2, 1),
-            Some(77)
+            Some(81)
         );
 
         let response = [
@@ -1180,7 +1201,7 @@ mod tests {
             1,
             1,
             1,
-            32,
+            33,
             0,
             // CPU handoff work.
             0,
@@ -1192,13 +1213,14 @@ mod tests {
             4,
             // SAT event and its 11-word record.
             BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR,
-            13,
+            14,
             0x22,
             0x8000_0000,
             0x11,
             0,
             7,
             8,
+            9,
             0,
             6,
             2,

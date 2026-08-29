@@ -3944,6 +3944,15 @@ pub fn block_root_executor_enabled() -> bool {
     })
 }
 
+pub fn block_full_root_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
 pub enum ResidentBlockPop {
     Disabled,
     Empty,
@@ -3955,6 +3964,14 @@ pub enum ResidentBlockRoot {
     Wave {
         response: BlockRootResponse,
         keys: Vec<Vec<u32>>,
+    },
+}
+
+pub enum ResidentBlockFullRoot {
+    Disabled,
+    Wave {
+        response: BlockFullRootResponse,
+        source_keys: Vec<Vec<u32>>,
     },
 }
 
@@ -4066,6 +4083,119 @@ pub fn run_resident_block_root(
         Err(error) => {
             finish_block_controller_sim(Err(error));
             ResidentBlockRoot::Disabled
+        }
+    }
+}
+
+pub fn run_resident_block_full_root(
+    max_frame: usize,
+    step_limit: usize,
+    solvers: &[&DagCnfSolver],
+    next_var_by_current: &[u32],
+    init_value_by_current: &[u32],
+    latch_variables: &[u32],
+    input_variables: &[u32],
+    query_template: &IncrementalQuery,
+) -> ResidentBlockFullRoot {
+    if !block_full_root_enabled()
+        || !block_controller_owns_queue()
+        || !block_controller_sim_enabled()
+    {
+        return ResidentBlockFullRoot::Disabled;
+    }
+    let context = if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_EXACT_MAX_FRAME").is_some() {
+        let Some(solver) = max_frame
+            .checked_sub(1)
+            .and_then(|frame| solvers.get(frame))
+        else {
+            return ResidentBlockFullRoot::Disabled;
+        };
+        let (n_var, frame, snapshot) = solver.incremental_resident_snapshot();
+        ShadowContext {
+            n_var,
+            clauses: snapshot
+                .into_iter()
+                .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+                .collect(),
+            scope: ShadowContextScope::ExactFrame(frame),
+        }
+    } else if let Some(context) = block_root_ranged_context(solvers) {
+        context
+    } else {
+        return ResidentBlockFullRoot::Disabled;
+    };
+    let state = active_state().lock();
+    let result = state
+        .map_err(|_| "active hardware lock poisoned".to_string())
+        .and_then(|mut state| {
+            let update =
+                if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_RELOAD_EACH_ROOT").is_some() {
+                    ContextUpdate::Reload
+                } else {
+                    plan_context_update(state.loaded_context.as_ref(), &context)
+                };
+            let ready = match update {
+                ContextUpdate::Ready => Ok(()),
+                ContextUpdate::Append(clauses) => {
+                    let result = state
+                        .hardware
+                        .as_mut()
+                        .ok_or(HardwareError::Unavailable)
+                        .and_then(|hardware| hardware.add_frame_clauses(&clauses));
+                    if result.is_ok() {
+                        if let Some(loaded) = state.loaded_context.as_mut() {
+                            loaded.clauses.extend(clauses);
+                        }
+                    }
+                    result
+                }
+                ContextUpdate::Reload => {
+                    let result = state
+                        .hardware
+                        .as_mut()
+                        .ok_or(HardwareError::Unavailable)
+                        .and_then(|hardware| {
+                            hardware.load_context(context.n_var, &context.clauses)
+                        });
+                    if result.is_ok() {
+                        state.loaded_context = Some(LoadedContext::from(&context));
+                    }
+                    result
+                }
+            };
+            if let Err(error) = ready {
+                state.loaded_context = None;
+                return Err(format!("resident BLOCK full-root context failed: {error}"));
+            }
+            let result = state
+                .hardware
+                .as_mut()
+                .ok_or_else(|| "active hardware transport unavailable".to_string())
+                .and_then(|hardware| {
+                    super::block_controller_sim::run_owned_full_root(
+                        hardware,
+                        max_frame.min(u32::MAX as usize) as u32,
+                        step_limit,
+                        next_var_by_current,
+                        init_value_by_current,
+                        latch_variables,
+                        input_variables,
+                        query_template,
+                    )
+                });
+            if result.is_err() {
+                state.loaded_context = None;
+            }
+            result
+        });
+    match result {
+        Ok(wave) => ResidentBlockFullRoot::Wave {
+            response: wave.response,
+            source_keys: wave.source_keys,
+        },
+        Err(error) => {
+            finish_block_controller_sim(Err(error));
+            ResidentBlockFullRoot::Disabled
         }
     }
 }

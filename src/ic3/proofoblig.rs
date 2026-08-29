@@ -274,7 +274,11 @@ impl ProofObligationQueue {
     /// Simulation bridge for FPGA-owned work scheduling. The controller has
     /// already removed this descriptor; find the matching CPU proof-chain
     /// object without imposing the CPU BTreeSet's choice on the device.
-    fn take_resident_key(&mut self, key: &[u32], max_frame: usize) -> Option<ProofObligation> {
+    pub(super) fn take_resident_key(
+        &mut self,
+        key: &[u32],
+        max_frame: usize,
+    ) -> Option<ProofObligation> {
         let selected = self
             .resident_index
             .get(key)

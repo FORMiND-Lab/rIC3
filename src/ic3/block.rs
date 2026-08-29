@@ -7,12 +7,18 @@ use crate::ic3::{
 };
 use giputils::TerminateCtrl;
 use log::{debug, info};
-use logicrs::{Lit, LitOrdVec, LitVec, satif::Satif};
+use logicrs::{Lit, LitOrdVec, LitVec, Var, satif::Satif};
 use rand::seq::SliceRandom;
 use std::{collections::VecDeque, time::Instant};
 
 use crate::{
-    accel::{cdcl::BlockRootExecutionStatus, cdcl_host::ActivePreflight},
+    accel::{
+        cdcl::{
+            BlockFullRootEvent, BlockFullRootResponse, BlockFullRootStatus,
+            BlockRootExecutionStatus,
+        },
+        cdcl_host::ActivePreflight,
+    },
     gipsat::{IncrementalQuery, IncrementalResult, decode_batch_results},
 };
 
@@ -1257,6 +1263,144 @@ pub enum BlockResult {
 }
 
 impl IC3 {
+    fn replay_resident_full_root(
+        &mut self,
+        response: &BlockFullRootResponse,
+        source_keys: &[Vec<u32>],
+    ) -> Result<(bool, Vec<Vec<u32>>), String> {
+        if response.events.len() != source_keys.len() {
+            return Err("resident full-root event/source journal length mismatch".to_string());
+        }
+        let n_var = self.tsctx.num_var();
+        let decode = |words: &[u32]| -> Result<LitVec, String> {
+            words
+                .iter()
+                .map(|word| {
+                    let variable = Var::from(*word >> 1);
+                    (usize::from(variable) < n_var)
+                        .then(|| Lit::new(variable, *word & 1 == 0))
+                        .ok_or_else(|| format!("resident full-root literal out of range: {word}"))
+                })
+                .collect()
+        };
+        let mut proved = false;
+        let mut semantic_ops = Some(Vec::new());
+        for (event, source_key) in response.events.iter().zip(source_keys) {
+            let source = self
+                .obligations
+                .take_resident_key(source_key, self.level())
+                .ok_or_else(|| "resident full-root consumed unknown CPU obligation".to_string())?;
+            match event {
+                BlockFullRootEvent::SatPredecessor {
+                    frame,
+                    depth,
+                    state,
+                    input,
+                    ..
+                } => {
+                    if source.frame == 0
+                        || *frame as usize + 1 != source.frame
+                        || *depth as usize != source.depth + 1
+                    {
+                        return Err("resident SAT predecessor metadata mismatch".to_string());
+                    }
+                    let state = decode(state)?;
+                    let input = decode(input)?;
+                    let predecessor = ProofObligation::new(
+                        *frame as usize,
+                        LitOrdVec::new(state),
+                        vec![input],
+                        *depth as usize,
+                        Some(source.clone()),
+                    );
+                    self.add_obligation(source);
+                    self.add_obligation(predecessor);
+                }
+                BlockFullRootEvent::UnsatLemma { frame, cube, .. } => {
+                    if source.frame == 0 || *frame as usize != source.frame {
+                        return Err("resident UNSAT lemma frame mismatch".to_string());
+                    }
+                    let cube = decode(cube)?;
+                    if cube.is_empty() || self.tsctx.cube_subsume_init(&cube) {
+                        return Err("resident UNSAT lemma violates Init guard".to_string());
+                    }
+                    // Simulation oracle: until the fused root is qualified on
+                    // the AIGER matrix, prove every device-produced lemma
+                    // against an independent clone of the exact CPU frame.
+                    // This is deliberately outside the intended production
+                    // fast path and can be removed once the architecture has
+                    // zero oracle disagreements over repeated matrices.
+                    if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_ORACLE").is_some() {
+                        let solver = &self.solvers[*frame as usize - 1];
+                        let source_query = solver.incremental_inductive_query(
+                            source.state.as_litvec(),
+                            false,
+                            vec![],
+                        );
+                        let mut source_checker = solver.dcs.clone();
+                        if !matches!(
+                            source_checker.classify_incremental_exact(&source_query),
+                            IncrementalResult::Unsat { .. }
+                        ) {
+                            return Err(format!(
+                                "resident Q_block UNSAT failed exact CPU oracle at frame {} (source {} literals, lemma {} literals, CPU assumptions {:?})",
+                                frame,
+                                source.state.len(),
+                                cube.len(),
+                                source_query
+                                    .assumptions
+                                    .iter()
+                                    .map(|literal| u32::from(*literal))
+                                    .collect::<Vec<_>>()
+                            ));
+                        }
+                        let query = solver.incremental_inductive_query(&cube, false, vec![]);
+                        let mut checker = solver.dcs.clone();
+                        if !matches!(
+                            checker.classify_incremental_exact(&query),
+                            IncrementalResult::Unsat { .. }
+                        ) {
+                            return Err(format!(
+                                "resident UNSAT lemma failed exact CPU oracle at frame {} ({} literals)",
+                                frame,
+                                cube.len()
+                            ));
+                        }
+                    }
+                    // The card has already inserted this exact lemma. Replay
+                    // add_lemma only to rebuild FrameLemma/proof ownership and
+                    // capture the canonicalization removals it performs. One
+                    // matching insertion is consumed by the resident event;
+                    // all other mutations (normally subsumed old lemmas) must
+                    // still be sent to the semantic handle state.
+                    begin_block_lemma_journal(true);
+                    proved |= self.add_lemma(*frame as usize, cube.clone(), false, Some(source));
+                    let mutations = finish_block_lemma_journal();
+                    let mut consumed_resident_insert = false;
+                    let mut normalization = Vec::new();
+                    for mutation in mutations {
+                        if mutation.insert
+                            && !consumed_resident_insert
+                            && mutation.frame == *frame as usize
+                            && mutation.lemma == cube
+                        {
+                            consumed_resident_insert = true;
+                        } else {
+                            normalization.push(mutation);
+                        }
+                    }
+                    if !consumed_resident_insert {
+                        return Err(
+                            "resident UNSAT lemma was not installed in the CPU frame".to_string()
+                        );
+                    }
+                    note_exact_lemma_mutations(&mut semantic_ops, normalization);
+                }
+            }
+        }
+        Ok((proved, semantic_ops.unwrap_or_default()))
+    }
+
     fn full_pred_from_incremental_model(&self, model: &[Lit]) -> Option<(LitVec, Vec<LitVec>)> {
         let value = |lit: Lit| {
             model
@@ -1518,7 +1662,101 @@ impl IC3 {
             }
             let mut resident_root_inquiries = None;
             let mut resident_root_attempted = false;
-            let resident_pop = if next.is_none() {
+            let mut full_root_pop = None;
+            let mut full_root_sync_event = None;
+            if next.is_none() {
+                let full_root = self.solvers.first().map_or(
+                    crate::accel::cdcl_host::ResidentBlockFullRoot::Disabled,
+                    |solver| {
+                        let next_var_by_current = solver.resident_block_next_var_map();
+                        let (init, latches, inputs) = solver.resident_block_projection_metadata();
+                        let query_template = solver.incremental_inductive_query(&[], false, vec![]);
+                        let resident_solvers = self
+                            .solvers
+                            .iter()
+                            .map(|solver| &solver.dcs)
+                            .collect::<Vec<_>>();
+                        let full_root_steps = std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_STEPS")
+                            .ok()
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .filter(|steps| *steps != 0)
+                            .unwrap_or(64);
+                        crate::accel::cdcl_host::run_resident_block_full_root(
+                            self.level(),
+                            full_root_steps,
+                            &resident_solvers,
+                            &next_var_by_current,
+                            &init,
+                            &latches,
+                            &inputs,
+                            &query_template,
+                        )
+                    },
+                );
+                if let crate::accel::cdcl_host::ResidentBlockFullRoot::Wave {
+                    response,
+                    source_keys,
+                } = full_root
+                {
+                    let (proved, resident_semantic_ops) = self
+                        .replay_resident_full_root(&response, &source_keys)
+                        .unwrap_or_else(|error| panic!("resident full-root replay: {error}"));
+                    let resident_ops = progress.as_ref().map(|_| resident_semantic_ops);
+                    if proved {
+                        self.note_exact_block_step(progress, BLOCK_STEP_PROVED, resident_ops);
+                        return BlockResult::Proved;
+                    }
+                    match response.status {
+                        BlockFullRootStatus::Drained => {
+                            let event = if response.unsat_commits != 0 {
+                                BLOCK_STEP_GENERALIZED
+                            } else {
+                                BLOCK_STEP_SUCCESS
+                            };
+                            self.note_exact_block_step(progress, event, resident_ops);
+                            break;
+                        }
+                        BlockFullRootStatus::StepBudget => {
+                            let event = if response.unsat_commits != 0 {
+                                BLOCK_STEP_GENERALIZED
+                            } else {
+                                BLOCK_STEP_PREDECESSOR
+                            };
+                            self.note_exact_block_step(progress, event, resident_ops);
+                            continue;
+                        }
+                        BlockFullRootStatus::CpuResult
+                        | BlockFullRootStatus::CpuHandoff
+                        | BlockFullRootStatus::Fallback => {
+                            let event = if response.unsat_commits != 0 {
+                                BLOCK_STEP_GENERALIZED
+                            } else {
+                                BLOCK_STEP_PREDECESSOR
+                            };
+                            // The device has already POPed the handoff. Delay
+                            // the image oracle until the CPU removes the same
+                            // proof object; checking between those two halves
+                            // reports a false one-obligation mismatch.
+                            semantic_ops = resident_ops;
+                            full_root_sync_event = Some(event);
+                            let handoff = response
+                                .handoff
+                                .expect("resident full-root status requires handoff");
+                            full_root_pop =
+                                Some(crate::accel::cdcl_host::ResidentBlockPop::Selected {
+                                    user_tag: handoff.user_tag(),
+                                });
+                        }
+                        BlockFullRootStatus::Error => {
+                            panic!("resident full-root returned an internal error")
+                        }
+                    }
+                }
+            }
+            let full_root_handoff = full_root_pop.is_some();
+            let resident_pop = if let Some(pop) = full_root_pop {
+                pop
+            } else if next.is_none() {
                 let root = self.solvers.first().map_or(
                     crate::accel::cdcl_host::ResidentBlockRoot::Disabled,
                     |solver| {
@@ -1637,7 +1875,9 @@ impl IC3 {
                     .unwrap_or_else(|| {
                         panic!("resident queue selected unknown proof-chain tag {user_tag}")
                     });
-                note_exact_obligation_pop(&mut semantic_ops, self.level(), &po);
+                if !full_root_handoff {
+                    note_exact_obligation_pop(&mut semantic_ops, self.level(), &po);
+                }
                 po
             } else if matches!(
                 resident_pop,
@@ -1652,6 +1892,10 @@ impl IC3 {
                 self.note_exact_block_step(progress, BLOCK_STEP_SUCCESS, semantic_ops);
                 break;
             };
+            if let Some(event) = full_root_sync_event {
+                self.note_exact_block_step(progress, event, semantic_ops.take());
+                semantic_ops = progress.as_ref().map(|_| Vec::new());
+            }
             if from_wave {
                 crate::accel::cdcl_host::note_active_block_wave_taken();
             }

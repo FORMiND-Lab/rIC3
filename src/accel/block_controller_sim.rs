@@ -14,8 +14,9 @@ use super::{
         BLOCK_SEMANTIC_EVENT_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_INSERT_LEMMA,
         BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED, BLOCK_SEMANTIC_POP_OBLIGATION,
         BLOCK_SEMANTIC_REGISTER_LEMMA, BLOCK_SEMANTIC_REGISTER_STATE_FULL, BLOCK_SEMANTIC_RESET,
-        BLOCK_SEMANTIC_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_STATS, BlockRootExecutionStatus,
-        BlockRootResponse, BlockSemanticCommand, BlockSemanticCommandResponse,
+        BLOCK_SEMANTIC_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_STATS, BlockFullRootEvent,
+        BlockFullRootResponse, BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
+        BlockSemanticCommandResponse,
     },
     cdcl_host::HardwareCdcl,
 };
@@ -41,6 +42,7 @@ static MIRROR: OnceLock<Mutex<ResidentBlockMirror>> = OnceLock::new();
 static BATCHES: AtomicU64 = AtomicU64::new(0);
 static COMMANDS: AtomicU64 = AtomicU64::new(0);
 static REBASES: AtomicU64 = AtomicU64::new(0);
+static CAPACITY_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 static ROOT_RECONCILES: AtomicU64 = AtomicU64::new(0);
 static STEPS: AtomicU64 = AtomicU64::new(0);
 static SERVICE_NS: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +146,12 @@ struct ResidentBlockMirror {
 pub(super) struct OwnedBlockRootWave {
     pub response: BlockRootResponse,
     pub keys: Vec<Vec<u32>>,
+}
+
+pub(super) struct OwnedBlockFullRootWave {
+    pub response: BlockFullRootResponse,
+    /// CPU proof-obligation keys consumed by each ordered resident event.
+    pub source_keys: Vec<Vec<u32>>,
 }
 
 fn take(words: &[u32], at: &mut usize) -> Result<u32, String> {
@@ -354,6 +362,14 @@ fn issue(
     Ok(combined)
 }
 
+fn semantic_capacity_error(error: &str) -> bool {
+    // HardwareError::BlockSemantic preserves the command's ordinary semantic
+    // status in its Debug/Display representation. Status 2 is the fixed-arena
+    // capacity result; batch/transport errors must remain fatal so a reset
+    // cannot hide malformed journal traffic or a broken RPC boundary.
+    error.contains("BlockSemantic") && error.contains("command_status: 2")
+}
+
 fn multiset<T>(items: &[T], key: impl Fn(&T) -> Vec<u32>) -> HashMap<Vec<u32>, usize> {
     let mut counts = HashMap::new();
     for item in items {
@@ -366,6 +382,32 @@ impl ResidentBlockMirror {
     fn allocate_user_tag(&mut self) -> u64 {
         self.next_user_tag = self.next_user_tag.wrapping_add(1).max(1);
         self.next_user_tag
+    }
+
+    fn remove_obligation_descriptor_for_tag(
+        &mut self,
+        user_tag: u64,
+    ) -> Result<(Vec<u32>, ResidentObligationDescriptor), String> {
+        let selected = self
+            .obligation_descriptors
+            .iter()
+            .find_map(|(key, descriptors)| {
+                descriptors
+                    .iter()
+                    .position(|descriptor| descriptor.user_tag == user_tag)
+                    .map(|position| (key.clone(), position))
+            })
+            .ok_or_else(|| format!("resident full root returned unknown source tag {user_tag}"))?;
+        let (key, position) = selected;
+        let descriptors = self
+            .obligation_descriptors
+            .get_mut(&key)
+            .ok_or_else(|| "resident full-root source disappeared".to_string())?;
+        let descriptor = descriptors.swap_remove(position);
+        if descriptors.is_empty() {
+            self.obligation_descriptors.remove(&key);
+        }
+        Ok((key, descriptor))
     }
 
     fn tagged_obligation_insert(
@@ -560,6 +602,130 @@ impl ResidentBlockMirror {
         Ok(OwnedBlockRootWave { response, keys })
     }
 
+    fn run_owned_full_root(
+        &mut self,
+        hardware: &mut HardwareCdcl,
+        max_frame: u32,
+        step_limit: usize,
+        next_var_by_current: &[u32],
+        init_value_by_current: &[u32],
+        latch_variables: &[u32],
+        input_variables: &[u32],
+        query_template: &IncrementalQuery,
+    ) -> Result<OwnedBlockFullRootWave, String> {
+        if !self.initialized {
+            return Err("resident BLOCK mirror was not rebased".to_string());
+        }
+        if self.pending_owned_pop.is_some() {
+            return Err("resident queue has an unconsumed owned pop".to_string());
+        }
+        let started = Instant::now();
+        let response = hardware
+            .run_block_full_root(
+                max_frame,
+                step_limit,
+                next_var_by_current,
+                init_value_by_current,
+                latch_variables,
+                input_variables,
+                query_template,
+            )
+            .map_err(|error| format!("resident BLOCK full-root command failed: {error}"))?;
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        SERVICE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        ROOT_SERVICE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let mut source_keys = Vec::with_capacity(response.events.len());
+        for event in &response.events {
+            match event {
+                BlockFullRootEvent::SatPredecessor {
+                    child_tag,
+                    parent_tag,
+                    parent_descriptor_handle,
+                    child_descriptor_handle,
+                    child_payload_handle,
+                    frame,
+                    depth,
+                    state,
+                    input,
+                } => {
+                    let (source_key, source_descriptor) =
+                        self.remove_obligation_descriptor_for_tag(*parent_tag)?;
+                    if source_descriptor.user_tag != *parent_tag {
+                        return Err("resident SAT journal source tag mismatch".to_string());
+                    }
+                    source_keys.push(source_key.clone());
+                    self.obligation_descriptors
+                        .entry(source_key)
+                        .or_default()
+                        .push(ResidentObligationDescriptor {
+                            handle: *parent_descriptor_handle,
+                            user_tag: *parent_tag,
+                        });
+
+                    let mut payload = Vec::with_capacity(state.len() + input.len() + 3);
+                    payload.push(state.len().min(u32::MAX as usize) as u32);
+                    payload.extend_from_slice(state);
+                    payload.push(1);
+                    payload.push(input.len().min(u32::MAX as usize) as u32);
+                    payload.extend_from_slice(input);
+                    let mut child_key = vec![*frame, *depth, 0];
+                    child_key.extend_from_slice(&payload);
+                    self.obligation_payloads
+                        .insert(payload.clone(), *child_payload_handle);
+                    self.obligation_state_payloads
+                        .insert(state.clone(), *child_payload_handle);
+                    self.obligation_descriptors
+                        .entry(child_key)
+                        .or_default()
+                        .push(ResidentObligationDescriptor {
+                            handle: *child_descriptor_handle,
+                            user_tag: *child_tag,
+                        });
+                }
+                BlockFullRootEvent::UnsatLemma {
+                    frame,
+                    proof_tag,
+                    payload_handle,
+                    descriptor_handle,
+                    cube,
+                } => {
+                    let (source_key, _) = self.remove_obligation_descriptor_for_tag(*proof_tag)?;
+                    source_keys.push(source_key);
+                    let mut payload = Vec::with_capacity(cube.len() + 1);
+                    payload.push(cube.len().min(u32::MAX as usize) as u32);
+                    payload.extend_from_slice(cube);
+                    let mut key = vec![*frame];
+                    key.extend_from_slice(&payload);
+                    self.lemma_payloads.insert(payload, *payload_handle);
+                    self.lemma_descriptors
+                        .entry(key)
+                        .or_default()
+                        .push(*descriptor_handle);
+                }
+            }
+        }
+        if let Some(handoff) = response.handoff {
+            let user_tag = handoff.user_tag();
+            let (key, descriptor) = self.remove_obligation_descriptor_for_tag(user_tag)?;
+            if descriptor.handle != handoff.descriptor_handle {
+                return Err("resident full-root handoff descriptor mismatch".to_string());
+            }
+            if self.owned_selection_keys.insert(user_tag, key).is_some() {
+                return Err(format!(
+                    "duplicate resident full-root handoff tag {user_tag}"
+                ));
+            }
+        }
+        ROOT_WAVES.fetch_add(1, Ordering::Relaxed);
+        ROOT_WORK.fetch_add(response.cdcl_waves as u64, Ordering::Relaxed);
+        ROOT_OK.fetch_add(1, Ordering::Relaxed);
+        Ok(OwnedBlockFullRootWave {
+            response,
+            source_keys,
+        })
+    }
+
     fn take_owned_key(&mut self, user_tag: u64) -> Result<Vec<u32>, String> {
         self.owned_selection_keys
             .remove(&user_tag)
@@ -641,12 +807,38 @@ impl ResidentBlockMirror {
             .map(|(key, handles)| (key.clone(), handles.len()))
             .collect();
         if expected_obligations != actual_obligations || expected_lemmas != actual_lemmas {
+            let obligation_difference = expected_obligations
+                .iter()
+                .find(|(key, expected)| actual_obligations.get(*key) != Some(*expected))
+                .map(|(key, expected)| {
+                    format!(
+                        "expected obligation {:?} x{}, actual {}",
+                        key,
+                        expected,
+                        actual_obligations.get(key).copied().unwrap_or(0)
+                    )
+                })
+                .or_else(|| {
+                    actual_obligations
+                        .iter()
+                        .find(|(key, actual)| expected_obligations.get(*key) != Some(*actual))
+                        .map(|(key, actual)| {
+                            format!(
+                                "extra obligation {:?} x{}, expected {}",
+                                key,
+                                actual,
+                                expected_obligations.get(key).copied().unwrap_or(0)
+                            )
+                        })
+                })
+                .unwrap_or_else(|| "obligations match".to_string());
             return Err(format!(
-                "resident BLOCK multiset mismatch obligations {}/{} lemmas {}/{}",
+                "resident BLOCK multiset mismatch obligations {}/{} lemmas {}/{}; {}",
                 actual_obligations.values().sum::<usize>(),
                 obligations.len(),
                 actual_lemmas.values().sum::<usize>(),
                 lemmas.len(),
+                obligation_difference,
             ));
         }
         if let Some(response) = response
@@ -1176,7 +1368,20 @@ impl ResidentBlockMirror {
             .iter()
             .map(|words| decode_operation(words))
             .collect::<Result<Vec<_>, _>>()?;
-        self.apply_operations(hardware, operations, obligation_image, lemma_image, true)
+        match self.apply_operations(hardware, operations, obligation_image, lemma_image, true) {
+            Ok(()) => Ok(()),
+            Err(error) if semantic_capacity_error(&error) => {
+                // Immutable payload arenas intentionally avoid free-list and
+                // lifetime hazards in the hot path. When append space is
+                // exhausted, RESET and rebuild only the exact live image: a
+                // copying-GC epoch boundary. The failed batch may have
+                // committed a prefix, so retrying individual operations is
+                // unsafe; a complete rebase is the transactional recovery.
+                CAPACITY_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+                self.rebase(hardware, obligation_image, lemma_image)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1236,6 +1441,32 @@ pub(super) fn run_owned_root(
         )
 }
 
+pub(super) fn run_owned_full_root(
+    hardware: &mut HardwareCdcl,
+    max_frame: u32,
+    step_limit: usize,
+    next_var_by_current: &[u32],
+    init_value_by_current: &[u32],
+    latch_variables: &[u32],
+    input_variables: &[u32],
+    query_template: &IncrementalQuery,
+) -> Result<OwnedBlockFullRootWave, String> {
+    MIRROR
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "resident BLOCK mirror lock poisoned".to_string())?
+        .run_owned_full_root(
+            hardware,
+            max_frame,
+            step_limit,
+            next_var_by_current,
+            init_value_by_current,
+            latch_variables,
+            input_variables,
+            query_template,
+        )
+}
+
 pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
     MIRROR
         .get_or_init(Default::default)
@@ -1246,9 +1477,10 @@ pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
 
 pub(super) fn report() {
     eprintln!(
-        "inductor-cdcl: live BLOCK controller steps {}, rebases {}, root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
+        "inductor-cdcl: live BLOCK controller steps {}, rebases {} (capacity compactions {}), root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
         STEPS.load(Ordering::Relaxed),
         REBASES.load(Ordering::Relaxed),
+        CAPACITY_COMPACTIONS.load(Ordering::Relaxed),
         ROOT_RECONCILES.load(Ordering::Relaxed),
         BATCHES.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
@@ -1276,4 +1508,22 @@ pub(super) fn root_metrics() -> (u64, u64, u64) {
         ROOT_WORK.load(Ordering::Relaxed),
         ROOT_SERVICE_NS.load(Ordering::Relaxed),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::semantic_capacity_error;
+
+    #[test]
+    fn only_semantic_arena_capacity_triggers_epoch_compaction() {
+        assert!(semantic_capacity_error(
+            "incremental CDCL hardware error: BlockSemantic { error: 3, completed: 1, command: 20, command_status: 2, obligation_count: 0, lemma_count: 789 }"
+        ));
+        assert!(!semantic_capacity_error(
+            "incremental CDCL hardware error: BlockSemantic { error: 3, completed: 1, command: 20, command_status: 1, obligation_count: 0, lemma_count: 789 }"
+        ));
+        assert!(!semantic_capacity_error(
+            "incremental CDCL hardware error: InvalidResponse"
+        ));
+    }
 }
