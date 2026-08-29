@@ -5,7 +5,8 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockFullRootResponse,
+    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockFullRootEvent,
+    BlockFullRootResponse,
     BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
     BlockSemanticCommandResponse, MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
     MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
@@ -4191,7 +4192,28 @@ pub fn run_resident_block_full_root(
                         query_template,
                     )
                 });
-            if result.is_err() {
+            if let Ok(wave) = &result
+                && let Some(loaded) = state.loaded_context.as_mut()
+            {
+                // The resident controller has already appended every UNSAT
+                // journal lemma to the physical formula before publishing the
+                // response. Mirror those exact ranged clauses in the client
+                // lease so the next root does not append them a second time.
+                for event in &wave.response.events {
+                    if let BlockFullRootEvent::UnsatLemma { frame, cube, .. } = event {
+                        loaded.clauses.push(ResidentClause::new(
+                            1,
+                            *frame,
+                            cube.iter()
+                                .map(|literal| {
+                                    let word = *literal ^ 1;
+                                    Lit::new(Var::from(word >> 1), word & 1 == 0)
+                                })
+                                .collect::<LitVec>(),
+                        ));
+                    }
+                }
+            } else if result.is_err() {
                 state.loaded_context = None;
             }
             result
