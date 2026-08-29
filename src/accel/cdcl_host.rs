@@ -5,7 +5,8 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BatchHeader, MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
+    ABI_VERSION, BatchHeader, BlockSemanticCommand, BlockSemanticCommandResponse,
+    MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
     MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
     MicHeader, MicResponseHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
     PROFILE_CLEANUP, PROFILE_DECIDE, PROFILE_EMIT, PROFILE_EVALUATED_LITERALS, PROFILE_LEARN,
@@ -14,7 +15,8 @@ use super::cdcl::{
     PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
     RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS, STAGE_PROFILE_MAGIC,
     STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
-    UnknownReason, WANT_STAGE_PROFILE,
+    UnknownReason, WANT_STAGE_PROFILE, decode_block_semantic_batch_response,
+    pack_block_semantic_batch,
 };
 #[cfg(has_cdcl_accel)]
 use crate::gipsat::decode_batch_results;
@@ -80,6 +82,13 @@ unsafe extern "C" {
         out_response_words: *mut u32,
     ) -> i32;
     fn ind_cdcl_solve_mic_chains(
+        request: *const u32,
+        request_words: u32,
+        response: *mut u32,
+        response_capacity_words: u32,
+        out_response_words: *mut u32,
+    ) -> i32;
+    fn ind_cdcl_run_block_semantic_batch(
         request: *const u32,
         request_words: u32,
         response: *mut u32,
@@ -1070,6 +1079,58 @@ impl HardwareCdcl {
     pub fn open_from_env() -> Result<Self, HardwareError> {
         let path = std::env::var("INDUCTOR_CDCL_ACCEL").map_err(|_| HardwareError::Unavailable)?;
         Self::open(&path)
+    }
+
+    /// Execute one atomic, packed proof-state transaction against the
+    /// resident BLOCK interpreter owned by the native/RPC service. This is a
+    /// simulation-first transport today; the direct XRT bridge deliberately
+    /// reports unsupported until the same opcode exists in the persistent
+    /// hardware command ring.
+    pub fn run_block_semantic_batch(
+        &mut self,
+        commands: &[BlockSemanticCommand],
+    ) -> Result<Vec<BlockSemanticCommandResponse>, HardwareError> {
+        let request = pack_block_semantic_batch(commands).ok_or(HardwareError::Capacity)?;
+        let response_capacity = usize::try_from(request[3]).map_err(|_| HardwareError::Capacity)?;
+        let request_words = u32::try_from(request.len()).map_err(|_| HardwareError::Capacity)?;
+        let response_capacity_words =
+            u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
+        #[cfg(has_cdcl_accel)]
+        {
+            let mut response = vec![0u32; response_capacity];
+            let mut out_words = 0u32;
+            let rc = unsafe {
+                ind_cdcl_run_block_semantic_batch(
+                    request.as_ptr(),
+                    request_words,
+                    response.as_mut_ptr(),
+                    response_capacity_words,
+                    &mut out_words,
+                )
+            };
+            if rc != 0 {
+                return Err(HardwareError::Command(rc));
+            }
+            let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
+            if out_words > response.len() {
+                return Err(HardwareError::InvalidResponse);
+            }
+            response.truncate(out_words);
+            let (error, records) = decode_block_semantic_batch_response(&response)
+                .ok_or(HardwareError::InvalidResponse)?;
+            if error != 0
+                || records.len() != commands.len()
+                || records.iter().any(|record| record.status != 0)
+            {
+                return Err(HardwareError::InvalidResponse);
+            }
+            Ok(records)
+        }
+        #[cfg(not(has_cdcl_accel))]
+        {
+            let _ = (request, request_words, response_capacity_words);
+            Err(HardwareError::Unavailable)
+        }
     }
 
     pub fn load_context(
