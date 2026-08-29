@@ -5,8 +5,7 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockFullRootEvent,
-    BlockFullRootResponse,
+    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockFullRootEvent, BlockFullRootResponse,
     BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
     BlockSemanticCommandResponse, MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
     MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
@@ -4366,10 +4365,49 @@ fn exact_mic_replay_limit() -> u64 {
     })
 }
 
+fn scope_trace_path(
+    path: std::ffi::OsString,
+    worker: Option<&std::ffi::OsStr>,
+) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(path);
+    let Some(worker) = worker else {
+        return path;
+    };
+    let worker = worker
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if worker.is_empty() {
+        return path;
+    }
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "trace".to_string());
+    let extension = path
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        .unwrap_or_default();
+    path.set_file_name(format!("{stem}.{worker}{extension}"));
+    path
+}
+
+fn worker_scoped_trace_path(path: std::ffi::OsString) -> std::path::PathBuf {
+    let worker = std::env::var_os("INDUCTOR_CDCL_PORTFOLIO_WORKER");
+    scope_trace_path(path, worker.as_deref())
+}
+
 fn exact_replay_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
     EXACT_REPLAY_WRITER
         .get_or_init(|| {
-            let path = std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY")?;
+            let path = worker_scoped_trace_path(std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY")?);
             let file = match std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -4933,7 +4971,9 @@ fn comparison_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::Fi
 fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
     ARCH_TRACE_WRITER
         .get_or_init(|| {
-            let path = std::env::var_os("INDUCTOR_CDCL_TRACE_CSV")?;
+            let path = worker_scoped_trace_path(
+                std::env::var_os("INDUCTOR_CDCL_TRACE_CSV")?,
+            );
             let file = match std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -4952,7 +4992,7 @@ fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std
             let mut writer = BufWriter::new(file);
             if writeln!(
                 writer,
-                "pass_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_scope\tcontext_vars\tcontext_clauses\tcontext_literals\tcontext_words"
+                "pass_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_scope\tcontext_vars\tcontext_clauses\tcontext_literals\tcontext_words\tready_unix_ns"
             )
             .is_err()
             {
@@ -4965,6 +5005,7 @@ fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std
 
 fn record_architecture_trace_batch(
     pass_id: u64,
+    ready_unix_ns: u128,
     context: &ShadowContext,
     pending: &[(usize, IncrementalQuery, ShadowContext)],
     cpu: &[PairedCpuWork],
@@ -5004,7 +5045,7 @@ fn record_architecture_trace_batch(
             .sum::<u64>();
         let _ = writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             pass_id,
             batch_id,
             pending.len(),
@@ -5026,6 +5067,7 @@ fn record_architecture_trace_batch(
             context.clauses.len(),
             context_literals,
             context_words,
+            ready_unix_ns,
         );
     }
 }
@@ -6202,6 +6244,14 @@ pub fn solve_active_batch_with_min(
     ACTIVE_OFFERED.fetch_add(planned_count as u64, Ordering::Relaxed);
     let retain_exact_result =
         trace_only && std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some();
+    let trace_ready_unix_ns = trace_only
+        .then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        })
+        .unwrap_or(0);
     let reference_cpu = compare_cpu
         .then(|| measure_reference_cpu(&requests, &planned, paired, retain_exact_result));
     if let Some(cpu) = reference_cpu.as_ref() {
@@ -6222,6 +6272,7 @@ pub fn solve_active_batch_with_min(
                 for range in &group.batches {
                     record_architecture_trace_batch(
                         pass_id,
+                        trace_ready_unix_ns,
                         &group.context,
                         &group.pending[range.clone()],
                         cpu,
@@ -7559,6 +7610,21 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn portfolio_trace_paths_are_worker_scoped_without_losing_extension() {
+        assert_eq!(
+            scope_trace_path(
+                "/tmp/quad.tsv".into(),
+                Some(std::ffi::OsStr::new("ic3/pred")),
+            ),
+            std::path::PathBuf::from("/tmp/quad.ic3_pred.tsv"),
+        );
+        assert_eq!(
+            scope_trace_path("/tmp/quad".into(), None),
+            std::path::PathBuf::from("/tmp/quad"),
+        );
+    }
 
     #[test]
     fn persistent_ring_tickets_keep_one_independent_wave_correlated() {

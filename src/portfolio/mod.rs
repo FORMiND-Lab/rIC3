@@ -103,13 +103,16 @@ impl Worker {
     ) -> ! {
         set_max_level(LevelFilter::Warn);
         let active_fpga = std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some();
-        let selected_fpga = active_fpga
-            && portfolio_worker_uses_fpga(
-                &self.name,
-                std::env::var("INDUCTOR_CDCL_PORTFOLIO_FPGA_WORKERS")
-                    .ok()
-                    .as_deref(),
-            );
+        let trace_active = std::env::var_os("INDUCTOR_CDCL_TRACE_CSV").is_some()
+            || std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some();
+        let selected_worker = portfolio_worker_uses_fpga(
+            &self.name,
+            std::env::var("INDUCTOR_CDCL_PORTFOLIO_FPGA_WORKERS")
+                .ok()
+                .as_deref(),
+        );
+        let selected_fpga = active_fpga && selected_worker;
+        let selected_trace = trace_active && selected_worker;
         if active_fpga && !selected_fpga {
             // This runs in the freshly forked, single-threaded child before
             // the engine or accelerator client exists. The parent and sibling
@@ -118,11 +121,21 @@ impl Worker {
                 std::env::remove_var("INDUCTOR_CDCL_ACTIVE");
                 std::env::remove_var("INDUCTOR_CDCL_SERVER");
             }
-        } else if selected_fpga {
+        }
+        if trace_active && !selected_trace {
+            // Portfolio trace capture uses one worker-scoped output file per
+            // selected independent IC3 context. Nonselected workers must not
+            // truncate the shared base path after fork.
+            unsafe {
+                std::env::remove_var("INDUCTOR_CDCL_TRACE_CSV");
+                std::env::remove_var("INDUCTOR_CDCL_EXACT_REPLAY");
+            }
+        }
+        if selected_fpga || selected_trace {
             // A portfolio time limit terminates children before their final
             // statistics report. Preserve the selected worker name in its
             // private post-fork environment so the lazy hardware connection
-            // can identify which policy actually crossed the route gate.
+            // and trace writer can identify which policy crossed the route.
             unsafe {
                 std::env::set_var("INDUCTOR_CDCL_PORTFOLIO_WORKER", &self.name);
             }
@@ -139,7 +152,8 @@ impl Worker {
         // reports the compact per-process qualification counters before
         // returning, while all other workers retain the immediate termination
         // behavior. The ctrlc `termination` feature maps SIGTERM here.
-        let _fpga_interrupt = selected_fpga.then(|| install_interrupt_handler(engine.get_ctrl()));
+        let _fpga_interrupt =
+            (selected_fpga || selected_trace).then(|| install_interrupt_handler(engine.get_ctrl()));
         let res = engine.check();
         if let Some(cert_tx) = self.cert_tx.as_ref() {
             let certificate = match res {

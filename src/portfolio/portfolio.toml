@@ -53,6 +53,31 @@ bmc_kissat_10 = "bmc --kissat --step 10"
 ic3 = "ic3"
 ic3_ctg_limit = "ic3 --ctg-max 5 --ctg-limit 15 --drop-po=false"
 
+# Four independent IC3 contexts for the simulation-first short-query supply
+# gate. They share preprocessing and the immutable transition relation, while
+# proof queues, frame clauses, trails and learnt state remain lane-private.
+# Production selection stays on fpga_pair until this quad passes native and
+# board-calibrated economics gates.
+[fpga_quad]
+ic3 = "ic3"
+ic3_ctg_limit = "ic3 --ctg-max 5 --ctg-limit 15 --drop-po=false"
+ic3_no_parent = "ic3 --drop-po=false --parent-lemma=false"
+ic3_predprop = "ic3 --pred-prop"
+
+# Eight producers feeding a four-lane resident accelerator.  This exists only
+# for the simulation-first supply/queueing gate: an FPGA build is forbidden
+# until time-aligned traces show that the extra contexts can keep four lanes
+# occupied without a latency-dominating coalescing window.
+[fpga_octet]
+ic3 = "ic3"
+ic3_ctg_limit = "ic3 --ctg-max 5 --ctg-limit 15 --drop-po=false"
+ic3_no_parent = "ic3 --drop-po=false --parent-lemma=false"
+ic3_predprop = "ic3 --pred-prop"
+ic3_abs_cst = "ic3 --abs-cst"
+ic3_abs_all = "ic3 --abs-cst --abs-trans"
+ic3_inn = "ic3 --inn"
+ic3_inn_ctp = "ic3 --inn --ctp"
+
 [bl_hwmcc]
 ic3 = "ic3"
 ic3_no_preproc = "ic3 --ctg=false --frts=false --scorr=false --drop-po=false"
