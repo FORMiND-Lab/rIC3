@@ -276,6 +276,14 @@ pub enum HardwareError {
     Open(i32),
     Command(i32),
     Decode(BatchDecodeError),
+    BlockSemantic {
+        error: u32,
+        completed: u32,
+        command: u32,
+        command_status: u32,
+        obligation_count: u32,
+        lemma_count: u32,
+    },
     InvalidResponse,
 }
 
@@ -1118,11 +1126,21 @@ impl HardwareCdcl {
             response.truncate(out_words);
             let (error, records) = decode_block_semantic_batch_response(&response)
                 .ok_or(HardwareError::InvalidResponse)?;
-            if error != 0
-                || records.len() != commands.len()
-                || records.iter().any(|record| record.status != 0)
-            {
-                return Err(HardwareError::InvalidResponse);
+            let command_status = records
+                .iter()
+                .find(|record| record.status != 0)
+                .map_or(0, |record| record.status);
+            if error != 0 || command_status != 0 || records.len() != commands.len() {
+                return Err(HardwareError::BlockSemantic {
+                    error,
+                    completed: records.len().min(u32::MAX as usize) as u32,
+                    command: commands
+                        .get(records.len().saturating_sub(1))
+                        .map_or(u32::MAX, |command| command.command),
+                    command_status,
+                    obligation_count: records.last().map_or(0, |record| record.obligation_count),
+                    lemma_count: records.last().map_or(0, |record| record.lemma_count),
+                });
             }
             Ok(records)
         }
@@ -3638,6 +3656,77 @@ pub struct ExactFrameEventCapture {
     initial_lemma_image: Vec<u32>,
 }
 
+static BLOCK_CONTROLLER_SIM_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn block_controller_sim_requested() -> bool {
+    std::env::var_os("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM").is_some()
+}
+
+fn block_controller_sim_enabled() -> bool {
+    block_controller_sim_requested() && !BLOCK_CONTROLLER_SIM_FAILED.load(Ordering::Relaxed)
+}
+
+fn block_controller_sim_strict() -> bool {
+    std::env::var("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM_STRICT")
+        .ok()
+        .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+}
+
+fn finish_block_controller_sim(result: Result<(), String>) {
+    if let Err(error) = result {
+        if !BLOCK_CONTROLLER_SIM_FAILED.swap(true, Ordering::Relaxed) {
+            eprintln!("inductor-cdcl: live BLOCK controller disabled: {error}");
+        }
+        assert!(
+            !block_controller_sim_strict(),
+            "live BLOCK controller: {error}"
+        );
+    }
+}
+
+fn reconcile_block_controller_sim(obligation_image: &[u32], lemma_image: &[u32]) {
+    if !block_controller_sim_enabled() {
+        return;
+    }
+    let state = active_state().lock();
+    let result = state
+        .map_err(|_| "active hardware lock poisoned".to_string())
+        .and_then(|mut state| {
+            let hardware = state
+                .hardware
+                .as_mut()
+                .ok_or_else(|| "active hardware transport unavailable".to_string())?;
+            super::block_controller_sim::reconcile(hardware, obligation_image, lemma_image)
+        });
+    finish_block_controller_sim(result);
+}
+
+fn apply_block_controller_sim(
+    semantic_ops: &[Vec<u32>],
+    obligation_image: &[u32],
+    lemma_image: &[u32],
+) {
+    if !block_controller_sim_enabled() {
+        return;
+    }
+    let state = active_state().lock();
+    let result = state
+        .map_err(|_| "active hardware lock poisoned".to_string())
+        .and_then(|mut state| {
+            let hardware = state
+                .hardware
+                .as_mut()
+                .ok_or_else(|| "active hardware transport unavailable".to_string())?;
+            super::block_controller_sim::apply(
+                hardware,
+                semantic_ops,
+                obligation_image,
+                lemma_image,
+            )
+        });
+    finish_block_controller_sim(result);
+}
+
 struct ExactImagePatch {
     prefix: u32,
     suffix: u32,
@@ -3956,13 +4045,15 @@ pub fn begin_exact_block_progress(
     obligation_image: Vec<u32>,
     lemma_image: Vec<u32>,
 ) -> Option<ExactBlockProgressCapture> {
-    if std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_none() {
+    if std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_none() && !block_controller_sim_requested()
+    {
         return None;
     }
     let (phase, op_id) = crate::inductor::current_macro_context();
     if phase != inductor_trace::Phase::Block || op_id == 0 {
         return None;
     }
+    reconcile_block_controller_sim(&obligation_image, &lemma_image);
     Some(ExactBlockProgressCapture {
         op_id,
         frame: frame.min(u32::MAX as usize) as u32,
@@ -3977,7 +4068,7 @@ pub fn begin_exact_block_progress(
 }
 
 pub fn exact_block_progress_enabled() -> bool {
-    std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some()
+    std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some() || block_controller_sim_requested()
 }
 
 /// Begin one direct proof-state maintenance wave.  This scope deliberately
@@ -3990,14 +4081,16 @@ pub fn begin_exact_frame_events(
     obligation_image: Vec<u32>,
     lemma_image: Vec<u32>,
 ) -> Option<ExactFrameEventCapture> {
-    std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").map(|_| {
-        ExactFrameEventCapture {
-            input_obligations: obligations,
-            input_lemmas: lemmas,
-            initial_obligation_image: obligation_image,
-            initial_lemma_image: lemma_image,
-        }
-    })
+    (std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some() || block_controller_sim_requested())
+        .then(|| {
+            reconcile_block_controller_sim(&obligation_image, &lemma_image);
+            ExactFrameEventCapture {
+                input_obligations: obligations,
+                input_lemmas: lemmas,
+                initial_obligation_image: obligation_image,
+                initial_lemma_image: lemma_image,
+            }
+        })
 }
 
 /// Close a maintenance wave with CPU images used only as an exact simulation
@@ -4012,7 +4105,10 @@ pub fn finish_exact_frame_events(
     semantic_ops: Vec<Vec<u32>>,
 ) {
     let Some(capture) = capture else { return };
-    let Some(writer) = exact_replay_writer() else { return };
+    apply_block_controller_sim(&semantic_ops, &obligation_image, &lemma_image);
+    let Some(writer) = exact_replay_writer() else {
+        return;
+    };
     let wave_id = EXACT_REPLAY_FRAME_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
     let mut words = vec![
         0,
@@ -4062,6 +4158,10 @@ pub fn note_exact_block_progress_step(
     semantic_ops: Vec<Vec<u32>>,
 ) {
     let Some(capture) = capture else { return };
+    let live_lemma_image = lemma_image
+        .as_deref()
+        .unwrap_or(&capture.current_lemma_image);
+    apply_block_controller_sim(&semantic_ops, &obligation_image, live_lemma_image);
     fn patch(previous: &mut Vec<u32>, next: Vec<u32>) -> ExactImagePatch {
         let prefix = previous
             .iter()
@@ -6346,6 +6446,9 @@ pub fn flush_and_report() {
             std::env::var("INDUCTOR_CDCL_EXACT_REPLAY").unwrap_or_else(|_| "disabled".to_string()),
             FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
         );
+        if block_controller_sim_requested() {
+            super::block_controller_sim::report();
+        }
     }
     if paired_enabled() {
         flush_comparison_writer();

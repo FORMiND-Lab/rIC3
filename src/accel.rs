@@ -13,6 +13,7 @@
 
 pub mod cdcl;
 pub mod cdcl_host;
+mod block_controller_sim;
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
