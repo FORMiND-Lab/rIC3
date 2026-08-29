@@ -81,12 +81,13 @@ pub const PORTFOLIO_MIC_RECORD_PREFIX_WORDS: usize = 2;
 // Resident BLOCK-program ABI. This is intentionally separate from ABI-v2 SAT
 // inquiries: one packet carries a bounded sequence of proof-state mutations,
 // and every command receives the exact 14-word response emitted by the shared
-// C++/HLS command interpreter.
-pub const BLOCK_SEMANTIC_BATCH_VERSION: u32 = 1;
+// C++/HLS command interpreter. ABI v2 adds a 64-bit obligation user tag to
+// each response while retaining all v1 field positions.
+pub const BLOCK_SEMANTIC_BATCH_VERSION: u32 = 2;
 pub const BLOCK_SEMANTIC_BATCH_HEADER_WORDS: usize = 4;
 pub const BLOCK_SEMANTIC_COMMAND_HEADER_WORDS: usize = 6;
 pub const BLOCK_SEMANTIC_RESPONSE_HEADER_WORDS: usize = 4;
-pub const BLOCK_SEMANTIC_COMMAND_RESPONSE_WORDS: usize = 14;
+pub const BLOCK_SEMANTIC_COMMAND_RESPONSE_WORDS: usize = 16;
 
 pub const BLOCK_SEMANTIC_RESET: u32 = 0;
 pub const BLOCK_SEMANTIC_REGISTER_OBLIGATION: u32 = 1;
@@ -113,6 +114,8 @@ pub const BLOCK_SEMANTIC_REGISTER_STATE_DELTA: u32 = 21;
 pub const BLOCK_SEMANTIC_REGISTER_INPUT_FULL: u32 = 22;
 pub const BLOCK_SEMANTIC_REGISTER_INPUT_DELTA: u32 = 23;
 pub const BLOCK_SEMANTIC_COMPOSE_OBLIGATION: u32 = 24;
+pub const BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED: u32 = 25;
+pub const BLOCK_SEMANTIC_PEEK_OBLIGATION: u32 = 26;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockSemanticCommand {
@@ -192,6 +195,8 @@ pub struct BlockSemanticCommandResponse {
     pub lemma_frame_count: u32,
     pub state_arena_words: u32,
     pub input_arena_words: u32,
+    pub popped_user_tag_lo: u32,
+    pub popped_user_tag_hi: u32,
 }
 
 impl BlockSemanticCommandResponse {
@@ -212,7 +217,13 @@ impl BlockSemanticCommandResponse {
             lemma_frame_count: words[11],
             state_arena_words: words[12],
             input_arena_words: words[13],
+            popped_user_tag_lo: words[14],
+            popped_user_tag_hi: words[15],
         })
+    }
+
+    pub fn popped_user_tag(&self) -> u64 {
+        u64::from(self.popped_user_tag_lo) | (u64::from(self.popped_user_tag_hi) << 32)
     }
 }
 
@@ -571,9 +582,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<MicHeader>(), 9 * 4);
         assert_eq!(std::mem::size_of::<MicResponseHeader>(), 12 * 4);
 
-        let mic_response = MicResponseHeader::from_words(&[
-            ABI_VERSION, 4, 4, 4, 1, 0, 7, 2, 19, 1, 0, 1,
-        ]).unwrap();
+        let mic_response =
+            MicResponseHeader::from_words(&[ABI_VERSION, 4, 4, 4, 1, 0, 7, 2, 19, 1, 0, 1])
+                .unwrap();
         assert_eq!(mic_response.trials, 4);
         assert_eq!(mic_response.physical_rounds, 1);
 
@@ -650,7 +661,7 @@ mod tests {
             BlockSemanticCommand::new(BLOCK_SEMANTIC_STATS),
         ];
         let words = pack_block_semantic_batch(&commands).unwrap();
-        assert_eq!(words[..4], [1, 7, 47, 102]);
+        assert_eq!(words[..4], [2, 7, 47, 116]);
         assert_eq!(words.len(), 51);
         assert_eq!(&words[4..10], &[BLOCK_SEMANTIC_RESET, 0, 0, 0, 0, 0]);
         assert_eq!(
@@ -662,14 +673,17 @@ mod tests {
             &[BLOCK_SEMANTIC_REGISTER_INPUT_FULL, 0, 0, 0, 0, 2, 3, 7],
         );
 
-        let mut response = vec![BLOCK_SEMANTIC_BATCH_VERSION, 1, 14, 0];
-        response.extend([0, 1, 2, 3, 10, 11, 7, 4, 5, 0, 9, 6, 2, 8]);
+        let mut response = vec![BLOCK_SEMANTIC_BATCH_VERSION, 1, 16, 0];
+        response.extend([
+            0, 1, 2, 3, 10, 11, 7, 4, 5, 0, 9, 6, 2, 8, 0x89abcdef, 0x01234567,
+        ]);
         let (error, decoded) = decode_block_semantic_batch_response(&response).unwrap();
         assert_eq!(error, 0);
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].output_handle, 7);
         assert_eq!(decoded[0].state_arena_words, 2);
-        response[2] = 13;
+        assert_eq!(decoded[0].popped_user_tag(), 0x0123456789abcdef);
+        response[2] = 15;
         assert!(decode_block_semantic_batch_response(&response).is_none());
     }
 }

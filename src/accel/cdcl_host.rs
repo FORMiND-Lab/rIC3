@@ -4903,6 +4903,10 @@ fn deterministic_active_failure(error: &HardwareError) -> bool {
     )
 }
 
+fn active_failure_is_capacity(error: &HardwareError) -> bool {
+    matches!(error, HardwareError::Capacity | HardwareError::Command(-103))
+}
+
 fn disable_active_hardware(error: &HardwareError) {
     if !ACTIVE_HARDWARE_DISABLED.swap(true, Ordering::Relaxed) {
         ACTIVE_HARDWARE_DISABLES.fetch_add(1, Ordering::Relaxed);
@@ -5804,7 +5808,22 @@ pub fn solve_active_batch_with_min(
                                     query.frame,
                                 );
                             }
-                            ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                            // A context outside the compiled hardware envelope
+                            // is an ordinary UNKNOWN/CAPACITY outcome. It must
+                            // route to CPU once, not manufacture one protocol
+                            // error for every inquiry already packed in the
+                            // frontier batch.
+                            if active_failure_is_capacity(&error) {
+                                ACTIVE_UNKNOWN.fetch_add(
+                                    (end - start) as u64,
+                                    Ordering::Relaxed,
+                                );
+                            } else {
+                                ACTIVE_ERROR.fetch_add(
+                                    (end - start) as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                             disable_active_hardware(&error);
                             break 'groups;
                         }
@@ -6997,6 +7016,16 @@ mod tests {
         assert!(!deterministic_active_failure(&HardwareError::Command(-100)));
         assert!(!deterministic_active_failure(&HardwareError::Command(-32)));
         assert!(!deterministic_active_failure(&HardwareError::Unavailable));
+    }
+
+    #[test]
+    fn only_capacity_failures_are_accounted_as_hardware_unknowns() {
+        assert!(active_failure_is_capacity(&HardwareError::Capacity));
+        assert!(active_failure_is_capacity(&HardwareError::Command(-103)));
+        assert!(!active_failure_is_capacity(&HardwareError::Command(-104)));
+        assert!(!active_failure_is_capacity(&HardwareError::Command(-102)));
+        assert!(!active_failure_is_capacity(&HardwareError::Command(-101)));
+        assert!(!active_failure_is_capacity(&HardwareError::Unavailable));
     }
 
     #[test]

@@ -115,7 +115,23 @@ const BLOCK_SEMANTIC_INSERT_OBLIGATION: u32 = 1;
 const BLOCK_SEMANTIC_CLEAR_OBLIGATIONS: u32 = 2;
 const BLOCK_SEMANTIC_REMOVE_LEMMA: u32 = 3;
 const BLOCK_SEMANTIC_INSERT_LEMMA: u32 = 4;
+// A queue-owned pop is distinct from an arbitrary descriptor removal. The
+// resident controller must independently choose the same heap head and return
+// its opaque tag before CPU proof processing continues.
+const BLOCK_SEMANTIC_POP_OBLIGATION: u32 = 7;
 type ExactBlockSemanticOps = Option<Vec<Vec<u32>>>;
+
+fn exact_obligation_payload(po: &ProofObligation) -> Vec<u32> {
+    let mut payload = Vec::new();
+    payload.push(po.state.len().min(u32::MAX as usize) as u32);
+    payload.extend(po.state.iter().map(|lit| u32::from(*lit)));
+    payload.push(po.input.len().min(u32::MAX as usize) as u32);
+    for inputs in &po.input {
+        payload.push(inputs.len().min(u32::MAX as usize) as u32);
+        payload.extend(inputs.iter().map(|lit| u32::from(*lit)));
+    }
+    payload
+}
 
 fn note_exact_obligation_op(
     operations: &mut ExactBlockSemanticOps,
@@ -125,16 +141,30 @@ fn note_exact_obligation_op(
     let Some(operations) = operations.as_mut() else {
         return;
     };
-    let mut payload = Vec::new();
-    payload.push(po.state.len().min(u32::MAX as usize) as u32);
-    payload.extend(po.state.iter().map(|lit| u32::from(*lit)));
-    payload.push(po.input.len().min(u32::MAX as usize) as u32);
-    for inputs in &po.input {
-        payload.push(inputs.len().min(u32::MAX as usize) as u32);
-        payload.extend(inputs.iter().map(|lit| u32::from(*lit)));
-    }
+    let payload = exact_obligation_payload(po);
     let mut operation = vec![
         command,
+        po.frame.min(u32::MAX as usize) as u32,
+        po.depth.min(u32::MAX as usize) as u32,
+        u32::from(po.removed),
+        payload.len().min(u32::MAX as usize) as u32,
+    ];
+    operation.extend(payload);
+    operations.push(operation);
+}
+
+fn note_exact_obligation_pop(
+    operations: &mut ExactBlockSemanticOps,
+    max_frame: usize,
+    po: &ProofObligation,
+) {
+    let Some(operations) = operations.as_mut() else {
+        return;
+    };
+    let payload = exact_obligation_payload(po);
+    let mut operation = vec![
+        BLOCK_SEMANTIC_POP_OBLIGATION,
+        max_frame.min(u32::MAX as usize) as u32,
         po.frame.min(u32::MAX as usize) as u32,
         po.depth.min(u32::MAX as usize) as u32,
         u32::from(po.removed),
@@ -1653,11 +1683,7 @@ impl IC3 {
             let mut po = if let Some(po) = next {
                 po
             } else if let Some(po) = self.obligations.pop(self.level()) {
-                note_exact_obligation_op(
-                    &mut semantic_ops,
-                    BLOCK_SEMANTIC_REMOVE_OBLIGATION,
-                    &po,
-                );
+                note_exact_obligation_pop(&mut semantic_ops, self.level(), &po);
                 po
             } else {
                 self.note_exact_block_step(

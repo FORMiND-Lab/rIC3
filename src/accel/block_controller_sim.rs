@@ -9,10 +9,10 @@
 use super::{
     cdcl::{
         BLOCK_SEMANTIC_COMPOSE_OBLIGATION, BLOCK_SEMANTIC_EVENT_CLEAR_OBLIGATIONS,
-        BLOCK_SEMANTIC_EVENT_INSERT_LEMMA, BLOCK_SEMANTIC_EVENT_INSERT_OBLIGATION,
-        BLOCK_SEMANTIC_EVENT_MOVE_LEMMA, BLOCK_SEMANTIC_EVENT_REMOVE_LEMMA,
-        BLOCK_SEMANTIC_EVENT_REMOVE_OBLIGATION, BLOCK_SEMANTIC_EVENT_SET_LEMMA_FRAMES,
-        BLOCK_SEMANTIC_INSERT_LEMMA, BLOCK_SEMANTIC_INSERT_OBLIGATION,
+        BLOCK_SEMANTIC_EVENT_INSERT_LEMMA, BLOCK_SEMANTIC_EVENT_MOVE_LEMMA,
+        BLOCK_SEMANTIC_EVENT_REMOVE_LEMMA, BLOCK_SEMANTIC_EVENT_REMOVE_OBLIGATION,
+        BLOCK_SEMANTIC_EVENT_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_INSERT_LEMMA,
+        BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED, BLOCK_SEMANTIC_POP_OBLIGATION,
         BLOCK_SEMANTIC_REGISTER_LEMMA, BLOCK_SEMANTIC_REGISTER_STATE_FULL, BLOCK_SEMANTIC_RESET,
         BLOCK_SEMANTIC_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_STATS, BlockSemanticCommand,
         BlockSemanticCommandResponse,
@@ -34,6 +34,7 @@ const JOURNAL_REMOVE_LEMMA: u32 = 3;
 const JOURNAL_INSERT_LEMMA: u32 = 4;
 const JOURNAL_SET_LEMMA_FRAMES: u32 = 5;
 const JOURNAL_MOVE_LEMMA: u32 = 6;
+const JOURNAL_POP_OBLIGATION: u32 = 7;
 
 static MIRROR: OnceLock<Mutex<ResidentBlockMirror>> = OnceLock::new();
 static BATCHES: AtomicU64 = AtomicU64::new(0);
@@ -49,6 +50,7 @@ static MAX_OBLIGATION_ARENA: AtomicU64 = AtomicU64::new(0);
 static MAX_LEMMA_ARENA: AtomicU64 = AtomicU64::new(0);
 static MAX_STATE_ARENA: AtomicU64 = AtomicU64::new(0);
 static MAX_INPUT_ARENA: AtomicU64 = AtomicU64::new(0);
+static QUEUE_POPS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct Obligation {
@@ -87,14 +89,27 @@ enum JournalOperation {
     RemoveLemma(Lemma),
     InsertLemma(Lemma),
     SetLemmaFrames(u32),
-    MoveLemma { source: Lemma, destination: u32 },
+    MoveLemma {
+        source: Lemma,
+        destination: u32,
+    },
+    PopObligation {
+        max_frame: u32,
+        expected: Obligation,
+    },
 }
 
 enum PendingAction {
     None,
-    InsertObligation(Vec<u32>),
+    InsertObligation { key: Vec<u32>, user_tag: u64 },
     InsertLemma(Vec<u32>),
     MoveLemma { key: Vec<u32>, handle: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResidentObligationDescriptor {
+    handle: u32,
+    user_tag: u64,
 }
 
 #[derive(Default)]
@@ -105,8 +120,9 @@ struct ResidentBlockMirror {
     obligation_payloads: HashMap<Vec<u32>, u32>,
     obligation_state_payloads: HashMap<Vec<u32>, u32>,
     lemma_payloads: HashMap<Vec<u32>, u32>,
-    obligation_descriptors: HashMap<Vec<u32>, Vec<u32>>,
+    obligation_descriptors: HashMap<Vec<u32>, Vec<ResidentObligationDescriptor>>,
     lemma_descriptors: HashMap<Vec<u32>, Vec<u32>>,
+    next_user_tag: u64,
 }
 
 fn take(words: &[u32], at: &mut usize) -> Result<u32, String> {
@@ -236,6 +252,22 @@ fn decode_operation(words: &[u32]) -> Result<JournalOperation, String> {
                 destination,
             }
         }
+        JOURNAL_POP_OBLIGATION => {
+            let max_frame = take(words, &mut at)?;
+            let frame = take(words, &mut at)?;
+            let depth = take(words, &mut at)?;
+            let removed = take(words, &mut at)?;
+            let payload_words = take(words, &mut at)? as usize;
+            JournalOperation::PopObligation {
+                max_frame,
+                expected: Obligation {
+                    frame,
+                    depth,
+                    removed,
+                    payload: take_payload(words, &mut at, payload_words)?,
+                },
+            }
+        }
         _ => return Err(format!("unknown BLOCK journal operation {command}")),
     };
     if at != words.len() {
@@ -312,6 +344,26 @@ fn multiset<T>(items: &[T], key: impl Fn(&T) -> Vec<u32>) -> HashMap<Vec<u32>, u
 }
 
 impl ResidentBlockMirror {
+    fn allocate_user_tag(&mut self) -> u64 {
+        self.next_user_tag = self.next_user_tag.wrapping_add(1).max(1);
+        self.next_user_tag
+    }
+
+    fn tagged_obligation_insert(
+        &mut self,
+        obligation: &Obligation,
+        payload_handle: u32,
+    ) -> (BlockSemanticCommand, u64) {
+        let user_tag = self.allocate_user_tag();
+        let mut insert = command(BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED);
+        insert.frame = obligation.frame;
+        insert.depth = obligation.depth;
+        insert.removed = obligation.removed;
+        insert.handle = payload_handle;
+        insert.payload = vec![user_tag as u32, (user_tag >> 32) as u32];
+        (insert, user_tag)
+    }
+
     fn register_obligation_payloads(
         &mut self,
         hardware: &mut HardwareCdcl,
@@ -459,16 +511,13 @@ impl ResidentBlockMirror {
         let mut insertion = Vec::with_capacity(obligations.len() + lemmas.len() + 1);
         let mut obligation_descriptor_keys = Vec::new();
         for obligation in &obligations {
-            let mut insert = command(BLOCK_SEMANTIC_INSERT_OBLIGATION);
-            insert.frame = obligation.frame;
-            insert.depth = obligation.depth;
-            insert.removed = obligation.removed;
-            insert.handle = *self
+            let payload_handle = *self
                 .obligation_payloads
                 .get(&obligation.payload)
                 .ok_or_else(|| "missing registered obligation payload".to_string())?;
+            let (insert, user_tag) = self.tagged_obligation_insert(obligation, payload_handle);
             insertion.push(insert);
-            obligation_descriptor_keys.push(obligation.key());
+            obligation_descriptor_keys.push((obligation.key(), user_tag));
         }
         let obligation_insertion_end = insertion.len();
         let mut lemma_descriptor_keys = Vec::new();
@@ -484,14 +533,16 @@ impl ResidentBlockMirror {
         }
         insertion.push(command(BLOCK_SEMANTIC_STATS));
         let response = issue(hardware, &insertion)?;
-        for (key, record) in obligation_descriptor_keys
+        for ((key, user_tag), record) in obligation_descriptor_keys
             .into_iter()
             .zip(response[..obligation_insertion_end].iter())
         {
-            self.obligation_descriptors
-                .entry(key)
-                .or_default()
-                .push(record.output_handle);
+            self.obligation_descriptors.entry(key).or_default().push(
+                ResidentObligationDescriptor {
+                    handle: record.output_handle,
+                    user_tag,
+                },
+            );
         }
         for (key, record) in lemma_descriptor_keys
             .into_iter()
@@ -649,11 +700,14 @@ impl ResidentBlockMirror {
         for (action, record) in actions.drain(..).zip(&response) {
             match action {
                 PendingAction::None => {}
-                PendingAction::InsertObligation(key) => self
-                    .obligation_descriptors
-                    .entry(key)
-                    .or_default()
-                    .push(record.output_handle),
+                PendingAction::InsertObligation { key, user_tag } => {
+                    self.obligation_descriptors.entry(key).or_default().push(
+                        ResidentObligationDescriptor {
+                            handle: record.output_handle,
+                            user_tag,
+                        },
+                    )
+                }
                 PendingAction::InsertLemma(key) => self
                     .lemma_descriptors
                     .entry(key)
@@ -705,30 +759,75 @@ impl ResidentBlockMirror {
                         .obligation_descriptors
                         .get_mut(&key)
                         .ok_or_else(|| "remove of unknown obligation".to_string())?;
-                    let handle = handles
+                    let descriptor = handles
                         .pop()
                         .ok_or_else(|| "empty obligation descriptor stack".to_string())?;
                     if handles.is_empty() {
                         self.obligation_descriptors.remove(&key);
                     }
                     let mut remove = command(BLOCK_SEMANTIC_EVENT_REMOVE_OBLIGATION);
-                    remove.handle = handle;
+                    remove.handle = descriptor.handle;
                     commands.push(remove);
                     actions.push(PendingAction::None);
                 }
                 JournalOperation::InsertObligation(obligation) => {
                     let key = obligation.key();
-                    let mut insert = command(BLOCK_SEMANTIC_EVENT_INSERT_OBLIGATION);
-                    insert.frame = obligation.frame;
-                    insert.depth = obligation.depth;
-                    insert.removed = obligation.removed;
-                    insert.handle = *self
+                    let payload_handle = *self
                         .obligation_payloads
                         .get(&obligation.payload)
                         .ok_or_else(|| "insert uses unknown obligation payload".to_string())?;
+                    let (insert, user_tag) =
+                        self.tagged_obligation_insert(&obligation, payload_handle);
                     commands.push(insert);
-                    actions.push(PendingAction::InsertObligation(key.clone()));
+                    actions.push(PendingAction::InsertObligation {
+                        key: key.clone(),
+                        user_tag,
+                    });
                     pending_obligations.insert(key);
+                }
+                JournalOperation::PopObligation {
+                    max_frame,
+                    expected,
+                } => {
+                    let _ = self.flush_pending(
+                        hardware,
+                        &mut commands,
+                        &mut actions,
+                        &mut pending_obligations,
+                        &mut pending_lemmas,
+                    )?;
+                    let key = expected.key();
+                    let mut pop = command(BLOCK_SEMANTIC_POP_OBLIGATION);
+                    pop.frame = max_frame;
+                    let response = issue(hardware, &[pop])?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| "missing resident queue pop response".to_string())?;
+                    if response.found == 0 {
+                        return Err("resident queue missed CPU obligation pop".to_string());
+                    }
+                    let handles = self.obligation_descriptors.get_mut(&key).ok_or_else(|| {
+                        "resident queue popped a different obligation".to_string()
+                    })?;
+                    let position = handles
+                        .iter()
+                        .position(|descriptor| {
+                            descriptor.handle == response.output_handle
+                                && descriptor.user_tag == response.popped_user_tag()
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "resident queue tag mismatch handle {} tag {}",
+                                response.output_handle,
+                                response.popped_user_tag(),
+                            )
+                        })?;
+                    handles.swap_remove(position);
+                    if handles.is_empty() {
+                        self.obligation_descriptors.remove(&key);
+                    }
+                    QUEUE_POPS.fetch_add(1, Ordering::Relaxed);
+                    last_response = Some(response);
                 }
                 JournalOperation::ClearObligations => {
                     last_response = self.flush_pending(
@@ -892,7 +991,7 @@ pub(super) fn apply(
 
 pub(super) fn report() {
     eprintln!(
-        "inductor-cdcl: live BLOCK controller steps {}, rebases {}, root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words",
+        "inductor-cdcl: live BLOCK controller steps {}, rebases {}, root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}",
         STEPS.load(Ordering::Relaxed),
         REBASES.load(Ordering::Relaxed),
         ROOT_RECONCILES.load(Ordering::Relaxed),
@@ -906,5 +1005,6 @@ pub(super) fn report() {
         MAX_LEMMA_ARENA.load(Ordering::Relaxed),
         MAX_STATE_ARENA.load(Ordering::Relaxed),
         MAX_INPUT_ARENA.load(Ordering::Relaxed),
+        QUEUE_POPS.load(Ordering::Relaxed),
     );
 }
