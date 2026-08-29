@@ -4,6 +4,7 @@ use giputils::hash::GHashSet;
 use giputils::ptr::Grc;
 use logicrs::{Lit, LitOrdVec, LitSet, LitVec, Var, satif::Satif};
 use std::{
+    cell::RefCell,
     fmt::Write,
     ops::{Deref, DerefMut, Index},
     vec,
@@ -14,6 +15,31 @@ pub struct FrameLemma {
     lemma: LitOrdVec,
     pub po: Option<ProofObligation>,
     pub _ctp: Option<LitVec>,
+}
+
+/// Exact-replay journal entry produced at the real lemma mutation site.  The
+/// BLOCK resident-controller simulation consumes these entries directly;
+/// canonical frame images remain an independent correctness oracle only.
+#[derive(Clone)]
+pub(super) struct BlockLemmaMutation {
+    pub insert: bool,
+    pub frame: usize,
+    pub lemma: LitVec,
+}
+
+thread_local! {
+    static BLOCK_LEMMA_JOURNAL: RefCell<Option<Vec<BlockLemmaMutation>>> =
+        const { RefCell::new(None) };
+}
+
+pub(super) fn begin_block_lemma_journal(enabled: bool) {
+    BLOCK_LEMMA_JOURNAL.with(|journal| {
+        *journal.borrow_mut() = enabled.then(Vec::new);
+    });
+}
+
+pub(super) fn finish_block_lemma_journal() -> Vec<BlockLemmaMutation> {
+    BLOCK_LEMMA_JOURNAL.with(|journal| journal.borrow_mut().take().unwrap_or_default())
 }
 
 impl FrameLemma {
@@ -305,6 +331,38 @@ impl IC3 {
         contained_check: bool,
         po: Option<ProofObligation>,
     ) -> bool {
+        self.add_lemma_with_mutations(frame, lemma, contained_check, po, None)
+    }
+
+    #[inline]
+    pub(super) fn add_lemma_with_mutations(
+        &mut self,
+        frame: usize,
+        lemma: LitVec,
+        contained_check: bool,
+        po: Option<ProofObligation>,
+        mut mutations: Option<&mut Vec<BlockLemmaMutation>>,
+    ) -> bool {
+        fn record(
+            mutations: &mut Option<&mut Vec<BlockLemmaMutation>>,
+            insert: bool,
+            frame: usize,
+            lemma: &LitOrdVec,
+        ) {
+            let mutation = BlockLemmaMutation {
+                insert,
+                frame,
+                lemma: lemma.as_litvec().clone(),
+            };
+            BLOCK_LEMMA_JOURNAL.with(|journal| {
+                if let Some(journal) = journal.borrow_mut().as_mut() {
+                    journal.push(mutation.clone());
+                }
+            });
+            if let Some(mutations) = mutations.as_deref_mut() {
+                mutations.push(mutation);
+            }
+        }
         let lemma = LitOrdVec::new(lemma);
         if frame == 0 {
             assert_eq!(self.frame.len(), 1);
@@ -316,6 +374,7 @@ impl IC3 {
             let clause = !lemma.as_litvec();
             crate::accel::cdcl_host::register_frame_resident_clause(&clause, 0, 0);
             self.solvers[0].add_clause(&clause);
+            record(&mut mutations, true, 0, &lemma);
             self.frame.frames[0].push(FrameLemma::new(lemma, po, None));
             return false;
         }
@@ -330,7 +389,8 @@ impl IC3 {
                 let l = &self.frame[i][j];
                 if begin.is_none() && l.subsume(&lemma) {
                     if l.eq(&lemma) {
-                        self.frame.frames[i].swap_remove(j);
+                        let removed = self.frame.frames[i].swap_remove(j);
+                        record(&mut mutations, false, i, &removed);
                         let clause = !lemma.as_litvec();
                         crate::accel::cdcl_host::register_frame_resident_clause(
                             &clause,
@@ -345,6 +405,7 @@ impl IC3 {
                         {
                             predprop.add_lemma(&lemma);
                         }
+                        record(&mut mutations, true, frame, &lemma);
                         self.frame.frames[frame].push(FrameLemma::new(lemma, po, None));
                         self.frame.early = self.frame.early.min(i + 1);
                         return self.frame[i].is_empty();
@@ -354,7 +415,8 @@ impl IC3 {
                     }
                 }
                 if lemma.subsume(l) {
-                    let _remove = self.frame.frames[i].swap_remove(j);
+                    let remove = self.frame.frames[i].swap_remove(j);
+                    record(&mut mutations, false, i, &remove);
                     // self.solvers[i].remove_lemma(&remove);
                     continue;
                 }
@@ -398,6 +460,7 @@ impl IC3 {
         {
             predprop.add_lemma(&lemma);
         }
+        record(&mut mutations, true, frame, &lemma);
         self.frame.frames[frame].push(FrameLemma::new(lemma, po, None));
         self.frame.early = self.frame.early.min(begin);
         inv_found

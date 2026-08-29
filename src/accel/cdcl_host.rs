@@ -3504,7 +3504,11 @@ fn measure_reference_cpu(
 // ring model for every query. The server remains the sole SQ producer: it
 // resolves the lease/epoch and assigns a physical lane before constructing the
 // 64-byte ABI-v2 descriptor.
-const EXACT_REPLAY_VERSION: u32 = 6;
+// Version 7 appends an event-owned semantic operation stream to every BLOCK
+// instruction.  Unlike the version-6 image patch, these operands are emitted
+// at the queue/frame mutation sites and can therefore drive a resident
+// controller without reconstructing work from CPU post-images.
+const EXACT_REPLAY_VERSION: u32 = 7;
 const EXACT_REPLAY_BATCH: u32 = 1;
 const EXACT_REPLAY_MIC: u32 = 2;
 const EXACT_REPLAY_BLOCK_PROGRESS_RECORD: u32 = 3;
@@ -3568,6 +3572,7 @@ struct ExactBlockProgressStep {
     lemmas: (usize, u64),
     obligation_patch: ExactImagePatch,
     lemma_patch: Option<ExactImagePatch>,
+    semantic_ops: Vec<Vec<u32>>,
 }
 
 fn exact_replay_roots() -> &'static std::sync::Mutex<HashSet<u32>> {
@@ -3907,6 +3912,7 @@ pub fn note_exact_block_progress_step(
     lemmas: (usize, u64),
     obligation_image: Vec<u32>,
     lemma_image: Option<Vec<u32>>,
+    semantic_ops: Vec<Vec<u32>>,
 ) {
     let Some(capture) = capture else { return };
     fn patch(previous: &mut Vec<u32>, next: Vec<u32>) -> ExactImagePatch {
@@ -3937,6 +3943,7 @@ pub fn note_exact_block_progress_step(
         lemmas,
         obligation_patch,
         lemma_patch,
+        semantic_ops,
     });
 }
 
@@ -3997,6 +4004,10 @@ pub fn finish_exact_block_progress(
                 words.extend(patch.append);
             }
             None => words.push(0),
+        }
+        words.push(step.semantic_ops.len().min(u32::MAX as usize) as u32);
+        for operation in step.semantic_ops {
+            words.extend(operation);
         }
     }
     words[0] = (words.len() - 1) as u32;

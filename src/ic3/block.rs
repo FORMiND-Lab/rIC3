@@ -1,5 +1,9 @@
 use crate::ic3::{
     IC3,
+    frame::{
+        BlockLemmaMutation, begin_block_lemma_journal,
+        finish_block_lemma_journal,
+    },
     mab::branch_act,
     mic::{DropVarParameter, MicType},
     proofoblig::ProofObligation,
@@ -102,6 +106,72 @@ const BLOCK_STEP_PREDECESSOR: u32 = 7;
 const BLOCK_STEP_SUCCESS: u32 = 8;
 const BLOCK_STEP_FAILURE: u32 = 9;
 const BLOCK_STEP_TIMEOUT: u32 = 10;
+
+// Version-7 event operands. Each operation is self-delimiting and is emitted
+// where the algorithm actually mutates its queue/frame, never by comparing
+// CPU boundary images. Keep these values in sync with the native replayer.
+const BLOCK_SEMANTIC_REMOVE_OBLIGATION: u32 = 0;
+const BLOCK_SEMANTIC_INSERT_OBLIGATION: u32 = 1;
+const BLOCK_SEMANTIC_CLEAR_OBLIGATIONS: u32 = 2;
+const BLOCK_SEMANTIC_REMOVE_LEMMA: u32 = 3;
+const BLOCK_SEMANTIC_INSERT_LEMMA: u32 = 4;
+type ExactBlockSemanticOps = Option<Vec<Vec<u32>>>;
+
+fn note_exact_obligation_op(
+    operations: &mut ExactBlockSemanticOps,
+    command: u32,
+    po: &ProofObligation,
+) {
+    let Some(operations) = operations.as_mut() else {
+        return;
+    };
+    let mut payload = Vec::new();
+    payload.push(po.state.len().min(u32::MAX as usize) as u32);
+    payload.extend(po.state.iter().map(|lit| u32::from(*lit)));
+    payload.push(po.input.len().min(u32::MAX as usize) as u32);
+    for inputs in &po.input {
+        payload.push(inputs.len().min(u32::MAX as usize) as u32);
+        payload.extend(inputs.iter().map(|lit| u32::from(*lit)));
+    }
+    let mut operation = vec![
+        command,
+        po.frame.min(u32::MAX as usize) as u32,
+        po.depth.min(u32::MAX as usize) as u32,
+        u32::from(po.removed),
+        payload.len().min(u32::MAX as usize) as u32,
+    ];
+    operation.extend(payload);
+    operations.push(operation);
+}
+
+fn note_exact_clear_obligations(operations: &mut ExactBlockSemanticOps) {
+    if let Some(operations) = operations.as_mut() {
+        operations.push(vec![BLOCK_SEMANTIC_CLEAR_OBLIGATIONS]);
+    }
+}
+
+fn note_exact_lemma_mutations(
+    operations: &mut ExactBlockSemanticOps,
+    mutations: Vec<BlockLemmaMutation>,
+) {
+    let Some(operations) = operations.as_mut() else {
+        return;
+    };
+    for mutation in mutations {
+        let mut operation = vec![
+            if mutation.insert {
+                BLOCK_SEMANTIC_INSERT_LEMMA
+            } else {
+                BLOCK_SEMANTIC_REMOVE_LEMMA
+            },
+            mutation.frame.min(u32::MAX as usize) as u32,
+            mutation.lemma.len().min(u32::MAX as usize) as u32 + 1,
+            mutation.lemma.len().min(u32::MAX as usize) as u32,
+        ];
+        operation.extend(mutation.lemma.iter().map(|lit| u32::from(*lit)));
+        operations.push(operation);
+    }
+}
 
 pub(super) struct BlockAccelPolicy {
     cpu_samples_ns: VecDeque<u64>,
@@ -1392,11 +1462,32 @@ impl IC3 {
         (self.level() + 1, cube)
     }
 
-    fn generalize(&mut self, mut po: ProofObligation, mic_type: MicType) -> bool {
+    fn generalize(
+        &mut self,
+        mut po: ProofObligation,
+        mic_type: MicType,
+        semantic_ops: &mut ExactBlockSemanticOps,
+    ) -> bool {
+        begin_block_lemma_journal(semantic_ops.is_some());
         let Some(mut mic) = self.solvers[po.frame - 1].inductive_core() else {
             po.frame += 1;
             self.add_obligation(po.clone());
-            return self.add_lemma(po.frame - 1, po.state.as_litvec().clone(), false, Some(po));
+            note_exact_obligation_op(
+                semantic_ops,
+                BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                &po,
+            );
+            let proved = self.add_lemma(
+                po.frame - 1,
+                po.state.as_litvec().clone(),
+                false,
+                Some(po),
+            );
+            note_exact_lemma_mutations(
+                semantic_ops,
+                finish_block_lemma_journal(),
+            );
+            return proved;
         };
         let original_cube_size = mic.len();
         mic = self.mic(po.frame, mic, &[], mic_type);
@@ -1408,7 +1499,17 @@ impl IC3 {
         self.statistic.avg_po_cube_len += po.state.len();
         po.push_to(frame);
         self.add_obligation(po.clone());
-        if self.add_lemma(frame - 1, mic.clone(), false, Some(po)) {
+        note_exact_obligation_op(
+            semantic_ops,
+            BLOCK_SEMANTIC_INSERT_OBLIGATION,
+            &po,
+        );
+        let proved = self.add_lemma(frame - 1, mic.clone(), false, Some(po));
+        note_exact_lemma_mutations(
+            semantic_ops,
+            finish_block_lemma_journal(),
+        );
+        if proved {
             return true;
         }
         false
@@ -1437,9 +1538,18 @@ impl IC3 {
         }
     }
 
-    fn restore_block_wave(&mut self, block_wave: &mut VecDeque<ProofObligation>) {
+    fn restore_block_wave(
+        &mut self,
+        block_wave: &mut VecDeque<ProofObligation>,
+        semantic_ops: &mut ExactBlockSemanticOps,
+    ) {
         while let Some(po) = block_wave.pop_front() {
             if !po.removed && !self.obligations.contains(&po) {
+                note_exact_obligation_op(
+                    semantic_ops,
+                    BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                    &po,
+                );
                 self.obligations.add(po);
             }
         }
@@ -1449,6 +1559,7 @@ impl IC3 {
         &self,
         progress: &mut Option<crate::accel::cdcl_host::ExactBlockProgressCapture>,
         event: u32,
+        semantic_ops: ExactBlockSemanticOps,
     ) {
         let Some(progress) = progress.as_mut() else {
             return;
@@ -1461,6 +1572,7 @@ impl IC3 {
             self.obligations.progress_image(),
             matches!(event, BLOCK_STEP_GENERALIZED | BLOCK_STEP_PROVED)
                 .then(|| self.frame.progress_image()),
+            semantic_ops.unwrap_or_default(),
         );
     }
 
@@ -1516,6 +1628,7 @@ impl IC3 {
         let block_wave_enabled = crate::accel::cdcl_host::block_batch_enabled()
             && BlockBatchCache::wavefront_enabled();
         loop {
+            let mut semantic_ops = progress.as_ref().map(|_| Vec::new());
             let mut from_wave = false;
             let mut next = None;
             while let Some(candidate) = block_wave.pop_front() {
@@ -1523,12 +1636,35 @@ impl IC3 {
                 // fresher obligation for the same state. Prefer that record
                 // (notably its predecessor chain), otherwise consume the
                 // reservation removed from the global set at batch creation.
-                next = Some(self.obligations.take(&candidate).unwrap_or(candidate));
+                let taken = self.obligations.take(&candidate);
+                if let Some(taken) = taken {
+                    note_exact_obligation_op(
+                        &mut semantic_ops,
+                        BLOCK_SEMANTIC_REMOVE_OBLIGATION,
+                        &taken,
+                    );
+                    next = Some(taken);
+                } else {
+                    next = Some(candidate);
+                }
                 from_wave = true;
                 break;
             }
-            let Some(mut po) = next.or_else(|| self.obligations.pop(self.level())) else {
-                self.note_exact_block_step(progress, BLOCK_STEP_SUCCESS);
+            let mut po = if let Some(po) = next {
+                po
+            } else if let Some(po) = self.obligations.pop(self.level()) {
+                note_exact_obligation_op(
+                    &mut semantic_ops,
+                    BLOCK_SEMANTIC_REMOVE_OBLIGATION,
+                    &po,
+                );
+                po
+            } else {
+                self.note_exact_block_step(
+                    progress,
+                    BLOCK_STEP_SUCCESS,
+                    semantic_ops,
+                );
                 break;
             };
             if from_wave {
@@ -1542,59 +1678,99 @@ impl IC3 {
             let mut cached_block = block_batch.take(&po, true);
             self.render_progress();
             if po.removed {
-                self.note_exact_block_step(progress, BLOCK_STEP_DISCARD_REMOVED);
+                self.note_exact_block_step(
+                    progress,
+                    BLOCK_STEP_DISCARD_REMOVED,
+                    semantic_ops,
+                );
                 continue;
             }
             if let Some(limit) = limit
                 && noc as f64 > limit
             {
-                self.restore_block_wave(&mut block_wave);
-                self.note_exact_block_step(progress, BLOCK_STEP_LIMIT);
+                self.restore_block_wave(&mut block_wave, &mut semantic_ops);
+                self.note_exact_block_step(progress, BLOCK_STEP_LIMIT, semantic_ops);
                 return BlockResult::BlockLimitExceeded;
             }
             if self.ctrl.is_terminated() {
-                self.restore_block_wave(&mut block_wave);
-                self.note_exact_block_step(progress, BLOCK_STEP_TIMEOUT);
+                self.restore_block_wave(&mut block_wave, &mut semantic_ops);
+                self.note_exact_block_step(progress, BLOCK_STEP_TIMEOUT, semantic_ops);
                 return BlockResult::OverallTimeLimitExceeded;
             }
             if let Some(limit) = self.cfg.time_limit
                 && self.statistic.time.time().as_secs() > limit
             {
-                self.restore_block_wave(&mut block_wave);
-                self.note_exact_block_step(progress, BLOCK_STEP_TIMEOUT);
+                self.restore_block_wave(&mut block_wave, &mut semantic_ops);
+                self.note_exact_block_step(progress, BLOCK_STEP_TIMEOUT, semantic_ops);
                 return BlockResult::OverallTimeLimitExceeded;
             }
             if self.tsctx.cube_subsume_init(&po.state) {
                 if self.cfg.abs_cst || self.cfg.abs_trans {
                     self.add_obligation(po.clone());
+                    note_exact_obligation_op(
+                        &mut semantic_ops,
+                        BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                        &po,
+                    );
                     if self.check_cex_by_bmc(po.depth) {
-                        self.note_exact_block_step(progress, BLOCK_STEP_FAILURE);
+                        self.note_exact_block_step(
+                            progress,
+                            BLOCK_STEP_FAILURE,
+                            semantic_ops,
+                        );
                         return BlockResult::Failure(po.depth);
                     }
                     self.obligations.clear();
+                    note_exact_clear_obligations(&mut semantic_ops);
                     self.frame.clear_po();
-                    self.note_exact_block_step(progress, BLOCK_STEP_SUBSUME_CLEAR);
+                    self.note_exact_block_step(
+                        progress,
+                        BLOCK_STEP_SUBSUME_CLEAR,
+                        semantic_ops,
+                    );
                     continue;
                 } else if po.frame > 0 {
                     let lemma = po.state.as_litvec();
                     debug_assert!(!self.solvers[0].solve(lemma));
                 } else {
                     self.add_obligation(po.clone());
-                    self.note_exact_block_step(progress, BLOCK_STEP_FAILURE);
+                    note_exact_obligation_op(
+                        &mut semantic_ops,
+                        BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                        &po,
+                    );
+                    self.note_exact_block_step(
+                        progress,
+                        BLOCK_STEP_FAILURE,
+                        semantic_ops,
+                    );
                     return BlockResult::Failure(po.depth);
                 }
             }
             if let Some((bf, _)) = self.frame.trivial_contained(Some(po.frame), &po.state) {
                 if let Some(bf) = bf {
                     po.push_to(bf + 1);
-                    self.add_obligation(po);
+                    self.add_obligation(po.clone());
+                    note_exact_obligation_op(
+                        &mut semantic_ops,
+                        BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                        &po,
+                    );
                 }
-                self.note_exact_block_step(progress, BLOCK_STEP_TRIVIAL_REQUEUE);
+                self.note_exact_block_step(
+                    progress,
+                    BLOCK_STEP_TRIVIAL_REQUEUE,
+                    semantic_ops,
+                );
                 continue;
             }
             po.bump_act();
             if self.cfg.drop_po && po.act > 20.0 {
-                self.note_exact_block_step(progress, BLOCK_STEP_DROP_ACTIVITY);
+                self.note_exact_block_step(
+                    progress,
+                    BLOCK_STEP_DROP_ACTIVITY,
+                    semantic_ops,
+                );
                 continue;
             }
             let blocked_start = Instant::now();
@@ -1930,6 +2106,11 @@ impl IC3 {
                                 continue;
                             };
                             if let Some(candidate) = self.obligations.take(&candidate) {
+                                note_exact_obligation_op(
+                                    &mut semantic_ops,
+                                    BLOCK_SEMANTIC_REMOVE_OBLIGATION,
+                                    &candidate,
+                                );
                                 block_wave.push_back(candidate);
                                 reserved += 1;
                             }
@@ -2161,11 +2342,19 @@ impl IC3 {
                 } else {
                     MicType::from_config(&self.cfg)
                 };
-                if self.generalize(po, mic_type) {
-                    self.note_exact_block_step(progress, BLOCK_STEP_PROVED);
+                if self.generalize(po, mic_type, &mut semantic_ops) {
+                    self.note_exact_block_step(
+                        progress,
+                        BLOCK_STEP_PROVED,
+                        semantic_ops,
+                    );
                     return BlockResult::Proved;
                 }
-                self.note_exact_block_step(progress, BLOCK_STEP_GENERALIZED);
+                self.note_exact_block_step(
+                    progress,
+                    BLOCK_STEP_GENERALIZED,
+                    semantic_ops,
+                );
                 debug!("{}", self.frame.statistic(false));
             } else {
                 let (model, inputs) = speculative_pred
@@ -2183,13 +2372,39 @@ impl IC3 {
                     // discover the same ordered obligation before either path
                     // reaches the head of the queue. One representative is
                     // sufficient; both SAT predecessor chains are valid.
-                    self.add_obligation_if_new(pred);
-                    self.add_obligation_if_new(po);
+                    if self.add_obligation_if_new(pred.clone()) {
+                        note_exact_obligation_op(
+                            &mut semantic_ops,
+                            BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                            &pred,
+                        );
+                    }
+                    if self.add_obligation_if_new(po.clone()) {
+                        note_exact_obligation_op(
+                            &mut semantic_ops,
+                            BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                            &po,
+                        );
+                    }
                 } else {
-                    self.add_obligation(pred);
-                    self.add_obligation(po);
+                    self.add_obligation(pred.clone());
+                    self.add_obligation(po.clone());
+                    note_exact_obligation_op(
+                        &mut semantic_ops,
+                        BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                        &pred,
+                    );
+                    note_exact_obligation_op(
+                        &mut semantic_ops,
+                        BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                        &po,
+                    );
                 }
-                self.note_exact_block_step(progress, BLOCK_STEP_PREDECESSOR);
+                self.note_exact_block_step(
+                    progress,
+                    BLOCK_STEP_PREDECESSOR,
+                    semantic_ops,
+                );
             }
         }
         BlockResult::Success
