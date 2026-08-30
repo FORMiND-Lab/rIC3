@@ -345,6 +345,7 @@ impl DagCnfSolver {
         conflict_limit: Option<u32>,
         retain_learnts: bool,
     ) -> Option<bool> {
+        crate::inductor::note_root_query();
         self.assump = assump.into();
         self.constraint = constraint.clone();
         if self.trivial_unsat {

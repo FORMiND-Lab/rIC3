@@ -39,6 +39,53 @@ thread_local! {
     /// inside BLOCK) keep this id so exact replay can model one resident
     /// program without losing the finer-grained OP used by the ordinary trace.
     static ROOT_OP: Cell<u32> = const { Cell::new(0) };
+    /// Per-thread inquiry counter used only while a root-level CPU admission
+    /// sample is active. Keeping it thread-local prevents another IC3 worker
+    /// in the same process from contaminating the sample.
+    static ROOT_QUERY_COUNTING: Cell<bool> = const { Cell::new(false) };
+    static ROOT_QUERY_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+pub struct RootQueryCounter {
+    start: u64,
+    previous: bool,
+    active: bool,
+}
+
+impl RootQueryCounter {
+    pub fn start() -> Self {
+        let previous = ROOT_QUERY_COUNTING.with(|enabled| enabled.replace(true));
+        let start = ROOT_QUERY_COUNT.with(Cell::get);
+        Self {
+            start,
+            previous,
+            active: true,
+        }
+    }
+
+    pub fn finish(mut self) -> u64 {
+        let end = ROOT_QUERY_COUNT.with(Cell::get);
+        ROOT_QUERY_COUNTING.with(|enabled| enabled.set(self.previous));
+        self.active = false;
+        end.wrapping_sub(self.start)
+    }
+}
+
+impl Drop for RootQueryCounter {
+    fn drop(&mut self) {
+        if self.active {
+            ROOT_QUERY_COUNTING.with(|enabled| enabled.set(self.previous));
+        }
+    }
+}
+
+#[inline(always)]
+pub fn note_root_query() {
+    ROOT_QUERY_COUNTING.with(|enabled| {
+        if enabled.get() {
+            ROOT_QUERY_COUNT.with(|count| count.set(count.get().wrapping_add(1)));
+        }
+    });
 }
 
 /// Allocates macro-op ids. Starts at 1 so 0 can mean "no scope".

@@ -91,6 +91,118 @@ struct BlockBatchCache {
 const DEFAULT_BLOCK_ASYNC: bool = false;
 const DEFAULT_BLOCK_WAVEFRONT: bool = true;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockFullRootRoute {
+    Cpu,
+    Fpga,
+}
+
+/// Per-engine admission for the complete resident BLOCK root. The two
+/// calibration samples are different algorithm roots: the first executes on
+/// GipSAT and the second on the trusted resident controller. No result is
+/// solved twice. Once calibrated, the route stays fixed for this IC3 engine.
+#[derive(Default)]
+pub(super) struct BlockFullRootAdmission {
+    cpu_sample: Option<(u64, u64)>,
+    fpga_sample: Option<(u64, u64)>,
+    route_fpga: Option<bool>,
+}
+
+impl BlockFullRootAdmission {
+    fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_ADMISSION")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        }) && crate::accel::cdcl_host::block_full_root_enabled()
+    }
+
+    fn margin_percent() -> u64 {
+        use std::sync::OnceLock;
+        static PERCENT: OnceLock<u64> = OnceLock::new();
+        *PERCENT.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_ADMISSION_MARGIN_PCT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(110)
+                .clamp(100, 1000)
+        })
+    }
+
+    fn route(&self) -> BlockFullRootRoute {
+        if !Self::enabled() {
+            return BlockFullRootRoute::Fpga;
+        }
+        match (self.cpu_sample, self.fpga_sample, self.route_fpga) {
+            (None, _, _) => BlockFullRootRoute::Cpu,
+            (Some(_), None, _) => BlockFullRootRoute::Fpga,
+            (_, _, Some(true)) => BlockFullRootRoute::Fpga,
+            (_, _, Some(false)) => BlockFullRootRoute::Cpu,
+            _ => BlockFullRootRoute::Cpu,
+        }
+    }
+
+    fn observe_at(
+        &mut self,
+        route: BlockFullRootRoute,
+        elapsed_ns: u64,
+        inquiries: u64,
+        margin_percent: u64,
+    ) {
+        if inquiries == 0 || self.route_fpga.is_some() {
+            return;
+        }
+        match route {
+            BlockFullRootRoute::Cpu if self.cpu_sample.is_none() => {
+                self.cpu_sample = Some((elapsed_ns, inquiries));
+            }
+            BlockFullRootRoute::Fpga if self.cpu_sample.is_some() && self.fpga_sample.is_none() => {
+                self.fpga_sample = Some((elapsed_ns, inquiries));
+            }
+            _ => return,
+        }
+        let (Some((cpu_ns, cpu_inquiries)), Some((fpga_ns, fpga_inquiries))) =
+            (self.cpu_sample, self.fpga_sample)
+        else {
+            return;
+        };
+        // FPGA must beat CPU by the configured safety margin. Cross
+        // multiplication avoids rounding the one-root per-inquiry estimates.
+        let fpga_weighted = u128::from(fpga_ns)
+            .saturating_mul(u128::from(cpu_inquiries))
+            .saturating_mul(u128::from(margin_percent));
+        let cpu_weighted = u128::from(cpu_ns)
+            .saturating_mul(u128::from(fpga_inquiries))
+            .saturating_mul(100);
+        self.route_fpga = Some(fpga_weighted < cpu_weighted);
+    }
+
+    fn observe(&mut self, route: BlockFullRootRoute, elapsed_ns: u64, inquiries: u64) {
+        if !Self::enabled() {
+            return;
+        }
+        let before = self.route_fpga;
+        self.observe_at(route, elapsed_ns, inquiries, Self::margin_percent());
+        if before.is_none()
+            && let Some(route_fpga) = self.route_fpga
+            && let (Some((cpu_ns, cpu_inquiries)), Some((fpga_ns, fpga_inquiries))) =
+                (self.cpu_sample, self.fpga_sample)
+        {
+            eprintln!(
+                "inductor-cdcl: full-root admission CPU {:.3} ms/{} inquiries, FPGA {:.3} ms/{} inquiries, margin {}%, route {}",
+                cpu_ns as f64 / 1_000_000.0,
+                cpu_inquiries,
+                fpga_ns as f64 / 1_000_000.0,
+                fpga_inquiries,
+                Self::margin_percent(),
+                if route_fpga { "FPGA" } else { "CPU" },
+            );
+        }
+    }
+}
+
 // Version-5 exact replay instruction codes for the software resident BLOCK
 // controller. Keep these values in sync with cdcl_exact_replay_tb.cpp.
 const BLOCK_STEP_DISCARD_REMOVED: u32 = 0;
@@ -707,8 +819,8 @@ impl BlockAccelPolicy {
 #[cfg(test)]
 mod block_accel_policy_tests {
     use super::{
-        BatchRouteDecision, BlockAccelPolicy, BlockBatchCache, CachedBlockInquiry,
-        DEFAULT_BLOCK_ASYNC, DEFAULT_BLOCK_WAVEFRONT,
+        BatchRouteDecision, BlockAccelPolicy, BlockBatchCache, BlockFullRootAdmission,
+        BlockFullRootRoute, CachedBlockInquiry, DEFAULT_BLOCK_ASYNC, DEFAULT_BLOCK_WAVEFRONT,
     };
     use crate::{
         accel::cdcl::UnknownReason,
@@ -717,6 +829,28 @@ mod block_accel_policy_tests {
     };
     use logicrs::{Lit, LitOrdVec, LitVec, Var};
     use std::collections::VecDeque;
+
+    #[test]
+    fn full_root_admission_uses_one_distinct_sample_per_route() {
+        let mut policy = BlockFullRootAdmission::default();
+        policy.observe_at(BlockFullRootRoute::Cpu, 20_000_000, 10, 110);
+        // A second CPU root is not used as the FPGA sample.
+        policy.observe_at(BlockFullRootRoute::Cpu, 1, 10, 110);
+        assert_eq!(policy.cpu_sample, Some((20_000_000, 10)));
+        assert_eq!(policy.fpga_sample, None);
+        policy.observe_at(BlockFullRootRoute::Fpga, 10_000_000, 10, 110);
+        assert_eq!(policy.route_fpga, Some(true));
+    }
+
+    #[test]
+    fn full_root_admission_rejects_slow_or_empty_fpga_samples() {
+        let mut policy = BlockFullRootAdmission::default();
+        policy.observe_at(BlockFullRootRoute::Cpu, 10_000_000, 10, 110);
+        policy.observe_at(BlockFullRootRoute::Fpga, 1, 0, 110);
+        assert_eq!(policy.fpga_sample, None);
+        policy.observe_at(BlockFullRootRoute::Fpga, 12_000_000, 10, 110);
+        assert_eq!(policy.route_fpga, Some(false));
+    }
 
     #[test]
     fn calibrated_route_requires_periodic_cpu_resampling() {
@@ -1612,6 +1746,13 @@ impl IC3 {
         // so every caller and every early return retains the same exact-replay
         // root for a future resident BLOCK program.
         let _op = crate::inductor::macro_scope(inductor_trace::Phase::Block, self.level());
+        let admission_route = self.block_full_root_admission.route();
+        let admission_enabled = BlockFullRootAdmission::enabled();
+        let root_started = admission_enabled.then(Instant::now);
+        let cpu_query_counter = (admission_enabled
+            && matches!(admission_route, BlockFullRootRoute::Cpu))
+        .then(crate::inductor::RootQueryCounter::start);
+        let mut resident_full_root_inquiries = 0u64;
         let root_timeline = crate::accel::cdcl_host::begin_block_root_timeline(self.level());
         let mut progress = crate::accel::cdcl_host::exact_block_progress_enabled()
             .then(|| {
@@ -1624,7 +1765,14 @@ impl IC3 {
                 )
             })
             .flatten();
-        let result = self.block_inner(limit, &mut progress);
+        let result = self.block_inner(
+            limit,
+            &mut progress,
+            matches!(admission_route, BlockFullRootRoute::Fpga),
+            &mut resident_full_root_inquiries,
+        );
+        let root_elapsed_ns =
+            root_started.map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         let (result_code, result_aux) = match &result {
             BlockResult::Success => (0, 0),
             BlockResult::Failure(depth) => (1, (*depth).min(u32::MAX as usize) as u32),
@@ -1640,6 +1788,16 @@ impl IC3 {
             self.obligations.progress_snapshot(),
             self.frame.progress_snapshot(),
         );
+        if let Some(root_elapsed_ns) = root_elapsed_ns {
+            let inquiries = match admission_route {
+                BlockFullRootRoute::Cpu => cpu_query_counter
+                    .map(crate::inductor::RootQueryCounter::finish)
+                    .unwrap_or(0),
+                BlockFullRootRoute::Fpga => resident_full_root_inquiries,
+            };
+            self.block_full_root_admission
+                .observe(admission_route, root_elapsed_ns, inquiries);
+        }
         result
     }
 
@@ -1647,15 +1805,18 @@ impl IC3 {
         &mut self,
         limit: Option<f64>,
         progress: &mut Option<crate::accel::cdcl_host::ExactBlockProgressCapture>,
+        block_fpga_enabled: bool,
+        resident_full_root_inquiries: &mut u64,
     ) -> BlockResult {
-        if crate::accel::cdcl_host::block_batch_enabled() {
+        if block_fpga_enabled && crate::accel::cdcl_host::block_batch_enabled() {
             crate::inductor::ThreadCpuTimer::enable();
         }
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
         let mut block_wave = VecDeque::new();
-        let block_wave_enabled =
-            crate::accel::cdcl_host::block_batch_enabled() && BlockBatchCache::wavefront_enabled();
+        let block_wave_enabled = block_fpga_enabled
+            && crate::accel::cdcl_host::block_batch_enabled()
+            && BlockBatchCache::wavefront_enabled();
         loop {
             let mut semantic_ops = progress.as_ref().map(|_| Vec::new());
             let mut from_wave = false;
@@ -1683,7 +1844,7 @@ impl IC3 {
             let mut resident_root_attempted = false;
             let mut full_root_pop = None;
             let mut full_root_sync_event = None;
-            if next.is_none() {
+            if next.is_none() && block_fpga_enabled {
                 let full_root = self.solvers.first().map_or(
                     crate::accel::cdcl_host::ResidentBlockFullRoot::Disabled,
                     |solver| {
@@ -1717,6 +1878,8 @@ impl IC3 {
                     source_keys,
                 } = full_root
                 {
+                    *resident_full_root_inquiries = resident_full_root_inquiries
+                        .saturating_add(u64::from(response.cdcl_inquiries));
                     let (proved, resident_semantic_ops) = self
                         .replay_resident_full_root(&response, &source_keys)
                         .unwrap_or_else(|error| panic!("resident full-root replay: {error}"));
@@ -1775,7 +1938,7 @@ impl IC3 {
             let full_root_handoff = full_root_pop.is_some();
             let resident_pop = if let Some(pop) = full_root_pop {
                 pop
-            } else if next.is_none() {
+            } else if next.is_none() && block_fpga_enabled {
                 let root = self.solvers.first().map_or(
                     crate::accel::cdcl_host::ResidentBlockRoot::Disabled,
                     |solver| {
@@ -2029,6 +2192,7 @@ impl IC3 {
             let block_cost_eligible = po.frame > 0 && (direct_cost_eligible || batch_plan_eligible);
             if po.frame > 0
                 && !block_cost_eligible
+                && block_fpga_enabled
                 && crate::accel::cdcl_host::block_batch_enabled()
             {
                 crate::accel::cdcl_host::note_active_block_cost_rejected();
@@ -2037,6 +2201,7 @@ impl IC3 {
                 && !resident_root_attempted
                 && block_batch.can_launch()
                 && po.frame > 0
+                && block_fpga_enabled
                 && crate::accel::cdcl_host::block_batch_enabled()
                 && block_cost_eligible
                 && self.solvers[po.frame - 1].dcs.num_var() >= BlockBatchCache::min_context_vars()
