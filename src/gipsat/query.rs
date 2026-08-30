@@ -45,6 +45,15 @@ pub fn packed_sat_model_enabled() -> bool {
     })
 }
 
+pub fn local_incremental_domain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_LOCAL_DOMAIN")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "off"))
+    })
+}
+
 pub fn encoded_domain_words(domain: &[Var]) -> usize {
     if !bank_aligned_domain_enabled() {
         return domain.len();
@@ -336,7 +345,17 @@ impl DagCnfSolver {
         );
         match result {
             Some(true) => IncrementalResult::Sat {
-                model: self.sat_value_iter().copied().collect(),
+                // Match the accelerator ABI: root assignments outside the
+                // dependency-closed query domain are solver-internal state,
+                // not part of this inquiry's witness.
+                model: query
+                    .domain
+                    .iter()
+                    .filter_map(|variable| {
+                        self.sat_value(variable.lit())
+                            .map(|polarity| variable.lit().not_if(!polarity))
+                    })
+                    .collect(),
             },
             Some(false) => IncrementalResult::Unsat {
                 core: query
@@ -413,29 +432,49 @@ impl DagCnfSolver {
         true
     }
 
-    /// Decode the fixed-width accelerator model without proving its clauses on
-    /// the CPU.  Even a trusted device must still satisfy transport invariants:
-    /// the result belongs to this frame and contains one value for every
-    /// variable, with no duplicate or out-of-range entries.
-    fn complete_incremental_assignment(
+    /// Decode an accelerator model without proving its clauses on the CPU.
+    /// GipSAT searches only the dependency-closed query domain; variables
+    /// outside it are deliberately absent from an ordinary CPU model too. A
+    /// trusted device must return every query-domain variable exactly once and
+    /// no variable outside that domain.
+    fn incremental_domain_assignment(
         &self,
         query: &IncrementalQuery,
         model: &[Lit],
-    ) -> Option<Vec<bool>> {
+    ) -> Option<Vec<Option<bool>>> {
         if query.frame != self.accel_level {
             return None;
         }
         let n_var = self.num_var();
         let mut assignment = vec![None; n_var];
+        let mut required = vec![false; n_var];
+        for &variable in &query.domain {
+            let var: usize = variable.into();
+            let slot = required.get_mut(var)?;
+            if *slot {
+                return None;
+            }
+            *slot = true;
+        }
         for &lit in model {
             let var: usize = lit.var().into();
+            if !required.get(var).copied().unwrap_or(false) {
+                return None;
+            }
             let slot = assignment.get_mut(var)?;
             if slot.is_some() {
                 return None;
             }
             *slot = Some(lit.polarity());
         }
-        assignment.into_iter().collect::<Option<_>>()
+        if required
+            .iter()
+            .zip(&assignment)
+            .any(|(required, value)| *required && value.is_none())
+        {
+            return None;
+        }
+        Some(assignment)
     }
 
     /// Check a hardware SAT model against the exact, current CPU formula.
@@ -450,13 +489,20 @@ impl DagCnfSolver {
         &self,
         query: &IncrementalQuery,
         model: &[Lit],
-    ) -> Option<Vec<bool>> {
-        let assignment = self.complete_incremental_assignment(query, model)?;
+    ) -> Option<Vec<Option<bool>>> {
+        let assignment = self.incremental_domain_assignment(query, model)?;
+        // Clause-by-clause CPU validation requires a total formula assignment.
+        // A sparse dependency-domain witness is accepted only by the explicit
+        // qualified-device path; conservative mode falls back to CPU search.
+        if assignment.iter().any(Option::is_none) {
+            return None;
+        }
         let lit_true = |lit: Lit| {
             let var: usize = lit.var().into();
             assignment
                 .get(var)
-                .is_some_and(|value| *value == lit.polarity())
+                .and_then(|value| *value)
+                .is_some_and(|value| value == lit.polarity())
         };
         if !query.assumptions.iter().copied().all(&lit_true) {
             return None;
@@ -476,7 +522,7 @@ impl DagCnfSolver {
     fn install_incremental_assignment(
         &mut self,
         query: &IncrementalQuery,
-        assignment: Vec<bool>,
+        assignment: Vec<Option<bool>>,
     ) -> bool {
         if self.trivial_unsat || self.propagate() != CREF_NONE {
             return false;
@@ -520,6 +566,9 @@ impl DagCnfSolver {
             }
         }
         for (var, polarity) in assignment.into_iter().enumerate() {
+            let Some(polarity) = polarity else {
+                continue;
+            };
             let lit = Lit::new(Var::from(var), polarity);
             match self.value.v(lit) {
                 Lbool::TRUE => {}
@@ -552,7 +601,7 @@ impl DagCnfSolver {
         query: &IncrementalQuery,
         model: &[Lit],
     ) -> bool {
-        self.complete_incremental_assignment(query, model).is_some()
+        self.incremental_domain_assignment(query, model).is_some()
     }
 
     /// Validate and import a complete FPGA SAT model into GipSAT's live trail.
@@ -581,7 +630,7 @@ impl DagCnfSolver {
         query: &IncrementalQuery,
         model: &[Lit],
     ) -> bool {
-        let Some(assignment) = self.complete_incremental_assignment(query, model) else {
+        let Some(assignment) = self.incremental_domain_assignment(query, model) else {
             return false;
         };
         self.install_incremental_assignment(query, assignment)
@@ -1025,6 +1074,39 @@ mod tests {
         assert!(!solver.install_trusted_incremental_sat_model(&query, &incomplete));
         let wrong_frame = IncrementalQuery::new(1, LitVec::new());
         assert!(!solver.install_trusted_incremental_sat_model(&wrong_frame, &model));
+    }
+
+    #[test]
+    fn dependency_domain_trusted_model_leaves_unrelated_variables_unassigned() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let unrelated = dc.new_var().lit();
+        let mut solver = DagCnfSolver::new(&dc);
+        solver.add_clause(&[!a, b]);
+
+        let mut query = IncrementalQuery::new(0, LitVec::from([a]));
+        query.domain = solver.incremental_local_domain(std::iter::once(a.var()));
+        assert!(query.domain.contains(&a.var()));
+        assert!(query.domain.contains(&b.var()));
+        assert!(!query.domain.contains(&unrelated.var()));
+
+        let IncrementalResult::Sat { model } = solver.classify_incremental_exact(&query) else {
+            panic!("expected a dependency-domain SAT model");
+        };
+        assert_eq!(model.len(), query.domain.len());
+        assert!(!solver.validate_incremental_sat_model(&query, &model));
+        assert!(solver.install_trusted_incremental_sat_model(&query, &model));
+        assert_eq!(solver.sat_value(a), Some(true));
+        assert_eq!(solver.sat_value(b), Some(true));
+        assert_eq!(solver.sat_value(unrelated), None);
+
+        let mut missing = model.clone();
+        missing.pop();
+        assert!(!solver.install_trusted_incremental_sat_model(&query, &missing));
+        let mut extraneous = model;
+        extraneous.push(unrelated);
+        assert!(!solver.install_trusted_incremental_sat_model(&query, &extraneous));
     }
 
     #[test]

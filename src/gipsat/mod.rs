@@ -609,6 +609,19 @@ impl DagCnfSolver {
         self.resident_revision
     }
 
+    /// Reproduce `new_round`'s dependency-closed decision domain without
+    /// mutating the live solver. Permanent frame lemmas are already represented
+    /// by `domain.fixed`; the supplied seeds add this inquiry's assumptions and
+    /// temporary constraints exactly as the ordinary GipSAT solve does.
+    pub fn incremental_local_domain(
+        &self,
+        seeds: impl Iterator<Item = Var>,
+    ) -> Vec<Var> {
+        let mut domain = self.domain.clone();
+        domain.enable_local(seeds, &self.dc, &self.value);
+        (0..domain.len()).map(|index| domain[index]).collect()
+    }
+
     pub fn solve_with_restart_limit(
         &mut self,
         assumps: &[Lit],

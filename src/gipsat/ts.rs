@@ -78,11 +78,22 @@ impl TransysSolver {
         if strengthen {
             constraint.push(LitVec::from_iter(cube.iter().map(|lit| !*lit)));
         }
+        let assumptions = self.ts.lits_next(cube);
+        let domain = if crate::gipsat::query::local_incremental_domain_enabled() {
+            self.dcs.incremental_local_domain(
+                assumptions
+                    .iter()
+                    .chain(constraint.iter().flatten())
+                    .map(|lit| lit.var()),
+            )
+        } else {
+            (0..self.dcs.num_var()).map(Var::from).collect()
+        };
         IncrementalQuery {
             frame: self.dcs.accel_level,
-            assumptions: self.ts.lits_next(cube),
+            assumptions,
             constraints: constraint,
-            domain: (0..self.dcs.num_var()).map(Var::from).collect(),
+            domain,
             budget: QueryBudget {
                 conflicts: crate::accel::cdcl_host::active_conflict_budget(),
                 ..QueryBudget::default()

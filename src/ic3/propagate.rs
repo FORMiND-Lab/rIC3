@@ -322,7 +322,7 @@ impl IC3 {
                                 })) => {
                                     let restore_start = Instant::now();
                                     let accepted = self.solvers[frame_idx]
-                                        .install_incremental_sat_model(
+                                        .install_trusted_incremental_sat_model(
                                             &active_queries[lemma_index],
                                             model,
                                         );
