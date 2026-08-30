@@ -2539,8 +2539,11 @@ static PAIRED_WRITER: std::sync::OnceLock<Option<std::sync::Mutex<BufWriter<std:
     std::sync::OnceLock::new();
 static ARCH_TRACE_WRITER: std::sync::OnceLock<Option<std::sync::Mutex<BufWriter<std::fs::File>>>> =
     std::sync::OnceLock::new();
+static ROOT_TRACE_WRITER: std::sync::OnceLock<Option<std::sync::Mutex<BufWriter<std::fs::File>>>> =
+    std::sync::OnceLock::new();
 static ARCH_TRACE_BATCH_ID: AtomicU64 = AtomicU64::new(0);
 static ARCH_TRACE_QUERIES: AtomicU64 = AtomicU64::new(0);
+static ROOT_TRACE_ROOTS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_WRITER: std::sync::OnceLock<
     Option<std::sync::Mutex<BufWriter<std::fs::File>>>,
 > = std::sync::OnceLock::new();
@@ -3905,6 +3908,16 @@ pub struct ExactBlockProgressCapture {
     steps: Vec<ExactBlockProgressStep>,
 }
 
+/// Lightweight wall-clock boundary for discrete-event architecture replay.
+/// Unlike exact replay, this does not clone proof images or change the live
+/// solver. Query rows with the same macro_op_id provide the measured SAT part.
+pub struct BlockRootTimelineCapture {
+    op_id: u32,
+    frame: u32,
+    ready_unix_ns: u128,
+    start: std::time::Instant,
+}
+
 pub struct ExactFrameEventCapture {
     input_obligations: (usize, u64),
     input_lemmas: (usize, u64),
@@ -3913,6 +3926,93 @@ pub struct ExactFrameEventCapture {
 }
 
 static BLOCK_CONTROLLER_SIM_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn block_root_timeline_enabled() -> bool {
+    std::env::var_os("INDUCTOR_CDCL_ROOT_TRACE_TSV").is_some()
+}
+
+fn block_root_timeline_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
+    ROOT_TRACE_WRITER
+        .get_or_init(|| {
+            let path = worker_scoped_trace_path(std::env::var_os("INDUCTOR_CDCL_ROOT_TRACE_TSV")?);
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!(
+                        "inductor-cdcl: cannot create BLOCK root timeline {}: {error}",
+                        path.display(),
+                    );
+                    return None;
+                }
+            };
+            let mut writer = BufWriter::new(file);
+            writeln!(
+                writer,
+                "op_id\tframe\tresult\tresult_aux\tready_unix_ns\tfinish_unix_ns\tcpu_root_ns"
+            )
+            .ok()?;
+            Some(std::sync::Mutex::new(writer))
+        })
+        .as_ref()
+}
+
+pub fn begin_block_root_timeline(frame: usize) -> Option<BlockRootTimelineCapture> {
+    if !block_root_timeline_enabled() {
+        return None;
+    }
+    let (phase, op_id) = crate::inductor::current_macro_context();
+    if phase != inductor_trace::Phase::Block || op_id == 0 {
+        return None;
+    }
+    Some(BlockRootTimelineCapture {
+        op_id,
+        frame: frame.min(u32::MAX as usize) as u32,
+        ready_unix_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        start: std::time::Instant::now(),
+    })
+}
+
+pub fn finish_block_root_timeline(
+    capture: Option<BlockRootTimelineCapture>,
+    result: u32,
+    result_aux: u32,
+) {
+    let Some(capture) = capture else { return };
+    let elapsed_ns = capture.start.elapsed().as_nanos();
+    let finish_unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let Some(writer) = block_root_timeline_writer() else {
+        return;
+    };
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
+    if writeln!(
+        writer,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        capture.op_id,
+        capture.frame,
+        result,
+        result_aux,
+        capture.ready_unix_ns,
+        finish_unix_ns,
+        elapsed_ns,
+    )
+    .is_ok()
+    {
+        ROOT_TRACE_ROOTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 fn block_controller_sim_requested() -> bool {
     std::env::var_os("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM").is_some()
@@ -4992,7 +5092,7 @@ fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std
             let mut writer = BufWriter::new(file);
             if writeln!(
                 writer,
-                "pass_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_scope\tcontext_vars\tcontext_clauses\tcontext_literals\tcontext_words\tready_unix_ns"
+                "pass_id\tmacro_op_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_scope\tcontext_vars\tcontext_clauses\tcontext_literals\tcontext_words\tready_unix_ns"
             )
             .is_err()
             {
@@ -5021,6 +5121,7 @@ fn record_architecture_trace_batch(
     };
     let batch_id = ARCH_TRACE_BATCH_ID.fetch_add(1, Ordering::Relaxed) + 1;
     ARCH_TRACE_QUERIES.fetch_add(pending.len() as u64, Ordering::Relaxed);
+    let (_, macro_op_id) = crate::inductor::current_macro_context();
     let context_literals = context
         .clauses
         .iter()
@@ -5045,8 +5146,9 @@ fn record_architecture_trace_batch(
             .sum::<u64>();
         let _ = writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             pass_id,
+            macro_op_id,
             batch_id,
             pending.len(),
             position,
@@ -5074,6 +5176,14 @@ fn record_architecture_trace_batch(
 
 fn flush_architecture_trace_writer() {
     if let Some(writer) = architecture_trace_writer()
+        && let Ok(mut writer) = writer.lock()
+    {
+        let _ = writer.flush();
+    }
+}
+
+fn flush_block_root_timeline_writer() {
+    if let Some(writer) = block_root_timeline_writer()
         && let Ok(mut writer) = writer.lock()
     {
         let _ = writer.flush();
@@ -7088,15 +7198,22 @@ pub fn flush_and_report() {
             SHADOW_ERROR.load(Ordering::Relaxed),
         );
     }
-    if architecture_trace_enabled() || exact_block_progress_enabled() {
+    if architecture_trace_enabled()
+        || exact_block_progress_enabled()
+        || block_root_timeline_enabled()
+    {
         if architecture_trace_enabled() {
             flush_architecture_trace_writer();
         }
+        if block_root_timeline_enabled() {
+            flush_block_root_timeline_writer();
+        }
         flush_exact_replay_writer();
         eprintln!(
-            "inductor-cdcl: architecture trace batches {}, queries {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK checkpoints {}, event-only roots {}, frame-event waves {}, file {}; ranged snapshot fallbacks {}",
+            "inductor-cdcl: architecture trace batches {}, queries {}, roots {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK checkpoints {}, event-only roots {}, frame-event waves {}, file {}; ranged snapshot fallbacks {}",
             ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
             ARCH_TRACE_QUERIES.load(Ordering::Relaxed),
+            ROOT_TRACE_ROOTS.load(Ordering::Relaxed),
             std::env::var("INDUCTOR_CDCL_TRACE_CSV").unwrap_or_else(|_| "disabled".to_string()),
             EXACT_REPLAY_BATCHES.load(Ordering::Relaxed),
             EXACT_REPLAY_QUERIES.load(Ordering::Relaxed),

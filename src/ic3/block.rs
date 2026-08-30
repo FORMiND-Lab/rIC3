@@ -1612,6 +1612,7 @@ impl IC3 {
         // so every caller and every early return retains the same exact-replay
         // root for a future resident BLOCK program.
         let _op = crate::inductor::macro_scope(inductor_trace::Phase::Block, self.level());
+        let root_timeline = crate::accel::cdcl_host::begin_block_root_timeline(self.level());
         let mut progress = crate::accel::cdcl_host::exact_block_progress_enabled()
             .then(|| {
                 crate::accel::cdcl_host::begin_exact_block_progress(
@@ -1631,6 +1632,7 @@ impl IC3 {
             BlockResult::BlockLimitExceeded => (3, 0),
             BlockResult::OverallTimeLimitExceeded => (4, 0),
         };
+        crate::accel::cdcl_host::finish_block_root_timeline(root_timeline, result_code, result_aux);
         crate::accel::cdcl_host::finish_exact_block_progress(
             progress,
             result_code,
