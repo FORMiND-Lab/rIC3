@@ -1291,6 +1291,19 @@ impl HardwareCdcl {
             || query_template.domain.is_empty()
             || !query_template.constraints.is_empty()
         {
+            if std::env::var_os("INDUCTOR_CDCL_NATIVE_DIAG_FIRST_ERROR").is_some() {
+                eprintln!(
+                    concat!(
+                        "inductor-cdcl: full-root invalid context: resident_n_var={} ",
+                        "next_map={} init={} domain={} constraints={}"
+                    ),
+                    self.n_var,
+                    next_var_by_current.len(),
+                    init_value_by_current.len(),
+                    query_template.domain.len(),
+                    query_template.constraints.len(),
+                );
+            }
             return Err(HardwareError::InvalidContext);
         }
         let mut domain_query = query_template.clone();
@@ -1316,8 +1329,29 @@ impl HardwareCdcl {
             domain_header.flags,
             domain_header.decision_budget,
             domain_header.conflict_budget,
-        )
-        .ok_or(HardwareError::InvalidContext)?;
+        );
+        if request.is_none() && std::env::var_os("INDUCTOR_CDCL_NATIVE_DIAG_FIRST_ERROR").is_some()
+        {
+            eprintln!(
+                concat!(
+                    "inductor-cdcl: full-root pack rejected: steps={} frontier={} ",
+                    "next={} init={} init_max={} domain={} latches={} inputs={} ",
+                    "flags=0x{:x} budgets={}/{}"
+                ),
+                step_limit,
+                frontier_limit,
+                next_var_by_current.len(),
+                init_value_by_current.len(),
+                init_value_by_current.iter().copied().max().unwrap_or(0),
+                domain_words.len(),
+                latch_variables.len(),
+                input_variables.len(),
+                domain_header.flags,
+                domain_header.decision_budget,
+                domain_header.conflict_budget,
+            );
+        }
+        let request = request.ok_or(HardwareError::InvalidContext)?;
         let response_capacity = block_full_root_required_response_capacity(
             step_limit,
             latch_variables.len(),

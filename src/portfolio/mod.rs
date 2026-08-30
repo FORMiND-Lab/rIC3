@@ -105,15 +105,23 @@ impl Worker {
         let active_fpga = std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some();
         let trace_active = std::env::var_os("INDUCTOR_CDCL_TRACE_CSV").is_some()
             || std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some();
+        let full_root_enabled = std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
         let selected_worker = portfolio_worker_uses_fpga(
             &self.name,
             std::env::var("INDUCTOR_CDCL_PORTFOLIO_FPGA_WORKERS")
                 .ok()
                 .as_deref(),
-            std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT")
-                .ok()
-                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off")),
+            full_root_enabled,
         );
+        let selected_full_root = full_root_enabled
+            && portfolio_worker_uses_full_root(
+                &self.name,
+                std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_WORKERS")
+                    .ok()
+                    .as_deref(),
+            );
         let selected_fpga = active_fpga && selected_worker;
         let selected_trace = trace_active && selected_worker;
         if active_fpga && !selected_fpga {
@@ -123,6 +131,19 @@ impl Worker {
             unsafe {
                 std::env::remove_var("INDUCTOR_CDCL_ACTIVE");
                 std::env::remove_var("INDUCTOR_CDCL_SERVER");
+                std::env::remove_var("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM");
+                std::env::remove_var("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM_STRICT");
+                std::env::remove_var("INDUCTOR_CDCL_BLOCK_CONTROLLER_OWNS_QUEUE");
+            }
+        }
+        if active_fpga && selected_fpga && full_root_enabled && !selected_full_root {
+            // The resident BLOCK proof controller is root-owner-private. The
+            // sibling FPGA worker keeps its CDCL short-query transport, but
+            // must not send proof-state commands into the root owner's state.
+            unsafe {
+                std::env::remove_var("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM");
+                std::env::remove_var("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM_STRICT");
+                std::env::remove_var("INDUCTOR_CDCL_BLOCK_CONTROLLER_OWNS_QUEUE");
             }
         }
         if trace_active && !selected_trace {
@@ -182,6 +203,18 @@ impl Worker {
 const DEFAULT_FPGA_PORTFOLIO_WORKERS: [&str; 2] = ["ic3", "ic3_ctg_limit"];
 const DEFAULT_FULL_ROOT_PORTFOLIO_WORKER: &str = "ic3_abs_all";
 
+fn portfolio_worker_uses_full_root(name: &str, allowlist: Option<&str>) -> bool {
+    let allowlist = allowlist.map(str::trim);
+    if allowlist.is_none() || allowlist == Some("auto") {
+        return name == DEFAULT_FULL_ROOT_PORTFOLIO_WORKER;
+    }
+    allowlist
+        .unwrap()
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate == "all" || candidate == name)
+}
+
 fn portfolio_worker_uses_fpga(
     name: &str,
     allowlist: Option<&str>,
@@ -189,13 +222,17 @@ fn portfolio_worker_uses_fpga(
 ) -> bool {
     let allowlist = allowlist.map(str::trim);
     if allowlist.is_none() || allowlist == Some("auto") {
-        // ic3/ic3_ctg_limit share one transition relation and supply the
-        // qualified short-inquiry stream. ic3_abs_all owns the independently
-        // qualified complete-root path; the joint two-lane replay includes
-        // its view switches. Wider portfolios remain explicit because other
-        // abstractions repeatedly invalidated queued requests on the board.
-        return DEFAULT_FPGA_PORTFOLIO_WORKERS.contains(&name)
-            || (full_root_enabled && name == DEFAULT_FULL_ROOT_PORTFOLIO_WORKER);
+        // Two physical CDCL lanes cannot hold three independent learnt-clause
+        // contexts. Without complete roots, ic3/ic3_ctg_limit remain the
+        // qualified short-inquiry pair. With complete roots, ic3 keeps the
+        // higher-supply short stream and ic3_abs_all owns the other lane for
+        // resident roots. Wider sets require explicit context virtualization
+        // and remain diagnostic-only.
+        return if full_root_enabled {
+            name == DEFAULT_FPGA_PORTFOLIO_WORKERS[0] || name == DEFAULT_FULL_ROOT_PORTFOLIO_WORKER
+        } else {
+            DEFAULT_FPGA_PORTFOLIO_WORKERS.contains(&name)
+        };
     }
     let allowlist = allowlist.unwrap();
     allowlist
@@ -206,7 +243,7 @@ fn portfolio_worker_uses_fpga(
 
 #[cfg(test)]
 mod fpga_worker_tests {
-    use super::portfolio_worker_uses_fpga;
+    use super::{portfolio_worker_uses_fpga, portfolio_worker_uses_full_root};
 
     #[test]
     fn automatic_fpga_worker_policy_selects_the_qualified_mixed_set() {
@@ -214,6 +251,7 @@ mod fpga_worker_tests {
         assert!(portfolio_worker_uses_fpga("ic3_ctg_limit", None, false));
         assert!(!portfolio_worker_uses_fpga("ic3_abs_all", None, false));
         assert!(portfolio_worker_uses_fpga("ic3_abs_all", None, true));
+        assert!(!portfolio_worker_uses_fpga("ic3_ctg_limit", None, true));
         assert!(!portfolio_worker_uses_fpga("ic3_no_parent", None, true));
         assert!(!portfolio_worker_uses_fpga("ic3_inn", Some("auto"), true));
         assert!(portfolio_worker_uses_fpga("ic3", Some(" auto "), false));
@@ -234,6 +272,16 @@ mod fpga_worker_tests {
         assert!(portfolio_worker_uses_fpga("anything", Some("all"), false));
         assert!(portfolio_worker_uses_fpga("anything", Some("*"), false));
         assert!(!portfolio_worker_uses_fpga("ic3", Some(""), false));
+    }
+
+    #[test]
+    fn complete_root_owner_is_independent_of_short_query_admission() {
+        assert!(portfolio_worker_uses_full_root("ic3_abs_all", None));
+        assert!(!portfolio_worker_uses_full_root("ic3", Some("auto")));
+        assert!(portfolio_worker_uses_full_root(
+            "ic3_inn",
+            Some("ic3_abs_all, ic3_inn")
+        ));
     }
 }
 
