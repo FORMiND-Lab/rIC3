@@ -6731,8 +6731,25 @@ pub fn solve_active_batch_with_min(
                         output[*index] = result;
                     }
                 }
-                Err(_) => {
-                    ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                Err(error) => {
+                    // A top-level request/arena capacity rejection means that
+                    // none of these inquiries ran.  Report ordinary UNKNOWNs
+                    // so every caller takes its exact CPU path; do not count a
+                    // proof-safe heterogeneous fallback as a wrong hardware
+                    // answer.  The same resident arena/request shape cannot
+                    // become legal on a retry, so stop submitting further
+                    // batches from this solver process.  Per-query capacity
+                    // results arrive through Ok(results) above and therefore
+                    // remain local to just that inquiry.
+                    if active_failure_is_capacity(&error) {
+                        ACTIVE_UNKNOWN.fetch_add((end - start) as u64, Ordering::Relaxed);
+                    } else {
+                        ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                    }
+                    if deterministic_active_failure(&error) {
+                        disable_active_hardware(&error);
+                        break 'groups;
+                    }
                 }
             }
         }
@@ -7357,6 +7374,8 @@ pub fn flush_and_report() {
         let block_rejected = ACTIVE_BLOCK_RESULT_REJECTED.load(Ordering::Relaxed);
         let block_unconsumed =
             block_conclusive.saturating_sub(block_used.saturating_add(block_rejected));
+        let push_conclusive = hw_conclusive.saturating_sub(block_conclusive);
+        let push_used = hw_used.saturating_sub(block_used);
         // Keep this line comfortably below PIPE_BUF. Portfolio workers share
         // one redirected stderr; the detailed multi-kilobyte report can be
         // interleaved at a write boundary and is not a reliable qualification
@@ -7364,7 +7383,7 @@ pub fn flush_and_report() {
         // FPGA worker.
         let (root_waves, root_work, root_service_ns) = super::block_controller_sim::root_metrics();
         let qualification = format!(
-            "inductor-cdcl: qualification worker={} transport_attempted={} transport_unavailable={} hardware_disabled={} disable_count={} candidates={} batches={} hw_sat={} hw_unsat={} hw_unknown={} hw_errors={} batch_service_ms={:.3} mic_service_ms={:.3} root_waves={} root_work={} root_service_ms={:.3}\n",
+            "inductor-cdcl: qualification worker={} transport_attempted={} transport_unavailable={} hardware_disabled={} disable_count={} candidates={} batches={} hw_sat={} hw_unsat={} hw_unknown={} hw_errors={} batch_service_ms={:.3} mic_service_ms={:.3} root_waves={} root_work={} root_service_ms={:.3} block_conclusive={} block_used={} push_conclusive={} push_used={} cpu_fallback={} trusted_sat={} trusted_unsat={} trusted_rejected={} stale_sat={}\n",
             std::env::var("INDUCTOR_CDCL_PORTFOLIO_WORKER")
                 .unwrap_or_else(|_| "standalone".to_string()),
             ACTIVE_INIT_NS.load(Ordering::Relaxed) != 0,
@@ -7382,6 +7401,17 @@ pub fn flush_and_report() {
             root_waves,
             root_work,
             root_service_ns as f64 / 1_000_000.0,
+            block_conclusive,
+            block_used,
+            push_conclusive,
+            push_used,
+            ACTIVE_CPU_FALLBACK.load(Ordering::Relaxed),
+            ACTIVE_TRUSTED_SAT_INSTALLED.load(Ordering::Relaxed),
+            ACTIVE_TRUSTED_UNSAT_INSTALLED.load(Ordering::Relaxed),
+            ACTIVE_TRUSTED_SAT_REJECTED
+                .load(Ordering::Relaxed)
+                .saturating_add(ACTIVE_TRUSTED_UNSAT_REJECTED.load(Ordering::Relaxed)),
+            ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.load(Ordering::Relaxed),
         );
         let _ = std::io::stderr().lock().write_all(qualification.as_bytes());
         let kernel_ns = direct_kernel_ns();
