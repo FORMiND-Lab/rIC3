@@ -171,6 +171,19 @@ impl BlockFullRootAdmission {
         })
     }
 
+    fn min_cpu_sample_ns() -> u64 {
+        use std::sync::OnceLock;
+        static NANOSECONDS: OnceLock<u64> = OnceLock::new();
+        *NANOSECONDS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_MIN_CPU_SAMPLE_US")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(500)
+                .min(60_000_000)
+                .saturating_mul(1_000)
+        })
+    }
+
     fn route(&self) -> BlockFullRootRoute {
         if !Self::eligible() {
             return BlockFullRootRoute::Cpu;
@@ -178,11 +191,20 @@ impl BlockFullRootAdmission {
         if !Self::enabled() {
             return BlockFullRootRoute::Fpga;
         }
-        match (self.cpu_sample, self.fpga_sample, self.route_fpga) {
-            (None, _, _) => BlockFullRootRoute::Cpu,
-            (Some(_), None, _) => BlockFullRootRoute::Fpga,
-            (_, _, Some(true)) => BlockFullRootRoute::Fpga,
-            (_, _, Some(false)) => BlockFullRootRoute::Cpu,
+        self.sampled_route()
+    }
+
+    fn sampled_route(&self) -> BlockFullRootRoute {
+        if let Some(route_fpga) = self.route_fpga {
+            return if route_fpga {
+                BlockFullRootRoute::Fpga
+            } else {
+                BlockFullRootRoute::Cpu
+            };
+        }
+        match (self.cpu_sample, self.fpga_sample) {
+            (None, _) => BlockFullRootRoute::Cpu,
+            (Some(_), None) => BlockFullRootRoute::Fpga,
             _ => BlockFullRootRoute::Cpu,
         }
     }
@@ -193,6 +215,7 @@ impl BlockFullRootAdmission {
         elapsed_ns: u64,
         inquiries: u64,
         margin_percent: u64,
+        min_cpu_sample_ns: u64,
     ) {
         if inquiries == 0 || self.route_fpga.is_some() {
             return;
@@ -200,6 +223,14 @@ impl BlockFullRootAdmission {
         match route {
             BlockFullRootRoute::Cpu if self.cpu_sample.is_none() => {
                 self.cpu_sample = Some((elapsed_ns, inquiries));
+                // A complete-root FPGA probe has a fixed descriptor/context
+                // cost. Very short CPU roots are better served by the sibling
+                // short-inquiry stream, so do not spend a second root merely
+                // to rediscover that fixed-cost boundary.
+                if elapsed_ns < min_cpu_sample_ns {
+                    self.route_fpga = Some(false);
+                    return;
+                }
             }
             BlockFullRootRoute::Fpga if self.cpu_sample.is_some() && self.fpga_sample.is_none() => {
                 self.fpga_sample = Some((elapsed_ns, inquiries));
@@ -227,21 +258,38 @@ impl BlockFullRootAdmission {
             return;
         }
         let before = self.route_fpga;
-        self.observe_at(route, elapsed_ns, inquiries, Self::margin_percent());
+        self.observe_at(
+            route,
+            elapsed_ns,
+            inquiries,
+            Self::margin_percent(),
+            Self::min_cpu_sample_ns(),
+        );
         if before.is_none()
             && let Some(route_fpga) = self.route_fpga
-            && let (Some((cpu_ns, cpu_inquiries)), Some((fpga_ns, fpga_inquiries))) =
-                (self.cpu_sample, self.fpga_sample)
         {
-            eprintln!(
-                "inductor-cdcl: full-root admission CPU {:.3} ms/{} inquiries, FPGA {:.3} ms/{} inquiries, margin {}%, route {}",
-                cpu_ns as f64 / 1_000_000.0,
-                cpu_inquiries,
-                fpga_ns as f64 / 1_000_000.0,
-                fpga_inquiries,
-                Self::margin_percent(),
-                if route_fpga { "FPGA" } else { "CPU" },
-            );
+            match (self.cpu_sample, self.fpga_sample) {
+                (Some((cpu_ns, cpu_inquiries)), Some((fpga_ns, fpga_inquiries))) => {
+                    eprintln!(
+                        "inductor-cdcl: full-root admission CPU {:.3} ms/{} inquiries, FPGA {:.3} ms/{} inquiries, margin {}%, route {}",
+                        cpu_ns as f64 / 1_000_000.0,
+                        cpu_inquiries,
+                        fpga_ns as f64 / 1_000_000.0,
+                        fpga_inquiries,
+                        Self::margin_percent(),
+                        if route_fpga { "FPGA" } else { "CPU" },
+                    );
+                }
+                (Some((cpu_ns, cpu_inquiries)), None) => {
+                    eprintln!(
+                        "inductor-cdcl: full-root admission CPU {:.3} ms/{} inquiries below {:.3} ms probe floor, route CPU",
+                        cpu_ns as f64 / 1_000_000.0,
+                        cpu_inquiries,
+                        Self::min_cpu_sample_ns() as f64 / 1_000_000.0,
+                    );
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -877,13 +925,23 @@ mod block_accel_policy_tests {
     #[test]
     fn full_root_admission_uses_one_distinct_sample_per_route() {
         let mut policy = BlockFullRootAdmission::default();
-        policy.observe_at(BlockFullRootRoute::Cpu, 20_000_000, 10, 110);
+        policy.observe_at(BlockFullRootRoute::Cpu, 20_000_000, 10, 110, 0);
         // A second CPU root is not used as the FPGA sample.
-        policy.observe_at(BlockFullRootRoute::Cpu, 1, 10, 110);
+        policy.observe_at(BlockFullRootRoute::Cpu, 1, 10, 110, 0);
         assert_eq!(policy.cpu_sample, Some((20_000_000, 10)));
         assert_eq!(policy.fpga_sample, None);
-        policy.observe_at(BlockFullRootRoute::Fpga, 10_000_000, 10, 110);
+        policy.observe_at(BlockFullRootRoute::Fpga, 10_000_000, 10, 110, 0);
         assert_eq!(policy.route_fpga, Some(true));
+    }
+
+    #[test]
+    fn full_root_admission_skips_fpga_probe_below_cpu_cost_floor() {
+        let mut policy = BlockFullRootAdmission::default();
+        policy.observe_at(BlockFullRootRoute::Cpu, 499_999, 10, 110, 500_000);
+        assert_eq!(policy.cpu_sample, Some((499_999, 10)));
+        assert_eq!(policy.fpga_sample, None);
+        assert_eq!(policy.route_fpga, Some(false));
+        assert_eq!(policy.sampled_route(), BlockFullRootRoute::Cpu);
     }
 
     #[test]
@@ -941,10 +999,10 @@ mod block_accel_policy_tests {
     #[test]
     fn full_root_admission_rejects_slow_or_empty_fpga_samples() {
         let mut policy = BlockFullRootAdmission::default();
-        policy.observe_at(BlockFullRootRoute::Cpu, 10_000_000, 10, 110);
-        policy.observe_at(BlockFullRootRoute::Fpga, 1, 0, 110);
+        policy.observe_at(BlockFullRootRoute::Cpu, 10_000_000, 10, 110, 0);
+        policy.observe_at(BlockFullRootRoute::Fpga, 1, 0, 110, 0);
         assert_eq!(policy.fpga_sample, None);
-        policy.observe_at(BlockFullRootRoute::Fpga, 12_000_000, 10, 110);
+        policy.observe_at(BlockFullRootRoute::Fpga, 12_000_000, 10, 110, 0);
         assert_eq!(policy.route_fpga, Some(false));
     }
 
