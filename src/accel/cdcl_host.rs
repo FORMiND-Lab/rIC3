@@ -3953,10 +3953,18 @@ pub struct BlockRootTimelineCapture {
 }
 
 pub struct ExactFrameEventCapture {
+    wave_id: u32,
     input_obligations: (usize, u64),
     input_lemmas: (usize, u64),
     initial_obligation_image: Vec<u32>,
     initial_lemma_image: Vec<u32>,
+}
+
+thread_local! {
+    // A maintenance wave encloses extend, PUSH propagation and infinity
+    // promotion. Exact batch records use this ID instead of the frame level
+    // so architecture replay can issue the whole wave as one resident command.
+    static EXACT_FRAME_WAVE_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 static BLOCK_CONTROLLER_SIM_FAILED: AtomicBool = AtomicBool::new(false);
@@ -4618,7 +4626,14 @@ fn record_exact_replay_batch(
     // pass_id spans every context/word-limited record produced by this one
     // call, so it is the exact persistent-queue scope when a caller launched
     // outside a thread-local macro_scope (notably async PUSH prefetch).
-    let op_id = if scoped_op_id != 0 {
+    let frame_wave_id = EXACT_FRAME_WAVE_ID.with(std::cell::Cell::get);
+    let op_id = if frame_wave_id != 0
+        && matches!(
+            phase,
+            inductor_trace::Phase::Push | inductor_trace::Phase::Inf
+        ) {
+        frame_wave_id
+    } else if scoped_op_id != 0 {
         scoped_op_id
     } else {
         (pass_id as u32).max(1)
@@ -4856,7 +4871,13 @@ pub fn begin_exact_frame_events(
     (std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some() || block_controller_sim_requested())
         .then(|| {
             reconcile_block_controller_sim(&obligation_image, &lemma_image);
+            let wave_id = (EXACT_REPLAY_FRAME_EVENTS.fetch_add(1, Ordering::Relaxed) + 1)
+                .min(u64::from(u32::MAX)) as u32;
+            EXACT_FRAME_WAVE_ID.with(|active| {
+                debug_assert_eq!(active.replace(wave_id), 0);
+            });
             ExactFrameEventCapture {
+                wave_id,
                 input_obligations: obligations,
                 input_lemmas: lemmas,
                 initial_obligation_image: obligation_image,
@@ -4877,15 +4898,17 @@ pub fn finish_exact_frame_events(
     semantic_ops: Vec<Vec<u32>>,
 ) {
     let Some(capture) = capture else { return };
+    EXACT_FRAME_WAVE_ID.with(|active| {
+        debug_assert_eq!(active.replace(0), capture.wave_id);
+    });
     apply_block_controller_sim(&semantic_ops, &obligation_image, &lemma_image);
     let Some(writer) = exact_replay_writer() else {
         return;
     };
-    let wave_id = EXACT_REPLAY_FRAME_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
     let mut words = vec![
         0,
         EXACT_REPLAY_FRAME_EVENT_RECORD,
-        wave_id.min(u64::from(u32::MAX)) as u32,
+        capture.wave_id,
         u32::from(proved),
         capture.input_obligations.0.min(u32::MAX as usize) as u32,
     ];
@@ -5356,6 +5379,16 @@ fn architecture_trace_enabled() -> bool {
     std::env::var_os("INDUCTOR_CDCL_TRACE_CSV").is_some()
 }
 
+// Capture propagation traffic without letting the earlier BLOCK phase exhaust
+// the bounded exact-replay query budget. This remains observational: the CPU
+// solver is authoritative and solve_active_batch returns UNKNOWN to IC3.
+fn architecture_frame_trace_only() -> bool {
+    architecture_trace_enabled()
+        && std::env::var("INDUCTOR_CDCL_TRACE_FRAME_ONLY")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "off"))
+}
+
 pub fn active_enabled() -> bool {
     (std::env::var_os("INDUCTOR_CDCL_ACTIVE").is_some() || architecture_trace_enabled())
         && std::env::var_os("INDUCTOR_CDCL_PAIRED").is_none()
@@ -5400,7 +5433,8 @@ pub fn paired_enabled() -> bool {
 /// may consume validated answers; paired mode deliberately never does.
 pub fn propagation_batch_enabled() -> bool {
     (active_enabled() || paired_enabled())
-        && std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
+        && (std::env::var_os("INDUCTOR_CDCL_BLOCK_ONLY").is_none()
+            || architecture_frame_trace_only())
         && propagation_batch_requested()
         && !push_prefetch_enabled()
         && active_hardware_available()
@@ -5614,6 +5648,7 @@ pub fn mic_batch_window() -> usize {
 pub fn block_batch_enabled() -> bool {
     (active_enabled() || paired_enabled())
         && std::env::var_os("INDUCTOR_CDCL_BLOCK_BATCH").is_some()
+        && !architecture_frame_trace_only()
         && active_hardware_available()
 }
 
