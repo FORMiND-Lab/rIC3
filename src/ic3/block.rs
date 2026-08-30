@@ -90,11 +90,41 @@ struct BlockBatchCache {
 
 const DEFAULT_BLOCK_ASYNC: bool = false;
 const DEFAULT_BLOCK_WAVEFRONT: bool = true;
+const DEFAULT_BLOCK_FULL_ROOT_PORTFOLIO_WORKER: &str = "ic3_abs_all";
+
+fn block_full_root_worker_allowed(worker: Option<&str>, allowlist: Option<&str>) -> bool {
+    let Some(worker) = worker else {
+        // A standalone IC3 engine has no sibling with which it can contend.
+        return true;
+    };
+    let allowlist = allowlist.map(str::trim);
+    if allowlist.is_none() || allowlist == Some("auto") {
+        // Root-timeline replay shows that admitting every FPGA-enabled
+        // portfolio worker turns the two resident lanes into a calibration
+        // queue and regresses most cases. Keep complete-root ownership on the
+        // worker that passed the physical admission gate; sibling workers may
+        // still use the independent short-inquiry stream path.
+        return worker == DEFAULT_BLOCK_FULL_ROOT_PORTFOLIO_WORKER;
+    }
+    allowlist
+        .unwrap()
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate == "all" || candidate == worker)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockFullRootRoute {
     Cpu,
     Fpga,
+}
+
+fn block_fpga_routes(full_root_eligible: bool, route: BlockFullRootRoute) -> (bool, bool) {
+    let full_root = full_root_eligible && matches!(route, BlockFullRootRoute::Fpga);
+    // Ineligible portfolio workers retain short-inquiry acceleration. An
+    // eligible CPU route is different: it is a root-exclusive calibration or
+    // fixed CPU decision and therefore suppresses nested FPGA work.
+    (full_root, !full_root_eligible || full_root)
 }
 
 /// Per-engine admission for the complete resident BLOCK root. The two
@@ -109,6 +139,16 @@ pub(super) struct BlockFullRootAdmission {
 }
 
 impl BlockFullRootAdmission {
+    fn worker_allowed() -> bool {
+        let worker = std::env::var("INDUCTOR_CDCL_PORTFOLIO_WORKER").ok();
+        let allowlist = std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_WORKERS").ok();
+        block_full_root_worker_allowed(worker.as_deref(), allowlist.as_deref())
+    }
+
+    fn eligible() -> bool {
+        Self::worker_allowed() && crate::accel::cdcl_host::block_full_root_enabled()
+    }
+
     fn enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -116,7 +156,7 @@ impl BlockFullRootAdmission {
             std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_ADMISSION")
                 .ok()
                 .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-        }) && crate::accel::cdcl_host::block_full_root_enabled()
+        }) && Self::eligible()
     }
 
     fn margin_percent() -> u64 {
@@ -132,6 +172,9 @@ impl BlockFullRootAdmission {
     }
 
     fn route(&self) -> BlockFullRootRoute {
+        if !Self::eligible() {
+            return BlockFullRootRoute::Cpu;
+        }
         if !Self::enabled() {
             return BlockFullRootRoute::Fpga;
         }
@@ -821,6 +864,7 @@ mod block_accel_policy_tests {
     use super::{
         BatchRouteDecision, BlockAccelPolicy, BlockBatchCache, BlockFullRootAdmission,
         BlockFullRootRoute, CachedBlockInquiry, DEFAULT_BLOCK_ASYNC, DEFAULT_BLOCK_WAVEFRONT,
+        block_fpga_routes, block_full_root_worker_allowed,
     };
     use crate::{
         accel::cdcl::UnknownReason,
@@ -840,6 +884,58 @@ mod block_accel_policy_tests {
         assert_eq!(policy.fpga_sample, None);
         policy.observe_at(BlockFullRootRoute::Fpga, 10_000_000, 10, 110);
         assert_eq!(policy.route_fpga, Some(true));
+    }
+
+    #[test]
+    fn portfolio_full_root_defaults_to_the_physically_qualified_worker() {
+        assert!(block_full_root_worker_allowed(None, None));
+        assert!(block_full_root_worker_allowed(Some("ic3_abs_all"), None));
+        assert!(block_full_root_worker_allowed(
+            Some("ic3_abs_all"),
+            Some("auto")
+        ));
+        assert!(!block_full_root_worker_allowed(Some("ic3"), None));
+        assert!(!block_full_root_worker_allowed(
+            Some("ic3_ctg_limit"),
+            Some("auto")
+        ));
+    }
+
+    #[test]
+    fn portfolio_full_root_allowlist_is_explicit_and_exact() {
+        assert!(block_full_root_worker_allowed(
+            Some("ic3"),
+            Some("ic3, ic3_abs_all")
+        ));
+        assert!(!block_full_root_worker_allowed(
+            Some("ic3_inn"),
+            Some("ic3, ic3_abs_all")
+        ));
+        assert!(block_full_root_worker_allowed(
+            Some("anything"),
+            Some("all")
+        ));
+        assert!(block_full_root_worker_allowed(Some("anything"), Some("*")));
+        assert!(!block_full_root_worker_allowed(
+            Some("ic3_abs_all"),
+            Some("")
+        ));
+    }
+
+    #[test]
+    fn full_root_allowlist_does_not_disable_short_inquiry_acceleration() {
+        assert_eq!(
+            block_fpga_routes(false, BlockFullRootRoute::Cpu),
+            (false, true)
+        );
+        assert_eq!(
+            block_fpga_routes(true, BlockFullRootRoute::Cpu),
+            (false, false)
+        );
+        assert_eq!(
+            block_fpga_routes(true, BlockFullRootRoute::Fpga),
+            (true, true)
+        );
     }
 
     #[test]
@@ -1748,6 +1844,9 @@ impl IC3 {
         let _op = crate::inductor::macro_scope(inductor_trace::Phase::Block, self.level());
         let admission_route = self.block_full_root_admission.route();
         let admission_enabled = BlockFullRootAdmission::enabled();
+        let full_root_eligible = BlockFullRootAdmission::eligible();
+        let (full_root_fpga_enabled, leaf_fpga_enabled) =
+            block_fpga_routes(full_root_eligible, admission_route);
         let root_started = admission_enabled.then(Instant::now);
         let cpu_query_counter = (admission_enabled
             && matches!(admission_route, BlockFullRootRoute::Cpu))
@@ -1768,7 +1867,8 @@ impl IC3 {
         let result = self.block_inner(
             limit,
             &mut progress,
-            matches!(admission_route, BlockFullRootRoute::Fpga),
+            full_root_fpga_enabled,
+            leaf_fpga_enabled,
             &mut resident_full_root_inquiries,
         );
         let root_elapsed_ns =
@@ -1805,16 +1905,17 @@ impl IC3 {
         &mut self,
         limit: Option<f64>,
         progress: &mut Option<crate::accel::cdcl_host::ExactBlockProgressCapture>,
-        block_fpga_enabled: bool,
+        full_root_fpga_enabled: bool,
+        leaf_fpga_enabled: bool,
         resident_full_root_inquiries: &mut u64,
     ) -> BlockResult {
-        if block_fpga_enabled && crate::accel::cdcl_host::block_batch_enabled() {
+        if leaf_fpga_enabled && crate::accel::cdcl_host::block_batch_enabled() {
             crate::inductor::ThreadCpuTimer::enable();
         }
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
         let mut block_wave = VecDeque::new();
-        let block_wave_enabled = block_fpga_enabled
+        let block_wave_enabled = leaf_fpga_enabled
             && crate::accel::cdcl_host::block_batch_enabled()
             && BlockBatchCache::wavefront_enabled();
         loop {
@@ -1844,7 +1945,7 @@ impl IC3 {
             let mut resident_root_attempted = false;
             let mut full_root_pop = None;
             let mut full_root_sync_event = None;
-            if next.is_none() && block_fpga_enabled {
+            if next.is_none() && full_root_fpga_enabled {
                 let full_root = self.solvers.first().map_or(
                     crate::accel::cdcl_host::ResidentBlockFullRoot::Disabled,
                     |solver| {
@@ -1938,7 +2039,7 @@ impl IC3 {
             let full_root_handoff = full_root_pop.is_some();
             let resident_pop = if let Some(pop) = full_root_pop {
                 pop
-            } else if next.is_none() && block_fpga_enabled {
+            } else if next.is_none() && leaf_fpga_enabled {
                 let root = self.solvers.first().map_or(
                     crate::accel::cdcl_host::ResidentBlockRoot::Disabled,
                     |solver| {
@@ -2192,7 +2293,7 @@ impl IC3 {
             let block_cost_eligible = po.frame > 0 && (direct_cost_eligible || batch_plan_eligible);
             if po.frame > 0
                 && !block_cost_eligible
-                && block_fpga_enabled
+                && leaf_fpga_enabled
                 && crate::accel::cdcl_host::block_batch_enabled()
             {
                 crate::accel::cdcl_host::note_active_block_cost_rejected();
@@ -2201,7 +2302,7 @@ impl IC3 {
                 && !resident_root_attempted
                 && block_batch.can_launch()
                 && po.frame > 0
-                && block_fpga_enabled
+                && leaf_fpga_enabled
                 && crate::accel::cdcl_host::block_batch_enabled()
                 && block_cost_eligible
                 && self.solvers[po.frame - 1].dcs.num_var() >= BlockBatchCache::min_context_vars()
