@@ -15,8 +15,8 @@ use super::{
         BLOCK_SEMANTIC_INSERT_OBLIGATION_TAGGED, BLOCK_SEMANTIC_POP_OBLIGATION,
         BLOCK_SEMANTIC_REGISTER_LEMMA, BLOCK_SEMANTIC_REGISTER_STATE_FULL, BLOCK_SEMANTIC_RESET,
         BLOCK_SEMANTIC_SET_LEMMA_FRAMES, BLOCK_SEMANTIC_STATS, BlockFullRootEvent,
-        BlockFullRootResponse, BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
-        BlockSemanticCommandResponse,
+        BlockFullRootResponse, BlockFullRootStatus, BlockRootExecutionStatus, BlockRootResponse,
+        BlockSemanticCommand, BlockSemanticCommandResponse,
     },
     cdcl_host::HardwareCdcl,
 };
@@ -43,6 +43,7 @@ static BATCHES: AtomicU64 = AtomicU64::new(0);
 static COMMANDS: AtomicU64 = AtomicU64::new(0);
 static REBASES: AtomicU64 = AtomicU64::new(0);
 static CAPACITY_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+static FULL_ROOT_FALLBACK_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 static ROOT_RECONCILES: AtomicU64 = AtomicU64::new(0);
 static STEPS: AtomicU64 = AtomicU64::new(0);
 static SERVICE_NS: AtomicU64 = AtomicU64::new(0);
@@ -141,6 +142,7 @@ struct ResidentBlockMirror {
     next_user_tag: u64,
     pending_owned_pop: Option<PendingOwnedPop>,
     owned_selection_keys: HashMap<u64, Vec<u32>>,
+    compact_after_full_root_fallback: bool,
 }
 
 pub(super) struct OwnedBlockRootWave {
@@ -778,6 +780,17 @@ impl ResidentBlockMirror {
                 ));
             }
         }
+        // The full-root controller returns FALLBACK before mutating the head
+        // operation that did not fit. Its already-committed event prefix is
+        // replayed above, and the CPU then completes that one handed-off proof
+        // step. Rebase from the resulting authoritative live image at that
+        // boundary instead of waiting for a later semantic command to hit the
+        // same append-only arena again. This is copying GC: it preserves every
+        // live obligation/lemma while reclaiming dead state cubes, witness
+        // inputs and chain records accumulated by earlier SAT branches.
+        if response.status == BlockFullRootStatus::Fallback {
+            self.compact_after_full_root_fallback = true;
+        }
         ROOT_WAVES.fetch_add(response.cdcl_waves as u64, Ordering::Relaxed);
         ROOT_WORK.fetch_add(response.cdcl_inquiries as u64, Ordering::Relaxed);
         ROOT_OK.fetch_add(1, Ordering::Relaxed);
@@ -935,6 +948,7 @@ impl ResidentBlockMirror {
         self.lemma_descriptors.clear();
         self.pending_owned_pop = None;
         self.owned_selection_keys.clear();
+        self.compact_after_full_root_fallback = false;
 
         let mut registration = vec![command(BLOCK_SEMANTIC_RESET)];
         let mut set_frames = command(BLOCK_SEMANTIC_SET_LEMMA_FRAMES);
@@ -1430,6 +1444,11 @@ impl ResidentBlockMirror {
             .map(|words| decode_operation(words))
             .collect::<Result<Vec<_>, _>>()?;
         match self.apply_operations(hardware, operations, obligation_image, lemma_image, true) {
+            Ok(()) if self.compact_after_full_root_fallback => {
+                FULL_ROOT_FALLBACK_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+                CAPACITY_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+                self.rebase(hardware, obligation_image, lemma_image)
+            }
             Ok(()) => Ok(()),
             Err(error) if semantic_capacity_error(&error) => {
                 // Immutable payload arenas intentionally avoid free-list and
@@ -1540,10 +1559,11 @@ pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
 
 pub(super) fn report() {
     eprintln!(
-        "inductor-cdcl: live BLOCK controller steps {}, rebases {} (capacity compactions {}), root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
+        "inductor-cdcl: live BLOCK controller steps {}, rebases {} (capacity compactions {}, post-full-root-fallback {}), root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
         STEPS.load(Ordering::Relaxed),
         REBASES.load(Ordering::Relaxed),
         CAPACITY_COMPACTIONS.load(Ordering::Relaxed),
+        FULL_ROOT_FALLBACK_COMPACTIONS.load(Ordering::Relaxed),
         ROOT_RECONCILES.load(Ordering::Relaxed),
         BATCHES.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
