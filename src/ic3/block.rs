@@ -1659,7 +1659,12 @@ impl IC3 {
                                     .collect::<Vec<_>>()
                             ));
                         }
-                        let query = solver.incremental_inductive_query(&cube, false, vec![]);
+                        // MIC proves relative induction with the candidate
+                        // blocking clause installed: F[i-1] & !cube & cube'.
+                        // Checking strengthen=false here incorrectly rejects a
+                        // valid generalized lemma that is not blocked by the
+                        // weaker Q_block formula alone.
+                        let query = solver.incremental_inductive_query(&cube, true, vec![]);
                         let mut checker = solver.dcs.clone();
                         if !matches!(
                             checker.classify_incremental_exact(&query),

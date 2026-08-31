@@ -1375,13 +1375,16 @@ impl HardwareCdcl {
                 )
             };
             if rc != 0 {
+                record_full_root_transaction(&request, &[], rc);
                 return Err(HardwareError::Command(rc));
             }
             let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
             if out_words > response.len() {
+                record_full_root_transaction(&request, &[], rc);
                 return Err(HardwareError::InvalidResponse);
             }
             response.truncate(out_words);
+            record_full_root_transaction(&request, &response, rc);
             decode_block_full_root_response(&response).ok_or(HardwareError::InvalidResponse)
         }
         #[cfg(not(has_cdcl_accel))]
@@ -2581,6 +2584,12 @@ static ROOT_TRACE_ROOTS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_WRITER: std::sync::OnceLock<
     Option<std::sync::Mutex<BufWriter<std::fs::File>>>,
 > = std::sync::OnceLock::new();
+static FULL_ROOT_TRANSCRIPT_WRITER: std::sync::OnceLock<
+    Option<std::sync::Mutex<BufWriter<std::fs::File>>>,
+> = std::sync::OnceLock::new();
+static FULL_ROOT_TRANSCRIPT_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static FULL_ROOT_TRANSCRIPT_REQUEST_WORDS: AtomicU64 = AtomicU64::new(0);
+static FULL_ROOT_TRANSCRIPT_RESPONSE_WORDS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_BATCHES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_MICS: AtomicU64 = AtomicU64::new(0);
@@ -4571,6 +4580,88 @@ fn exact_replay_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::
             Some(std::sync::Mutex::new(writer))
         })
         .as_ref()
+}
+
+/// Record the exact production-facing RUN_BLOCK_FULL_ROOT transaction.  This
+/// is deliberately a separate stream from the CPU-oracle exact replay: it is
+/// emitted only after the real native/RPC transport has returned, so every
+/// word was observed at the same FFI boundary used by an xclbin.
+fn full_root_transcript_writer() -> Option<&'static std::sync::Mutex<BufWriter<std::fs::File>>> {
+    FULL_ROOT_TRANSCRIPT_WRITER
+        .get_or_init(|| {
+            let path =
+                worker_scoped_trace_path(std::env::var_os("INDUCTOR_CDCL_FULL_ROOT_TRANSCRIPT")?);
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!(
+                        "inductor-cdcl: cannot create full-root transcript {}: {error}",
+                        path.display(),
+                    );
+                    return None;
+                }
+            };
+            let mut writer = BufWriter::new(file);
+            // Eight-byte magic followed by the transcript format version.
+            if writer.write_all(b"INDFROOT").is_err()
+                || writer.write_all(&1u32.to_le_bytes()).is_err()
+            {
+                return None;
+            }
+            Some(std::sync::Mutex::new(writer))
+        })
+        .as_ref()
+}
+
+fn record_full_root_transaction(request: &[u32], response: &[u32], rc: i32) {
+    let Some(writer) = full_root_transcript_writer() else {
+        return;
+    };
+    let (_, op_id) = crate::inductor::current_macro_context();
+    let Ok(request_words) = u32::try_from(request.len()) else {
+        return;
+    };
+    let Ok(response_words) = u32::try_from(response.len()) else {
+        return;
+    };
+    let mut words = Vec::with_capacity(5 + request.len() + response.len());
+    words.push(0);
+    words.push(op_id);
+    words.push(rc as u32);
+    words.push(request_words);
+    words.push(response_words);
+    words.extend_from_slice(request);
+    words.extend_from_slice(response);
+    words[0] = (words.len() - 1) as u32;
+    let mut encoded = Vec::with_capacity(words.len().saturating_mul(4));
+    for word in words {
+        encoded.extend_from_slice(&word.to_le_bytes());
+    }
+    let Ok(mut writer) = writer.lock() else {
+        return;
+    };
+    // A correctness panic may follow immediately while the CPU mirror checks
+    // the returned journal. Keep the just-observed transaction durable as one
+    // complete record so the failure itself remains replayable.
+    if writer.write_all(&encoded).is_err() || writer.flush().is_err() {
+        return;
+    }
+    FULL_ROOT_TRANSCRIPT_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    FULL_ROOT_TRANSCRIPT_REQUEST_WORDS.fetch_add(u64::from(request_words), Ordering::Relaxed);
+    FULL_ROOT_TRANSCRIPT_RESPONSE_WORDS.fetch_add(u64::from(response_words), Ordering::Relaxed);
+}
+
+fn flush_full_root_transcript_writer() {
+    if let Some(writer) = full_root_transcript_writer()
+        && let Ok(mut writer) = writer.lock()
+    {
+        let _ = writer.flush();
+    }
 }
 
 #[inline]
@@ -7330,6 +7421,7 @@ pub fn flush_and_report() {
     if architecture_trace_enabled()
         || exact_block_progress_enabled()
         || block_root_timeline_enabled()
+        || std::env::var_os("INDUCTOR_CDCL_FULL_ROOT_TRANSCRIPT").is_some()
     {
         if architecture_trace_enabled() {
             flush_architecture_trace_writer();
@@ -7338,6 +7430,7 @@ pub fn flush_and_report() {
             flush_block_root_timeline_writer();
         }
         flush_exact_replay_writer();
+        flush_full_root_transcript_writer();
         eprintln!(
             "inductor-cdcl: architecture trace batches {}, queries {}, roots {}, CSV {}; exact replay batches {}, queries {}, MICs {}, BLOCK checkpoints {}, event-only roots {}, frame-event waves {}, file {}; ranged snapshot fallbacks {}",
             ARCH_TRACE_BATCH_ID.load(Ordering::Relaxed),
@@ -7353,6 +7446,16 @@ pub fn flush_and_report() {
             std::env::var("INDUCTOR_CDCL_EXACT_REPLAY").unwrap_or_else(|_| "disabled".to_string()),
             FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
         );
+        if std::env::var_os("INDUCTOR_CDCL_FULL_ROOT_TRANSCRIPT").is_some() {
+            eprintln!(
+                "inductor-cdcl: full-root transcript commands {}, request words {}, response words {}, file {}",
+                FULL_ROOT_TRANSCRIPT_COMMANDS.load(Ordering::Relaxed),
+                FULL_ROOT_TRANSCRIPT_REQUEST_WORDS.load(Ordering::Relaxed),
+                FULL_ROOT_TRANSCRIPT_RESPONSE_WORDS.load(Ordering::Relaxed),
+                std::env::var("INDUCTOR_CDCL_FULL_ROOT_TRANSCRIPT")
+                    .unwrap_or_else(|_| "disabled".to_string()),
+            );
+        }
         if block_controller_sim_requested() {
             super::block_controller_sim::report();
         }
