@@ -29,6 +29,10 @@ struct CachedBlockInquiry {
     query: IncrementalQuery,
     context_revision: u64,
     result: IncrementalResult,
+    // True after the SAT witness was converted into predecessor/current proof
+    // obligations at the immutable batch revision. Such an answer is already
+    // consumed and must never enter the revision-sensitive result cache.
+    materialized_sat_committed: bool,
     trusted_cpu: bool,
     hardware_selected: bool,
     cached_at: u64,
@@ -1193,6 +1197,7 @@ mod block_accel_policy_tests {
             query: IncrementalQuery::new(frame as u32, LitVec::from([lit])),
             context_revision: 7,
             result,
+            materialized_sat_committed: false,
             trusted_cpu: false,
             hardware_selected: true,
             cached_at: 0,
@@ -1252,6 +1257,28 @@ mod block_accel_policy_tests {
             IncrementalResult::Unknown(UnknownReason::ConflictBudget),
         )]);
         assert!(!cache.contains(2, &LitOrdVec::new(LitVec::from([a]))));
+    }
+
+    #[test]
+    fn block_cache_does_not_retain_committed_sat_answers() {
+        let a = Lit::new(Var::from(0), true);
+        let mut inquiry = cached_inquiry(
+            2,
+            a,
+            IncrementalResult::Sat {
+                model: LitVec::from([a]),
+            },
+        );
+        inquiry.materialized_sat_committed = true;
+        let mut cache = BlockBatchCache::default();
+        cache.insert(vec![inquiry]);
+        assert!(!cache.contains(2, &LitOrdVec::new(LitVec::from([a]))));
+    }
+
+    #[test]
+    fn sat_materialization_targets_small_contexts() {
+        assert!(BlockBatchCache::materialize_sat_context_eligible(512, 512));
+        assert!(!BlockBatchCache::materialize_sat_context_eligible(513, 512));
     }
 
     #[test]
@@ -1414,6 +1441,32 @@ impl BlockBatchCache {
             || include_sat && matches!(result, IncrementalResult::Sat { .. })
     }
 
+    fn materialize_sat_wave_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_MATERIALIZE_SAT_WAVE")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        })
+    }
+
+    fn materialize_sat_max_context_vars() -> usize {
+        use std::sync::OnceLock;
+        static MAX_VARS: OnceLock<usize> = OnceLock::new();
+        *MAX_VARS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_MATERIALIZE_SAT_MAX_VARS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(512)
+                .clamp(1, 32_768)
+        })
+    }
+
+    fn materialize_sat_context_eligible(context_vars: usize, max_vars: usize) -> bool {
+        context_vars <= max_vars
+    }
+
     fn async_depth() -> usize {
         use std::sync::OnceLock;
         static DEPTH: OnceLock<usize> = OnceLock::new();
@@ -1451,6 +1504,10 @@ impl BlockBatchCache {
             );
             if hardware {
                 crate::accel::cdcl_host::note_active_block_selected_result(conclusive);
+            }
+            if inquiry.materialized_sat_committed {
+                crate::accel::cdcl_host::note_active_block_result_consumed(true, 0);
+                continue;
             }
             // UNKNOWN cannot answer a later obligation and must not shadow a
             // future retry of the same state/frame pair.
@@ -2195,6 +2252,7 @@ impl IC3 {
                                                         query,
                                                         context_revision: revision,
                                                         result,
+                                                        materialized_sat_committed: false,
                                                         trusted_cpu: false,
                                                         hardware_selected: true,
                                                         cached_at: 0,
@@ -2273,6 +2331,7 @@ impl IC3 {
             // is discarded by one of the cheap guards below. Otherwise stale
             // entries would prevent the cache from naturally draining.
             let mut cached_block = block_batch.take(&po, true);
+            let mut materialized_current_sat = false;
             self.render_progress();
             if po.removed {
                 self.note_exact_block_step(progress, BLOCK_STEP_DISCARD_REMOVED, semantic_ops);
@@ -2331,12 +2390,19 @@ impl IC3 {
             if let Some((bf, _)) = self.frame.trivial_contained(Some(po.frame), &po.state) {
                 if let Some(bf) = bf {
                     po.push_to(bf + 1);
-                    self.add_obligation(po.clone());
-                    note_exact_obligation_op(
-                        &mut semantic_ops,
-                        BLOCK_SEMANTIC_INSERT_OBLIGATION,
-                        &po,
-                    );
+                    let inserted = if BlockBatchCache::materialize_sat_wave_enabled() {
+                        self.add_obligation_if_new(po.clone())
+                    } else {
+                        self.add_obligation(po.clone());
+                        true
+                    };
+                    if inserted {
+                        note_exact_obligation_op(
+                            &mut semantic_ops,
+                            BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                            &po,
+                        );
+                    }
                 }
                 self.note_exact_block_step(progress, BLOCK_STEP_TRIVIAL_REQUEUE, semantic_ops);
                 continue;
@@ -2576,6 +2642,7 @@ impl IC3 {
                             query,
                             context_revision,
                             result,
+                            materialized_sat_committed: false,
                             trusted_cpu,
                             hardware_selected,
                             cached_at: 0,
@@ -2649,6 +2716,95 @@ impl IC3 {
                     for (index, result) in hardware_indices.iter().copied().zip(hardware_results) {
                         inquiries[index].result = result;
                     }
+                    if BlockBatchCache::materialize_sat_wave_enabled()
+                        && crate::accel::cdcl_host::active_skip_cpu_check()
+                        && !BlockBatchCache::async_enabled()
+                    {
+                        // Commit every SAT witness before any result from this
+                        // batch can strengthen a frame. This is the ordinary
+                        // SAT transition (predecessor plus deferred current
+                        // obligation), applied transactionally to the whole
+                        // immutable-revision batch.
+                        for index in hardware_indices.iter().copied() {
+                            let materialization = match &inquiries[index].result {
+                                IncrementalResult::Sat { model } => Some((
+                                    inquiries[index].frame,
+                                    inquiries[index].query.clone(),
+                                    model.clone(),
+                                )),
+                                _ => None,
+                            };
+                            let Some((frame, query, model)) = materialization else {
+                                continue;
+                            };
+                            if !BlockBatchCache::materialize_sat_context_eligible(
+                                self.solvers[frame - 1].dcs.num_var(),
+                                BlockBatchCache::materialize_sat_max_context_vars(),
+                            ) {
+                                continue;
+                            }
+                            let start = Instant::now();
+                            let shape_ok = self.solvers[frame - 1]
+                                .trusted_incremental_sat_model_shape(&query, &model);
+                            let pred = shape_ok
+                                .then(|| self.pred_from_incremental_model(&query, &model))
+                                .flatten();
+                            let candidate = if index == 0 {
+                                Some(po.clone())
+                            } else {
+                                wave_candidates[index].clone()
+                            };
+                            let committed = pred.is_some() && candidate.is_some();
+                            if let (Some((model, inputs)), Some(candidate)) = (pred, candidate) {
+                                let candidate = if index == 0 {
+                                    Some(candidate)
+                                } else {
+                                    self.obligations.take(&candidate).inspect(|candidate| {
+                                        note_exact_obligation_op(
+                                            &mut semantic_ops,
+                                            BLOCK_SEMANTIC_REMOVE_OBLIGATION,
+                                            candidate,
+                                        );
+                                    })
+                                };
+                                if let Some(candidate) = candidate {
+                                    let pred = ProofObligation::new(
+                                        candidate.frame - 1,
+                                        LitOrdVec::new(model),
+                                        inputs,
+                                        candidate.depth + 1,
+                                        Some(candidate.clone()),
+                                    );
+                                    if self.add_obligation_if_new(pred.clone()) {
+                                        note_exact_obligation_op(
+                                            &mut semantic_ops,
+                                            BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                                            &pred,
+                                        );
+                                    }
+                                    if self.add_obligation_if_new(candidate.clone()) {
+                                        note_exact_obligation_op(
+                                            &mut semantic_ops,
+                                            BLOCK_SEMANTIC_INSERT_OBLIGATION,
+                                            &candidate,
+                                        );
+                                    }
+                                    inquiries[index].materialized_sat_committed = true;
+                                    wave_candidates[index] = None;
+                                    materialized_current_sat |= index == 0;
+                                    crate::accel::cdcl_host::note_active_materialized_sat_used();
+                                    crate::accel::cdcl_host::note_active_trusted_sat(
+                                        true,
+                                        start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                                    );
+                                }
+                            }
+                            crate::accel::cdcl_host::note_active_materialized_sat_prepared(
+                                committed && inquiries[index].materialized_sat_committed,
+                                start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                            );
+                        }
+                    }
                     if reserve_wave {
                         let mut reserved = 0;
                         for index in hardware_indices.iter().copied() {
@@ -2677,6 +2833,10 @@ impl IC3 {
                         crate::accel::cdcl_host::note_active_block_wave_reserved(reserved);
                     }
                     block_batch.insert(inquiries);
+                    if materialized_current_sat {
+                        self.note_exact_block_step(progress, BLOCK_STEP_PREDECESSOR, semantic_ops);
+                        continue;
+                    }
                     cached_block = block_batch.take(&po, false);
                 }
             }

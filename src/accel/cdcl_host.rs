@@ -2361,6 +2361,10 @@ static ACTIVE_TRUSTED_SAT_INSTALLED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TRUSTED_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TRUSTED_SAT_STALE_REVALIDATED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TRUSTED_SAT_REVISION_REUSED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MATERIALIZED_SAT_PREPARED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MATERIALIZED_SAT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MATERIALIZED_SAT_USED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MATERIALIZED_SAT_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_LIFT_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_LIFT_SUCCEEDED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAT_FULL_LITS: AtomicU64 = AtomicU64::new(0);
@@ -7026,6 +7030,19 @@ pub fn note_active_trusted_sat_revision_reused() {
     ACTIVE_TRUSTED_SAT_REVISION_REUSED.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn note_active_materialized_sat_prepared(accepted: bool, elapsed_ns: u64) {
+    if accepted {
+        ACTIVE_MATERIALIZED_SAT_PREPARED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACTIVE_MATERIALIZED_SAT_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+    ACTIVE_MATERIALIZED_SAT_PREPARE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
+pub fn note_active_materialized_sat_used() {
+    ACTIVE_MATERIALIZED_SAT_USED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn note_active_sat_lift(
     attempted: bool,
     succeeded: bool,
@@ -7825,11 +7842,15 @@ pub fn flush_and_report() {
         }
         if active_skip_cpu_check() {
             eprintln!(
-                "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, revision-fresh SAT reused {}, stale SAT discarded {}, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
+                "inductor-cdcl: active trusted direct results SAT accepted/rejected {}/{}, revision-fresh SAT reused {}, stale SAT discarded {}, materialized SAT prepared/rejected/used {}/{}/{}, prepare {:.3} ms, UNSAT core accepted/rejected {}/{} (transport/state restoration only; no CPU semantic replay)",
                 ACTIVE_TRUSTED_SAT_INSTALLED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_SAT_REJECTED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_SAT_REVISION_REUSED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.load(Ordering::Relaxed),
+                ACTIVE_MATERIALIZED_SAT_PREPARED.load(Ordering::Relaxed),
+                ACTIVE_MATERIALIZED_SAT_REJECTED.load(Ordering::Relaxed),
+                ACTIVE_MATERIALIZED_SAT_USED.load(Ordering::Relaxed),
+                ACTIVE_MATERIALIZED_SAT_PREPARE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
                 ACTIVE_TRUSTED_UNSAT_INSTALLED.load(Ordering::Relaxed),
                 ACTIVE_TRUSTED_UNSAT_REJECTED.load(Ordering::Relaxed),
             );
