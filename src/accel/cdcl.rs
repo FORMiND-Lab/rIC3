@@ -133,6 +133,7 @@ pub const BLOCK_FULL_ROOT_EVENT_HEADER_WORDS: usize = 2;
 pub const BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS: usize = 6;
 pub const BLOCK_FULL_ROOT_SAT_HEADER_WORDS: usize = 11;
 pub const BLOCK_FULL_ROOT_MAX_STEPS: usize = 256;
+pub const BLOCK_FULL_ROOT_COMPACTED_RETRY: u32 = 1 << 31;
 pub const BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR: u32 = 1;
 pub const BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA: u32 = 2;
 
@@ -292,6 +293,7 @@ pub enum BlockFullRootStatus {
     StepBudget = 3,
     Fallback = 4,
     Error = 5,
+    CompactionRequired = 6,
 }
 
 impl BlockFullRootStatus {
@@ -303,6 +305,7 @@ impl BlockFullRootStatus {
             3 => Self::StepBudget,
             4 => Self::Fallback,
             5 => Self::Error,
+            6 => Self::CompactionRequired,
             _ => return None,
         })
     }
@@ -371,6 +374,7 @@ pub fn pack_block_full_root_request(
     query_flags: u32,
     decision_budget: u32,
     conflict_budget: u32,
+    compacted_retry: bool,
 ) -> Option<Vec<u32>> {
     if step_limit == 0
         || step_limit > BLOCK_FULL_ROOT_MAX_STEPS
@@ -404,7 +408,11 @@ pub fn pack_block_full_root_request(
         u32::try_from(latch_variables.len()).ok()?,
         u32::try_from(input_variables.len()).ok()?,
         u32::try_from(frontier_limit).ok()?,
-        0,
+        if compacted_retry {
+            BLOCK_FULL_ROOT_COMPACTED_RETRY
+        } else {
+            0
+        },
     ]);
     words.extend_from_slice(next_var_by_current);
     words.extend_from_slice(init_value_by_current);
@@ -452,7 +460,9 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
     ) != handoff.is_some()
         || matches!(
             status,
-            BlockFullRootStatus::Drained | BlockFullRootStatus::StepBudget
+            BlockFullRootStatus::Drained
+                | BlockFullRootStatus::StepBudget
+                | BlockFullRootStatus::CompactionRequired
         ) && handoff.is_some()
     {
         return None;
@@ -1177,6 +1187,7 @@ mod tests {
             flags,
             11,
             17,
+            false,
         )
         .unwrap();
         assert_eq!(request.len(), 27);
@@ -1265,5 +1276,21 @@ mod tests {
             BlockFullRootEvent::UnsatLemma { frame: 2, cube, .. }
                 if cube == &[0, 2]
         ));
+
+        let compact = decode_block_full_root_response(&[
+            BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+            BlockFullRootStatus::CompactionRequired as u32,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ])
+        .unwrap();
+        assert_eq!(compact.status, BlockFullRootStatus::CompactionRequired);
+        assert!(compact.handoff.is_none() && compact.events.is_empty());
     }
 }

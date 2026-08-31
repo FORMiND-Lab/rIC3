@@ -1978,6 +1978,7 @@ impl IC3 {
         let mut noc = 0;
         let mut block_batch = BlockBatchCache::default();
         let mut block_wave = VecDeque::new();
+        let mut full_root_compacted_retry = false;
         let block_wave_enabled = leaf_fpga_enabled
             && crate::accel::cdcl_host::block_batch_enabled()
             && BlockBatchCache::wavefront_enabled();
@@ -2034,6 +2035,7 @@ impl IC3 {
                             &latches,
                             &inputs,
                             &query_template,
+                            full_root_compacted_retry,
                         )
                     },
                 );
@@ -2042,6 +2044,9 @@ impl IC3 {
                     source_keys,
                 } = full_root
                 {
+                    if response.status != BlockFullRootStatus::CompactionRequired {
+                        full_root_compacted_retry = false;
+                    }
                     *resident_full_root_inquiries = resident_full_root_inquiries
                         .saturating_add(u64::from(response.cdcl_inquiries));
                     let (proved, resident_semantic_ops) = self
@@ -2068,6 +2073,20 @@ impl IC3 {
                             } else {
                                 BLOCK_STEP_PREDECESSOR
                             };
+                            self.note_exact_block_step(progress, event, resident_ops);
+                            continue;
+                        }
+                        BlockFullRootStatus::CompactionRequired => {
+                            full_root_compacted_retry = true;
+                            let event = if response.unsat_commits != 0 {
+                                BLOCK_STEP_GENERALIZED
+                            } else {
+                                BLOCK_STEP_PREDECESSOR
+                            };
+                            // The device restored the uncommitted head. Apply
+                            // its conclusive prefix, let the simulation mirror
+                            // rebuild the live arenas, then retry without a CPU
+                            // solve or ownership transfer.
                             self.note_exact_block_step(progress, event, resident_ops);
                             continue;
                         }

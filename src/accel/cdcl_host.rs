@@ -1285,6 +1285,7 @@ impl HardwareCdcl {
         latch_variables: &[u32],
         input_variables: &[u32],
         query_template: &IncrementalQuery,
+        compacted_retry: bool,
     ) -> Result<BlockFullRootResponse, HardwareError> {
         if next_var_by_current.len() != self.n_var as usize
             || init_value_by_current.len() != next_var_by_current.len()
@@ -1329,6 +1330,7 @@ impl HardwareCdcl {
             domain_header.flags,
             domain_header.decision_budget,
             domain_header.conflict_budget,
+            compacted_retry,
         );
         if request.is_none() && std::env::var_os("INDUCTOR_CDCL_NATIVE_DIAG_FIRST_ERROR").is_some()
         {
@@ -2590,6 +2592,8 @@ static FULL_ROOT_TRANSCRIPT_WRITER: std::sync::OnceLock<
 static FULL_ROOT_TRANSCRIPT_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static FULL_ROOT_TRANSCRIPT_REQUEST_WORDS: AtomicU64 = AtomicU64::new(0);
 static FULL_ROOT_TRANSCRIPT_RESPONSE_WORDS: AtomicU64 = AtomicU64::new(0);
+static FULL_ROOT_WIRE_REJECTS: AtomicU64 = AtomicU64::new(0);
+static FULL_ROOT_STEP_CAPS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_BATCHES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_MICS: AtomicU64 = AtomicU64::new(0);
@@ -2621,6 +2625,7 @@ static PROFILE_MAX_CONTEXT_LITS: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_SHADOW_BATCH_SIZE: usize = 64;
 const KERNEL_MAX_REQUEST_WORDS: usize = 1 << 15;
+const DEFAULT_FULL_ROOT_MAX_RESPONSE_WORDS: usize = 1 << 16;
 const DEFAULT_SHADOW_CONFLICT_BUDGET: u32 = 3;
 const DEFAULT_ACTIVE_CONFLICT_BUDGET: u32 = 16;
 
@@ -4099,6 +4104,71 @@ pub fn block_full_root_enabled() -> bool {
     })
 }
 
+fn full_root_wire_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value != 0)
+        .unwrap_or(default)
+}
+
+fn admitted_full_root_steps_with_limits(
+    requested_steps: usize,
+    n_var: usize,
+    domain_words: usize,
+    latch_count: usize,
+    input_count: usize,
+    max_request_words: usize,
+    max_response_words: usize,
+) -> Option<usize> {
+    let request_words = crate::accel::cdcl::BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS
+        .checked_add(2usize.checked_mul(n_var)?)?
+        .checked_add(domain_words)?
+        .checked_add(latch_count)?
+        .checked_add(input_count)?;
+    if requested_steps == 0 || request_words > max_request_words {
+        return None;
+    }
+    let fixed_response_words = crate::accel::cdcl::BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS
+        .checked_add(crate::accel::cdcl::BLOCK_FULL_ROOT_WORK_WORDS)?;
+    let lemma_words =
+        crate::accel::cdcl::BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS.checked_add(latch_count)?;
+    let sat_words = crate::accel::cdcl::BLOCK_FULL_ROOT_SAT_HEADER_WORDS
+        .checked_add(latch_count)?
+        .checked_add(input_count)?;
+    let event_words = crate::accel::cdcl::BLOCK_FULL_ROOT_EVENT_HEADER_WORDS
+        .checked_add(lemma_words.max(sat_words))?;
+    let journal_words = max_response_words.checked_sub(fixed_response_words)?;
+    let admitted_steps = (journal_words / event_words)
+        .min(requested_steps)
+        .min(crate::accel::cdcl::BLOCK_FULL_ROOT_MAX_STEPS);
+    (admitted_steps != 0).then_some(admitted_steps)
+}
+
+fn admitted_full_root_steps(
+    requested_steps: usize,
+    n_var: usize,
+    domain_words: usize,
+    latch_count: usize,
+    input_count: usize,
+) -> Option<usize> {
+    admitted_full_root_steps_with_limits(
+        requested_steps,
+        n_var,
+        domain_words,
+        latch_count,
+        input_count,
+        full_root_wire_limit(
+            "INDUCTOR_CDCL_BLOCK_FULL_ROOT_MAX_REQUEST_WORDS",
+            KERNEL_MAX_REQUEST_WORDS,
+        ),
+        full_root_wire_limit(
+            "INDUCTOR_CDCL_BLOCK_FULL_ROOT_MAX_RESPONSE_WORDS",
+            DEFAULT_FULL_ROOT_MAX_RESPONSE_WORDS,
+        ),
+    )
+}
+
 pub enum ResidentBlockPop {
     Disabled,
     Empty,
@@ -4242,12 +4312,26 @@ pub fn run_resident_block_full_root(
     latch_variables: &[u32],
     input_variables: &[u32],
     query_template: &IncrementalQuery,
+    compacted_retry: bool,
 ) -> ResidentBlockFullRoot {
     if !block_full_root_enabled()
         || !block_controller_owns_queue()
         || !block_controller_sim_enabled()
     {
         return ResidentBlockFullRoot::Disabled;
+    }
+    let Some(admitted_step_limit) = admitted_full_root_steps(
+        step_limit,
+        next_var_by_current.len(),
+        query_template.domain.len(),
+        latch_variables.len(),
+        input_variables.len(),
+    ) else {
+        FULL_ROOT_WIRE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return ResidentBlockFullRoot::Disabled;
+    };
+    if admitted_step_limit != step_limit {
+        FULL_ROOT_STEP_CAPS.fetch_add(1, Ordering::Relaxed);
     }
     let context = if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_EXACT_MAX_FRAME").is_some() {
         let Some(solver) = max_frame
@@ -4326,13 +4410,14 @@ pub fn run_resident_block_full_root(
                     super::block_controller_sim::run_owned_full_root(
                         hardware,
                         max_frame.min(u32::MAX as usize) as u32,
-                        step_limit,
+                        admitted_step_limit,
                         frontier_limit,
                         next_var_by_current,
                         init_value_by_current,
                         latch_variables,
                         input_variables,
                         query_template,
+                        compacted_retry,
                     )
                 });
             if let Ok(wave) = &result
@@ -7448,10 +7533,12 @@ pub fn flush_and_report() {
         );
         if std::env::var_os("INDUCTOR_CDCL_FULL_ROOT_TRANSCRIPT").is_some() {
             eprintln!(
-                "inductor-cdcl: full-root transcript commands {}, request words {}, response words {}, file {}",
+                "inductor-cdcl: full-root transcript commands {}, request words {}, response words {}, wire rejects {}, step caps {}, file {}",
                 FULL_ROOT_TRANSCRIPT_COMMANDS.load(Ordering::Relaxed),
                 FULL_ROOT_TRANSCRIPT_REQUEST_WORDS.load(Ordering::Relaxed),
                 FULL_ROOT_TRANSCRIPT_RESPONSE_WORDS.load(Ordering::Relaxed),
+                FULL_ROOT_WIRE_REJECTS.load(Ordering::Relaxed),
+                FULL_ROOT_STEP_CAPS.load(Ordering::Relaxed),
                 std::env::var("INDUCTOR_CDCL_FULL_ROOT_TRANSCRIPT")
                     .unwrap_or_else(|_| "disabled".to_string()),
             );
@@ -7972,6 +8059,22 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn full_root_wire_admission_caps_journal_and_rejects_repeated_large_metadata() {
+        assert_eq!(
+            admitted_full_root_steps_with_limits(64, 1_000, 1_000, 200, 100, 32_768, 65_536),
+            Some(64),
+        );
+        assert_eq!(
+            admitted_full_root_steps_with_limits(64, 10_000, 4_000, 4_799, 3_110, 32_768, 65_536,),
+            Some(8),
+        );
+        assert_eq!(
+            admitted_full_root_steps_with_limits(64, 20_000, 4_000, 4_799, 3_110, 32_768, 65_536,),
+            None,
+        );
+    }
 
     #[test]
     fn portfolio_trace_paths_are_worker_scoped_without_losing_extension() {

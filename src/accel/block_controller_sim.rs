@@ -43,7 +43,7 @@ static BATCHES: AtomicU64 = AtomicU64::new(0);
 static COMMANDS: AtomicU64 = AtomicU64::new(0);
 static REBASES: AtomicU64 = AtomicU64::new(0);
 static CAPACITY_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
-static FULL_ROOT_FALLBACK_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+static FULL_ROOT_RESPONSE_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 static ROOT_RECONCILES: AtomicU64 = AtomicU64::new(0);
 static STEPS: AtomicU64 = AtomicU64::new(0);
 static SERVICE_NS: AtomicU64 = AtomicU64::new(0);
@@ -142,7 +142,7 @@ struct ResidentBlockMirror {
     next_user_tag: u64,
     pending_owned_pop: Option<PendingOwnedPop>,
     owned_selection_keys: HashMap<u64, Vec<u32>>,
-    compact_after_full_root_fallback: bool,
+    compact_after_full_root_response: bool,
 }
 
 pub(super) struct OwnedBlockRootWave {
@@ -632,6 +632,7 @@ impl ResidentBlockMirror {
         latch_variables: &[u32],
         input_variables: &[u32],
         query_template: &IncrementalQuery,
+        compacted_retry: bool,
     ) -> Result<OwnedBlockFullRootWave, String> {
         if !self.initialized {
             return Err("resident BLOCK mirror was not rebased".to_string());
@@ -650,6 +651,7 @@ impl ResidentBlockMirror {
                 latch_variables,
                 input_variables,
                 query_template,
+                compacted_retry,
             )
             .map_err(|error| format!("resident BLOCK full-root command failed: {error}"))?;
         let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -788,8 +790,11 @@ impl ResidentBlockMirror {
         // same append-only arena again. This is copying GC: it preserves every
         // live obligation/lemma while reclaiming dead state cubes, witness
         // inputs and chain records accumulated by earlier SAT branches.
-        if response.status == BlockFullRootStatus::Fallback {
-            self.compact_after_full_root_fallback = true;
+        if matches!(
+            response.status,
+            BlockFullRootStatus::Fallback | BlockFullRootStatus::CompactionRequired
+        ) {
+            self.compact_after_full_root_response = true;
         }
         ROOT_WAVES.fetch_add(response.cdcl_waves as u64, Ordering::Relaxed);
         ROOT_WORK.fetch_add(response.cdcl_inquiries as u64, Ordering::Relaxed);
@@ -948,7 +953,7 @@ impl ResidentBlockMirror {
         self.lemma_descriptors.clear();
         self.pending_owned_pop = None;
         self.owned_selection_keys.clear();
-        self.compact_after_full_root_fallback = false;
+        self.compact_after_full_root_response = false;
 
         let mut registration = vec![command(BLOCK_SEMANTIC_RESET)];
         let mut set_frames = command(BLOCK_SEMANTIC_SET_LEMMA_FRAMES);
@@ -1444,8 +1449,8 @@ impl ResidentBlockMirror {
             .map(|words| decode_operation(words))
             .collect::<Result<Vec<_>, _>>()?;
         match self.apply_operations(hardware, operations, obligation_image, lemma_image, true) {
-            Ok(()) if self.compact_after_full_root_fallback => {
-                FULL_ROOT_FALLBACK_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+            Ok(()) if self.compact_after_full_root_response => {
+                FULL_ROOT_RESPONSE_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
                 CAPACITY_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
                 self.rebase(hardware, obligation_image, lemma_image)
             }
@@ -1531,6 +1536,7 @@ pub(super) fn run_owned_full_root(
     latch_variables: &[u32],
     input_variables: &[u32],
     query_template: &IncrementalQuery,
+    compacted_retry: bool,
 ) -> Result<OwnedBlockFullRootWave, String> {
     MIRROR
         .get_or_init(Default::default)
@@ -1546,6 +1552,7 @@ pub(super) fn run_owned_full_root(
             latch_variables,
             input_variables,
             query_template,
+            compacted_retry,
         )
 }
 
@@ -1559,11 +1566,11 @@ pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
 
 pub(super) fn report() {
     eprintln!(
-        "inductor-cdcl: live BLOCK controller steps {}, rebases {} (capacity compactions {}, post-full-root-fallback {}), root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
+        "inductor-cdcl: live BLOCK controller steps {}, rebases {} (capacity compactions {}, post-full-root-response {}), root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
         STEPS.load(Ordering::Relaxed),
         REBASES.load(Ordering::Relaxed),
         CAPACITY_COMPACTIONS.load(Ordering::Relaxed),
-        FULL_ROOT_FALLBACK_COMPACTIONS.load(Ordering::Relaxed),
+        FULL_ROOT_RESPONSE_COMPACTIONS.load(Ordering::Relaxed),
         ROOT_RECONCILES.load(Ordering::Relaxed),
         BATCHES.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
