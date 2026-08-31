@@ -5129,7 +5129,7 @@ fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std
             let mut writer = BufWriter::new(file);
             if writeln!(
                 writer,
-                "pass_id\tmacro_op_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tcontext_scope\tcontext_vars\tcontext_clauses\tcontext_literals\tcontext_words\tready_unix_ns"
+                "pass_id\tmacro_op_id\tbatch_id\tbatch_size\tposition\toriginal_index\tframe\tcpu_status\tcpu_ns\tcpu_decisions\tcpu_conflicts\tcpu_propagations\tassumptions\tconstraint_clauses\tconstraint_literals\tdomain\trequest_words\tquery_fingerprint\tcontext_scope\tcontext_fingerprint\tcontext_vars\tcontext_clauses\tcontext_literals\tcontext_words\tready_unix_ns"
             )
             .is_err()
             {
@@ -5138,6 +5138,66 @@ fn architecture_trace_writer() -> Option<&'static std::sync::Mutex<BufWriter<std
             Some(std::sync::Mutex::new(writer))
         })
         .as_ref()
+}
+
+// Observational FNV-1a fingerprints let the no-HLS architecture simulator
+// distinguish a useful speculative answer from a merely shape-compatible
+// query. They never participate in a proof decision or in the device ABI.
+fn architecture_trace_hash_word(hash: &mut u64, value: u64) {
+    const PRIME: u64 = 0x100000001b3;
+    *hash ^= value;
+    *hash = hash.wrapping_mul(PRIME);
+}
+
+fn architecture_trace_query_fingerprint(query: &IncrementalQuery) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    architecture_trace_hash_word(&mut hash, query.frame as u64);
+    architecture_trace_hash_word(&mut hash, query.assumptions.len() as u64);
+    for literal in &query.assumptions {
+        architecture_trace_hash_word(&mut hash, u32::from(*literal) as u64);
+    }
+    architecture_trace_hash_word(&mut hash, query.constraints.len() as u64);
+    for clause in &query.constraints {
+        architecture_trace_hash_word(&mut hash, clause.len() as u64);
+        for literal in clause {
+            architecture_trace_hash_word(&mut hash, u32::from(*literal) as u64);
+        }
+    }
+    architecture_trace_hash_word(&mut hash, query.domain.len() as u64);
+    for variable in &query.domain {
+        architecture_trace_hash_word(&mut hash, u32::from(*variable) as u64);
+    }
+    architecture_trace_hash_word(&mut hash, query.budget.decisions as u64);
+    architecture_trace_hash_word(&mut hash, query.budget.conflicts as u64);
+    architecture_trace_hash_word(
+        &mut hash,
+        query.budget.restarts.map_or(u64::MAX, |value| value as u64),
+    );
+    architecture_trace_hash_word(&mut hash, u64::from(query.keep_learnts));
+    hash
+}
+
+fn architecture_trace_context_fingerprint(context: &ShadowContext) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    architecture_trace_hash_word(&mut hash, context.n_var as u64);
+    architecture_trace_hash_word(
+        &mut hash,
+        match context.scope {
+            ShadowContextScope::SharedTransition => 0,
+            ShadowContextScope::ExactFrame(frame) => 1u64 << 32 | frame as u64,
+            ShadowContextScope::FrameRanged => 2,
+        },
+    );
+    architecture_trace_hash_word(&mut hash, context.clauses.len() as u64);
+    for clause in &context.clauses {
+        architecture_trace_hash_word(&mut hash, clause.lo as u64);
+        architecture_trace_hash_word(&mut hash, clause.hi as u64);
+        architecture_trace_hash_word(&mut hash, clause.literals.len() as u64);
+        for literal in &clause.literals {
+            architecture_trace_hash_word(&mut hash, u32::from(*literal) as u64);
+        }
+    }
+    hash
 }
 
 fn record_architecture_trace_batch(
@@ -5172,6 +5232,7 @@ fn record_architecture_trace_batch(
         ShadowContextScope::ExactFrame(_) => "exact-frame",
         ShadowContextScope::FrameRanged => "frame-ranged",
     };
+    let context_fingerprint = architecture_trace_context_fingerprint(context);
     for (position, (index, query, _)) in pending.iter().enumerate() {
         let Some(cpu_work) = cpu.get(*index) else {
             continue;
@@ -5183,7 +5244,7 @@ fn record_architecture_trace_batch(
             .sum::<u64>();
         let _ = writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             pass_id,
             macro_op_id,
             batch_id,
@@ -5201,7 +5262,9 @@ fn record_architecture_trace_batch(
             constraint_literals,
             query.domain.len(),
             query_request_words(query).unwrap_or(0),
+            architecture_trace_query_fingerprint(query),
             context_scope,
+            context_fingerprint,
             context.n_var,
             context.clauses.len(),
             context_literals,
