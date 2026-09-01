@@ -125,12 +125,12 @@ pub const BLOCK_ROOT_MAX_WORK: usize = 8;
 pub const BLOCK_ROOT_BATCH_OFFSET: usize =
     BLOCK_ROOT_RESPONSE_HEADER_WORDS + BLOCK_ROOT_MAX_WORK * BLOCK_ROOT_WORK_WORDS;
 
-pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 3;
+pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 4;
 pub const BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS: usize = 12;
 pub const BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS: usize = 10;
 pub const BLOCK_FULL_ROOT_WORK_WORDS: usize = 7;
 pub const BLOCK_FULL_ROOT_EVENT_HEADER_WORDS: usize = 2;
-pub const BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS: usize = 6;
+pub const BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS: usize = 7;
 pub const BLOCK_FULL_ROOT_SAT_HEADER_WORDS: usize = 11;
 pub const BLOCK_FULL_ROOT_MAX_STEPS: usize = 256;
 pub const BLOCK_FULL_ROOT_COMPACTED_RETRY: u32 = 1 << 31;
@@ -294,6 +294,7 @@ pub enum BlockFullRootStatus {
     Fallback = 4,
     Error = 5,
     CompactionRequired = 6,
+    Proved = 7,
 }
 
 impl BlockFullRootStatus {
@@ -306,6 +307,7 @@ impl BlockFullRootStatus {
             4 => Self::Fallback,
             5 => Self::Error,
             6 => Self::CompactionRequired,
+            7 => Self::Proved,
             _ => return None,
         })
     }
@@ -326,6 +328,7 @@ pub enum BlockFullRootEvent {
     },
     UnsatLemma {
         frame: u32,
+        begin_frame: u32,
         proof_tag: u64,
         payload_handle: u32,
         descriptor_handle: u32,
@@ -463,6 +466,7 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
             BlockFullRootStatus::Drained
                 | BlockFullRootStatus::StepBudget
                 | BlockFullRootStatus::CompactionRequired
+                | BlockFullRootStatus::Proved
         ) && handoff.is_some()
     {
         return None;
@@ -483,16 +487,17 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
                 if record.len() < BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS {
                     return None;
                 }
-                let cube_words = usize::try_from(record[5]).ok()?;
+                let cube_words = usize::try_from(record[6]).ok()?;
                 if record.len() != BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS.checked_add(cube_words)? {
                     return None;
                 }
                 unsat_events = unsat_events.checked_add(1)?;
                 BlockFullRootEvent::UnsatLemma {
                     frame: record[0],
-                    proof_tag: u64::from(record[1]) | (u64::from(record[2]) << 32),
-                    payload_handle: record[3],
-                    descriptor_handle: record[4],
+                    begin_frame: record[1],
+                    proof_tag: u64::from(record[2]) | (u64::from(record[3]) << 32),
+                    payload_handle: record[4],
+                    descriptor_handle: record[5],
                     cube: record[BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS..].to_vec(),
                 }
             }
@@ -1222,7 +1227,7 @@ mod tests {
             1,
             1,
             1,
-            33,
+            34,
             2,
             // CPU handoff work.
             0,
@@ -1249,9 +1254,10 @@ mod tests {
             0,
             3,
             3,
-            // UNSAT lemma event and its 6-word record.
+            // UNSAT lemma event and its 7-word fixed header.
             BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA,
-            8,
+            9,
+            2,
             2,
             0x33,
             0,
@@ -1273,7 +1279,7 @@ mod tests {
         ));
         assert!(matches!(
             &decoded.events[1],
-            BlockFullRootEvent::UnsatLemma { frame: 2, cube, .. }
+            BlockFullRootEvent::UnsatLemma { frame: 2, begin_frame: 2, cube, .. }
                 if cube == &[0, 2]
         ));
 
@@ -1292,5 +1298,21 @@ mod tests {
         .unwrap();
         assert_eq!(compact.status, BlockFullRootStatus::CompactionRequired);
         assert!(compact.handoff.is_none() && compact.events.is_empty());
+
+        let proved = decode_block_full_root_response(&[
+            BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+            BlockFullRootStatus::Proved as u32,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ])
+        .unwrap();
+        assert_eq!(proved.status, BlockFullRootStatus::Proved);
+        assert!(proved.handoff.is_none() && proved.events.is_empty());
     }
 }

@@ -750,11 +750,17 @@ impl ResidentBlockMirror {
                 }
                 BlockFullRootEvent::UnsatLemma {
                     frame,
+                    begin_frame,
                     proof_tag,
                     payload_handle,
                     descriptor_handle,
                     cube,
                 } => {
+                    if *begin_frame == 0 || *begin_frame > frame.saturating_add(1) {
+                        return Err(format!(
+                            "resident UNSAT lemma has invalid physical range {begin_frame}..{frame}"
+                        ));
+                    }
                     let (source_key, _) = self.remove_obligation_descriptor_for_tag(*proof_tag)?;
                     source_keys.push(source_key);
                     let mut payload = Vec::with_capacity(cube.len() + 1);
@@ -793,7 +799,8 @@ impl ResidentBlockMirror {
         if matches!(
             response.status,
             BlockFullRootStatus::Fallback | BlockFullRootStatus::CompactionRequired
-        ) {
+        ) || response.unsat_commits != 0
+        {
             self.compact_after_full_root_response = true;
         }
         ROOT_WAVES.fetch_add(response.cdcl_waves as u64, Ordering::Relaxed);
@@ -1448,12 +1455,11 @@ impl ResidentBlockMirror {
             .iter()
             .map(|words| decode_operation(words))
             .collect::<Result<Vec<_>, _>>()?;
+        if self.compact_after_full_root_response {
+            FULL_ROOT_RESPONSE_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+            return self.rebase(hardware, obligation_image, lemma_image);
+        }
         match self.apply_operations(hardware, operations, obligation_image, lemma_image, true) {
-            Ok(()) if self.compact_after_full_root_response => {
-                FULL_ROOT_RESPONSE_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
-                CAPACITY_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
-                self.rebase(hardware, obligation_image, lemma_image)
-            }
             Ok(()) => Ok(()),
             Err(error) if semantic_capacity_error(&error) => {
                 // Immutable payload arenas intentionally avoid free-list and

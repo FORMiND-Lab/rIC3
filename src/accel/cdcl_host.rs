@@ -4566,9 +4566,16 @@ pub fn run_resident_block_full_root(
                 // response. Mirror those exact ranged clauses in the client
                 // lease so the next root does not append them a second time.
                 for event in &wave.response.events {
-                    if let BlockFullRootEvent::UnsatLemma { frame, cube, .. } = event {
+                    if let BlockFullRootEvent::UnsatLemma {
+                        frame,
+                        begin_frame,
+                        cube,
+                        ..
+                    } = event
+                        && begin_frame <= frame
+                    {
                         loaded.clauses.push(ResidentClause::new(
-                            1,
+                            *begin_frame,
                             *frame,
                             cube.iter()
                                 .map(|literal| {

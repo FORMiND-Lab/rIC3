@@ -2175,6 +2175,9 @@ impl IC3 {
                             self.note_exact_block_step(progress, event, resident_ops);
                             continue;
                         }
+                        BlockFullRootStatus::Proved => {
+                            panic!("resident full-root proved status disagrees with CPU add_lemma")
+                        }
                         BlockFullRootStatus::CpuResult
                         | BlockFullRootStatus::CpuHandoff
                         | BlockFullRootStatus::Fallback => {
