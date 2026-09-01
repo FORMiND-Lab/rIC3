@@ -1521,7 +1521,9 @@ impl HardwareCdcl {
             self.n_var = n_var;
             self.materialized_frame = None;
             self.arena = ResidentArena::default();
-            self.full_root_projection = None;
+            // Formula reload does not alter transition projection metadata.
+            // Exact vector matching below prevents reuse after a true mapping
+            // change; the RPC server arbitrates the physical cache owner.
             Ok(())
         }
         #[cfg(not(has_cdcl_accel))]
