@@ -2632,6 +2632,7 @@ const KERNEL_MAX_REQUEST_WORDS: usize = 1 << 15;
 const DEFAULT_FULL_ROOT_MAX_RESPONSE_WORDS: usize = 1 << 16;
 const DEFAULT_SHADOW_CONFLICT_BUDGET: u32 = 3;
 const DEFAULT_ACTIVE_CONFLICT_BUDGET: u32 = 16;
+const DEFAULT_BLOCK_FULL_ROOT_CONFLICT_BUDGET: u32 = 128;
 
 fn configured_conflict_budget(mode_variable: &str, default: u32) -> u32 {
     std::env::var(mode_variable)
@@ -2661,6 +2662,21 @@ pub fn active_conflict_budget() -> u32 {
         configured_conflict_budget(
             "INDUCTOR_CDCL_ACTIVE_CONFLICT_BUDGET",
             DEFAULT_ACTIVE_CONFLICT_BUDGET,
+        )
+    })
+}
+
+/// A resident root amortizes one slightly deeper short inquiry across an
+/// entire on-device BLOCK traversal.  Keep this budget independent from the
+/// leaf-batch cap: native multi-AIGER sweeps show that 16/32 conflicts cause
+/// repeated CPU handoffs, 64 still misses the mod3/token tail, while 128 keeps
+/// handoff below the simulation gate without paying the 256-conflict cap.
+pub fn block_full_root_conflict_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        configured_conflict_budget(
+            "INDUCTOR_CDCL_BLOCK_FULL_ROOT_CONFLICT_BUDGET",
+            DEFAULT_BLOCK_FULL_ROOT_CONFLICT_BUDGET,
         )
     })
 }

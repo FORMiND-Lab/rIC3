@@ -2067,12 +2067,31 @@ impl IC3 {
             let mut full_root_pop = None;
             let mut full_root_sync_event = None;
             if next.is_none() && full_root_fpga_enabled {
+                // A StepBudget response is normally followed immediately by
+                // another resident root command.  Without checking the global
+                // stop conditions here, that fast path can loop indefinitely
+                // without reaching the ordinary CPU-obligation checks below.
+                // Each completed command is a failure-atomic scheduling
+                // boundary, so stopping here leaves the resident queue and
+                // every journaled SAT/UNSAT commit in a consistent state.
+                if self.ctrl.is_terminated()
+                    || self
+                        .cfg
+                        .time_limit
+                        .is_some_and(|limit| self.statistic.time.time().as_secs() > limit)
+                {
+                    self.note_exact_block_step(progress, BLOCK_STEP_TIMEOUT, semantic_ops);
+                    return BlockResult::OverallTimeLimitExceeded;
+                }
                 let full_root = self.solvers.first().map_or(
                     crate::accel::cdcl_host::ResidentBlockFullRoot::Disabled,
                     |solver| {
                         let next_var_by_current = solver.resident_block_next_var_map();
                         let (init, latches, inputs) = solver.resident_block_projection_metadata();
-                        let query_template = solver.incremental_inductive_query(&[], false, vec![]);
+                        let mut query_template =
+                            solver.incremental_inductive_query(&[], false, vec![]);
+                        query_template.budget.conflicts =
+                            crate::accel::cdcl_host::block_full_root_conflict_budget();
                         let resident_solvers = self
                             .solvers
                             .iter()
