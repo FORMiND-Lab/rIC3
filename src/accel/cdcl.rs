@@ -125,14 +125,15 @@ pub const BLOCK_ROOT_MAX_WORK: usize = 8;
 pub const BLOCK_ROOT_BATCH_OFFSET: usize =
     BLOCK_ROOT_RESPONSE_HEADER_WORDS + BLOCK_ROOT_MAX_WORK * BLOCK_ROOT_WORK_WORDS;
 
-pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 4;
-pub const BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS: usize = 12;
+pub const BLOCK_FULL_ROOT_PROTOCOL_VERSION: u32 = 5;
+pub const BLOCK_FULL_ROOT_REQUEST_HEADER_WORDS: usize = 13;
 pub const BLOCK_FULL_ROOT_RESPONSE_HEADER_WORDS: usize = 10;
 pub const BLOCK_FULL_ROOT_WORK_WORDS: usize = 7;
 pub const BLOCK_FULL_ROOT_EVENT_HEADER_WORDS: usize = 2;
 pub const BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS: usize = 7;
 pub const BLOCK_FULL_ROOT_SAT_HEADER_WORDS: usize = 11;
 pub const BLOCK_FULL_ROOT_MAX_STEPS: usize = 256;
+pub const BLOCK_FULL_ROOT_REUSE_PROJECTION: u32 = 1 << 30;
 pub const BLOCK_FULL_ROOT_COMPACTED_RETRY: u32 = 1 << 31;
 pub const BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR: u32 = 1;
 pub const BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA: u32 = 2;
@@ -377,6 +378,7 @@ pub fn pack_block_full_root_request(
     query_flags: u32,
     decision_budget: u32,
     conflict_budget: u32,
+    projection_handle: u32,
     compacted_retry: bool,
 ) -> Option<Vec<u32>> {
     if step_limit == 0
@@ -388,6 +390,7 @@ pub fn pack_block_full_root_request(
         || init_value_by_current.iter().any(|value| *value > 2)
         || latch_variables.len() > next_var_by_current.len()
         || input_variables.len() > next_var_by_current.len()
+        || projection_handle == 0
         || query_flags & (BANK_ALIGNED_DOMAIN | PACKED_SAT_MODEL)
             != (BANK_ALIGNED_DOMAIN | PACKED_SAT_MODEL)
     {
@@ -416,6 +419,7 @@ pub fn pack_block_full_root_request(
         } else {
             0
         },
+        projection_handle,
     ]);
     words.extend_from_slice(next_var_by_current);
     words.extend_from_slice(init_value_by_current);
@@ -423,6 +427,55 @@ pub fn pack_block_full_root_request(
     words.extend_from_slice(latch_variables);
     words.extend_from_slice(input_variables);
     Some(words)
+}
+
+pub fn pack_block_full_root_continuation(
+    max_frame: u32,
+    step_limit: usize,
+    frontier_limit: usize,
+    n_var: usize,
+    domain_words: usize,
+    latch_count: usize,
+    input_count: usize,
+    query_flags: u32,
+    decision_budget: u32,
+    conflict_budget: u32,
+    projection_handle: u32,
+    compacted_retry: bool,
+) -> Option<Vec<u32>> {
+    if step_limit == 0
+        || step_limit > BLOCK_FULL_ROOT_MAX_STEPS
+        || frontier_limit == 0
+        || frontier_limit > BLOCK_ROOT_MAX_WORK
+        || n_var == 0
+        || latch_count > n_var
+        || input_count > n_var
+        || projection_handle == 0
+        || query_flags & (BANK_ALIGNED_DOMAIN | PACKED_SAT_MODEL)
+            != (BANK_ALIGNED_DOMAIN | PACKED_SAT_MODEL)
+    {
+        return None;
+    }
+    Some(vec![
+        BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+        max_frame,
+        u32::try_from(step_limit).ok()?,
+        u32::try_from(n_var).ok()?,
+        u32::try_from(domain_words).ok()?,
+        query_flags,
+        decision_budget,
+        conflict_budget,
+        u32::try_from(latch_count).ok()?,
+        u32::try_from(input_count).ok()?,
+        u32::try_from(frontier_limit).ok()?,
+        BLOCK_FULL_ROOT_REUSE_PROJECTION
+            | if compacted_retry {
+                BLOCK_FULL_ROOT_COMPACTED_RETRY
+            } else {
+                0
+            },
+        projection_handle,
+    ])
 }
 
 pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootResponse> {
@@ -1192,12 +1245,13 @@ mod tests {
             flags,
             11,
             17,
+            7,
             false,
         )
         .unwrap();
-        assert_eq!(request.len(), 27);
+        assert_eq!(request.len(), 28);
         assert_eq!(
-            &request[..12],
+            &request[..13],
             &[
                 BLOCK_FULL_ROOT_PROTOCOL_VERSION,
                 3,
@@ -1211,6 +1265,26 @@ mod tests {
                 1,
                 2,
                 0,
+                7,
+            ],
+        );
+        assert_eq!(
+            pack_block_full_root_continuation(3, 4, 2, 4, 4, 2, 1, flags, 11, 17, 7, false,)
+                .unwrap(),
+            vec![
+                BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+                3,
+                4,
+                4,
+                4,
+                flags,
+                11,
+                17,
+                2,
+                1,
+                2,
+                BLOCK_FULL_ROOT_REUSE_PROJECTION,
+                7,
             ],
         );
         assert_eq!(

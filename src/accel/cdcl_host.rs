@@ -5,7 +5,8 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BatchHeader, BlockFullRootEvent, BlockFullRootResponse,
+    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BLOCK_SEMANTIC_EVENT_RESET_EPOCH, BLOCK_SEMANTIC_RESET,
+    BatchHeader, BlockFullRootEvent, BlockFullRootResponse, BlockFullRootStatus,
     BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
     BlockSemanticCommandResponse, MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
     MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
@@ -18,8 +19,8 @@ use super::cdcl::{
     STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
     UnknownReason, WANT_STAGE_PROFILE, block_full_root_required_response_capacity,
     decode_block_full_root_response, decode_block_root_response,
-    decode_block_semantic_batch_response, pack_block_full_root_request, pack_block_root_request,
-    pack_block_semantic_batch,
+    decode_block_semantic_batch_response, pack_block_full_root_continuation,
+    pack_block_full_root_request, pack_block_root_request, pack_block_semantic_batch,
 };
 #[cfg(has_cdcl_accel)]
 use crate::gipsat::decode_batch_results;
@@ -1054,6 +1055,44 @@ pub struct HardwareCdcl {
     last_batch_records: Vec<HardwareWork>,
     stage_profile: bool,
     arena: ResidentArena,
+    full_root_projection: Option<FullRootProjectionLease>,
+    next_full_root_projection_handle: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FullRootProjectionLease {
+    handle: u32,
+    next_var_by_current: Vec<u32>,
+    init_value_by_current: Vec<u32>,
+    decision_domain: Vec<u32>,
+    latch_variables: Vec<u32>,
+    input_variables: Vec<u32>,
+}
+
+fn semantic_batch_invalidates_projection(commands: &[BlockSemanticCommand]) -> bool {
+    commands.iter().any(|command| {
+        matches!(
+            command.command,
+            BLOCK_SEMANTIC_RESET | BLOCK_SEMANTIC_EVENT_RESET_EPOCH
+        )
+    })
+}
+
+impl FullRootProjectionLease {
+    fn matches(
+        &self,
+        next_var_by_current: &[u32],
+        init_value_by_current: &[u32],
+        decision_domain: &[u32],
+        latch_variables: &[u32],
+        input_variables: &[u32],
+    ) -> bool {
+        self.next_var_by_current == next_var_by_current
+            && self.init_value_by_current == init_value_by_current
+            && self.decision_domain == decision_domain
+            && self.latch_variables == latch_variables
+            && self.input_variables == input_variables
+    }
 }
 
 impl HardwareCdcl {
@@ -1102,6 +1141,8 @@ impl HardwareCdcl {
                 last_batch_records: Vec::new(),
                 stage_profile: stage_profile_enabled(),
                 arena: ResidentArena::default(),
+                full_root_projection: None,
+                next_full_root_projection_handle: 1,
             })
         }
         #[cfg(not(has_cdcl_accel))]
@@ -1127,6 +1168,12 @@ impl HardwareCdcl {
         &mut self,
         commands: &[BlockSemanticCommand],
     ) -> Result<Vec<BlockSemanticCommandResponse>, HardwareError> {
+        // Ordinary journal commands mutate obligations and lemmas, not the
+        // transition projection. Keep the lease across those hot-path syncs;
+        // only an epoch reset makes the controller discard the cached arrays.
+        if semantic_batch_invalidates_projection(commands) {
+            self.full_root_projection = None;
+        }
         let request = pack_block_semantic_batch(commands).ok_or(HardwareError::Capacity)?;
         let response_capacity = usize::try_from(request[3]).map_err(|_| HardwareError::Capacity)?;
         let request_words = u32::try_from(request.len()).map_err(|_| HardwareError::Capacity)?;
@@ -1318,20 +1365,56 @@ impl HardwareCdcl {
         {
             return Err(HardwareError::InvalidContext);
         }
-        let request = pack_block_full_root_request(
-            max_frame,
-            step_limit,
-            frontier_limit,
-            next_var_by_current,
-            init_value_by_current,
-            &domain_words,
-            latch_variables,
-            input_variables,
-            domain_header.flags,
-            domain_header.decision_budget,
-            domain_header.conflict_budget,
-            compacted_retry,
-        );
+        let reuse_handle = (!compacted_retry)
+            .then(|| self.full_root_projection.as_ref())
+            .flatten()
+            .filter(|lease| {
+                lease.matches(
+                    next_var_by_current,
+                    init_value_by_current,
+                    &domain_words,
+                    latch_variables,
+                    input_variables,
+                )
+            })
+            .map(|lease| lease.handle);
+        let projection_handle = reuse_handle.unwrap_or_else(|| {
+            let handle = self.next_full_root_projection_handle.max(1);
+            self.next_full_root_projection_handle = handle.wrapping_add(1).max(1);
+            handle
+        });
+        let request = if reuse_handle.is_some() {
+            pack_block_full_root_continuation(
+                max_frame,
+                step_limit,
+                frontier_limit,
+                next_var_by_current.len(),
+                domain_words.len(),
+                latch_variables.len(),
+                input_variables.len(),
+                domain_header.flags,
+                domain_header.decision_budget,
+                domain_header.conflict_budget,
+                projection_handle,
+                compacted_retry,
+            )
+        } else {
+            pack_block_full_root_request(
+                max_frame,
+                step_limit,
+                frontier_limit,
+                next_var_by_current,
+                init_value_by_current,
+                &domain_words,
+                latch_variables,
+                input_variables,
+                domain_header.flags,
+                domain_header.decision_budget,
+                domain_header.conflict_budget,
+                projection_handle,
+                compacted_retry,
+            )
+        };
         if request.is_none() && std::env::var_os("INDUCTOR_CDCL_NATIVE_DIAG_FIRST_ERROR").is_some()
         {
             eprintln!(
@@ -1378,6 +1461,7 @@ impl HardwareCdcl {
             };
             if rc != 0 {
                 record_full_root_transaction(&request, &[], rc);
+                self.full_root_projection = None;
                 return Err(HardwareError::Command(rc));
             }
             let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
@@ -1387,11 +1471,32 @@ impl HardwareCdcl {
             }
             response.truncate(out_words);
             record_full_root_transaction(&request, &response, rc);
-            decode_block_full_root_response(&response).ok_or(HardwareError::InvalidResponse)
+            let decoded =
+                decode_block_full_root_response(&response).ok_or(HardwareError::InvalidResponse)?;
+            if decoded.status == BlockFullRootStatus::StepBudget {
+                if reuse_handle.is_none() {
+                    self.full_root_projection = Some(FullRootProjectionLease {
+                        handle: projection_handle,
+                        next_var_by_current: next_var_by_current.to_vec(),
+                        init_value_by_current: init_value_by_current.to_vec(),
+                        decision_domain: domain_words,
+                        latch_variables: latch_variables.to_vec(),
+                        input_variables: input_variables.to_vec(),
+                    });
+                }
+            } else {
+                self.full_root_projection = None;
+            }
+            Ok(decoded)
         }
         #[cfg(not(has_cdcl_accel))]
         {
-            let _ = (request, request_words, response_capacity_words);
+            let _ = (
+                request,
+                request_words,
+                response_capacity_words,
+                projection_handle,
+            );
             Err(HardwareError::Unavailable)
         }
     }
@@ -1410,11 +1515,13 @@ impl HardwareCdcl {
             if rc != 0 {
                 self.materialized_frame = None;
                 self.arena = ResidentArena::default();
+                self.full_root_projection = None;
                 return Err(HardwareError::Command(rc));
             }
             self.n_var = n_var;
             self.materialized_frame = None;
             self.arena = ResidentArena::default();
+            self.full_root_projection = None;
             Ok(())
         }
         #[cfg(not(has_cdcl_accel))]
@@ -8221,6 +8328,39 @@ mod tests {
     use logicrs::DagCnf;
     use logicrs::satif::Satif;
     use logicrs::{Lit, Var};
+
+    #[test]
+    fn full_root_projection_lease_requires_exact_projection_vectors() {
+        let lease = FullRootProjectionLease {
+            handle: 9,
+            next_var_by_current: vec![1, 0, 2],
+            init_value_by_current: vec![0, 1, 2],
+            decision_domain: vec![0x5, 0xa],
+            latch_variables: vec![0, 1],
+            input_variables: vec![2],
+        };
+        assert!(lease.matches(&[1, 0, 2], &[0, 1, 2], &[0x5, 0xa], &[0, 1], &[2]));
+        assert!(!lease.matches(&[1, 2, 0], &[0, 1, 2], &[0x5, 0xa], &[0, 1], &[2]));
+        assert!(!lease.matches(&[1, 0, 2], &[0, 2, 1], &[0x5, 0xa], &[0, 1], &[2]));
+        assert!(!lease.matches(&[1, 0, 2], &[0, 1, 2], &[0x5], &[0, 1], &[2]));
+        assert!(!lease.matches(&[1, 0, 2], &[0, 1, 2], &[0x5, 0xa], &[1, 0], &[2]));
+        assert!(!lease.matches(&[1, 0, 2], &[0, 1, 2], &[0x5, 0xa], &[0, 1], &[1]));
+    }
+
+    #[test]
+    fn only_epoch_reset_semantics_invalidate_full_root_projection() {
+        assert!(!semantic_batch_invalidates_projection(&[
+            BlockSemanticCommand::new(crate::accel::cdcl::BLOCK_SEMANTIC_STATS),
+            BlockSemanticCommand::new(crate::accel::cdcl::BLOCK_SEMANTIC_EVENT_INSERT_LEMMA,),
+        ]));
+        assert!(semantic_batch_invalidates_projection(&[
+            BlockSemanticCommand::new(crate::accel::cdcl::BLOCK_SEMANTIC_STATS),
+            BlockSemanticCommand::new(BLOCK_SEMANTIC_RESET),
+        ]));
+        assert!(semantic_batch_invalidates_projection(&[
+            BlockSemanticCommand::new(BLOCK_SEMANTIC_EVENT_RESET_EPOCH),
+        ]));
+    }
 
     #[test]
     fn full_root_wire_admission_caps_journal_and_rejects_repeated_large_metadata() {
