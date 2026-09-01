@@ -2128,6 +2128,15 @@ impl IC3 {
                     let (proved, resident_semantic_ops) = self
                         .replay_resident_full_root(&response, &source_keys)
                         .unwrap_or_else(|error| panic!("resident full-root replay: {error}"));
+                    let resident_solvers = self
+                        .solvers
+                        .iter()
+                        .map(|solver| &solver.dcs)
+                        .collect::<Vec<_>>();
+                    crate::accel::cdcl_host::audit_resident_full_root_formula(&resident_solvers)
+                        .unwrap_or_else(|error| {
+                            panic!("resident full-root formula oracle: {error}")
+                        });
                     let resident_ops = progress.as_ref().map(|_| resident_semantic_ops);
                     if proved {
                         self.note_exact_block_step(progress, BLOCK_STEP_PROVED, resident_ops);

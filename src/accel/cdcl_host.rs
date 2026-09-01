@@ -2262,6 +2262,124 @@ fn plan_context_update(loaded: Option<&LoadedContext>, target: &ShadowContext) -
     }
 }
 
+/// Canonical logical clause view selected by one frame from the exact physical
+/// resident image. The physical image remains ordered and may contain duplicate
+/// occurrences; formula equivalence deliberately compares a sorted clause set.
+fn resident_formula_view(loaded: &LoadedContext, frame: u32) -> Result<Vec<Vec<u32>>, String> {
+    let selected = match loaded.scope {
+        ShadowContextScope::FrameRanged => loaded
+            .clauses
+            .iter()
+            .filter(|clause| clause.lo <= frame && frame <= clause.hi)
+            .map(|clause| &clause.literals)
+            .collect::<Vec<_>>(),
+        ShadowContextScope::ExactFrame(exact) if exact == frame => loaded
+            .clauses
+            .iter()
+            .map(|clause| &clause.literals)
+            .collect(),
+        scope => {
+            return Err(format!(
+                "resident full-root formula oracle cannot select frame {frame} from {scope:?}"
+            ));
+        }
+    };
+    Ok(canonical_clause_set(selected.into_iter()))
+}
+
+/// A stable diagnostic fingerprint. Equality is always decided by the exact
+/// canonical vectors above; this hash is only a compact way to identify the
+/// two disagreeing frame views in logs and artifacts.
+fn formula_view_fingerprint(view: &[Vec<u32>]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    let mut feed = |word: u32| {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    feed(view.len().min(u32::MAX as usize) as u32);
+    for clause in view {
+        feed(clause.len().min(u32::MAX as usize) as u32);
+        for &literal in clause {
+            feed(literal);
+        }
+        feed(u32::MAX);
+    }
+    hash
+}
+
+fn compare_resident_formula_view(
+    loaded: &LoadedContext,
+    n_var: u32,
+    frame: u32,
+    cpu_clauses: &[LitVec],
+) -> Result<(), String> {
+    if loaded.n_var != n_var {
+        return Err(format!(
+            "resident full-root formula n_var mismatch at frame {frame}: device={} CPU={n_var}",
+            loaded.n_var
+        ));
+    }
+    let device = resident_formula_view(loaded, frame)?;
+    let cpu = canonical_clause_set(cpu_clauses.iter());
+    if device == cpu {
+        return Ok(());
+    }
+    let cpu_only = cpu
+        .iter()
+        .find(|clause| device.binary_search(clause).is_err());
+    let device_only = device
+        .iter()
+        .find(|clause| cpu.binary_search(clause).is_err());
+    let device_only_ranges = device_only.map(|body| {
+        loaded
+            .clauses
+            .iter()
+            .filter_map(|clause| {
+                let mut raw: Vec<u32> = clause
+                    .literals
+                    .iter()
+                    .map(|literal| u32::from(*literal))
+                    .collect();
+                raw.sort_unstable();
+                raw.dedup();
+                (raw == **body).then_some((clause.lo, clause.hi))
+            })
+            .collect::<Vec<_>>()
+    });
+    Err(format!(
+        "resident full-root formula mismatch at frame {frame}: device clauses={} fingerprint={:016x}, CPU clauses={} fingerprint={:016x}, first device-only={device_only:?} physical-ranges={device_only_ranges:?}, first CPU-only={cpu_only:?}",
+        device.len(),
+        formula_view_fingerprint(&device),
+        cpu.len(),
+        formula_view_fingerprint(&cpu),
+    ))
+}
+
+/// Compare the device mutation journal's exact physical frame views with the
+/// authoritative GipSAT frame solvers after replaying one full-root response.
+/// This is a simulation qualification oracle, not a production double-check.
+pub fn audit_resident_full_root_formula(solvers: &[&DagCnfSolver]) -> Result<(), String> {
+    if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_FORMULA_ORACLE").is_none() {
+        return Ok(());
+    }
+    let state = active_state()
+        .lock()
+        .map_err(|_| "resident full-root formula oracle hardware lock poisoned".to_string())?;
+    let loaded = state
+        .loaded_context
+        .as_ref()
+        .ok_or_else(|| "resident full-root formula oracle has no physical context".to_string())?;
+    for solver in solvers {
+        let (n_var, frame, cpu_clauses) = solver.incremental_resident_snapshot();
+        compare_resident_formula_view(loaded, n_var, frame, &cpu_clauses)?;
+    }
+    Ok(())
+}
+
 struct ShadowBatch {
     context: ShadowContext,
     pending: Vec<(IncrementalQuery, Option<bool>)>,
@@ -9011,6 +9129,65 @@ mod tests {
         assert_eq!(
             plan_context_update(Some(&loaded), &reordered),
             ContextUpdate::Reload,
+        );
+    }
+
+    #[test]
+    fn full_root_formula_oracle_compares_exact_frame_views() {
+        let a = Lit::new(Var::from(0), true);
+        let b = Lit::new(Var::from(1), true);
+        let transition = LitVec::from([a, b]);
+        let early = LitVec::from([!a]);
+        let later = LitVec::from([!b]);
+        let exact = LoadedContext {
+            n_var: 2,
+            clauses: vec![
+                ResidentClause::new(0, u32::MAX, transition.clone()),
+                ResidentClause::new(1, 4, early.clone()),
+                ResidentClause::new(3, 8, later.clone()),
+            ],
+            scope: ShadowContextScope::FrameRanged,
+        };
+        assert!(
+            compare_resident_formula_view(&exact, 2, 2, &[early.clone(), transition.clone()],)
+                .is_ok()
+        );
+        assert!(
+            compare_resident_formula_view(
+                &exact,
+                2,
+                3,
+                &[later.clone(), transition.clone(), early.clone()],
+            )
+            .is_ok()
+        );
+
+        // This is the failure mode the full-root architecture gate targets:
+        // a device-side 1..frame append is stronger than the CPU's actual
+        // begin..frame insertion at an earlier frame.
+        let too_broad = LoadedContext {
+            clauses: vec![
+                ResidentClause::new(0, u32::MAX, transition.clone()),
+                ResidentClause::new(1, 4, early.clone()),
+                ResidentClause::new(1, 8, later.clone()),
+            ],
+            ..exact.clone()
+        };
+        let error =
+            compare_resident_formula_view(&too_broad, 2, 2, &[transition.clone(), early.clone()])
+                .unwrap_err();
+        assert!(
+            error.contains("frame 2")
+                && error.contains("device-only")
+                && error.contains("physical-ranges=Some([(1, 8)])")
+        );
+
+        let first = canonical_clause_set([&transition, &early].into_iter());
+        let second = canonical_clause_set([&early, &transition].into_iter());
+        assert_eq!(first, second);
+        assert_eq!(
+            formula_view_fingerprint(&first),
+            formula_view_fingerprint(&second)
         );
     }
 
