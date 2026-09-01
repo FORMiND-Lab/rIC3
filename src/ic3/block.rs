@@ -320,6 +320,11 @@ const BLOCK_SEMANTIC_INSERT_OBLIGATION: u32 = 1;
 const BLOCK_SEMANTIC_CLEAR_OBLIGATIONS: u32 = 2;
 const BLOCK_SEMANTIC_REMOVE_LEMMA: u32 = 3;
 const BLOCK_SEMANTIC_INSERT_LEMMA: u32 = 4;
+// Simulation-only acknowledgement: the resident full-root controller already
+// removed this logical lemma while normalizing an UNSAT commit.  The host
+// mirror must retire its descriptor without issuing a duplicate device
+// command.  This never crosses the hardware protocol boundary.
+const BLOCK_SEMANTIC_ACK_REMOVE_LEMMA: u32 = 8;
 // A queue-owned pop is distinct from an arbitrary descriptor removal. The
 // resident controller must independently choose the same heap head and return
 // its opaque tag before CPU proof processing continues.
@@ -406,6 +411,31 @@ fn note_exact_lemma_mutations(
         operation.extend(mutation.lemma.iter().map(|lit| u32::from(*lit)));
         operations.push(operation);
     }
+}
+
+fn note_preapplied_lemma_removals(
+    operations: &mut ExactBlockSemanticOps,
+    mutations: Vec<BlockLemmaMutation>,
+) -> Result<(), String> {
+    let Some(operations) = operations.as_mut() else {
+        return Ok(());
+    };
+    for mutation in mutations {
+        if mutation.insert {
+            return Err(
+                "resident UNSAT normalization produced an unexpected extra insertion".to_string(),
+            );
+        }
+        let mut operation = vec![
+            BLOCK_SEMANTIC_ACK_REMOVE_LEMMA,
+            mutation.frame.min(u32::MAX as usize) as u32,
+            mutation.lemma.len().min(u32::MAX as usize) as u32 + 1,
+            mutation.lemma.len().min(u32::MAX as usize) as u32,
+        ];
+        operation.extend(mutation.lemma.iter().map(|lit| u32::from(*lit)));
+        operations.push(operation);
+    }
+    Ok(())
 }
 
 pub(super) struct BlockAccelPolicy {
@@ -1761,7 +1791,7 @@ impl IC3 {
                             "resident UNSAT lemma was not installed in the CPU frame".to_string()
                         );
                     }
-                    note_exact_lemma_mutations(&mut semantic_ops, normalization);
+                    note_preapplied_lemma_removals(&mut semantic_ops, normalization)?;
                 }
             }
         }

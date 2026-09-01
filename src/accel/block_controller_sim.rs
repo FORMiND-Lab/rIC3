@@ -37,6 +37,9 @@ const JOURNAL_INSERT_LEMMA: u32 = 4;
 const JOURNAL_SET_LEMMA_FRAMES: u32 = 5;
 const JOURNAL_MOVE_LEMMA: u32 = 6;
 const JOURNAL_POP_OBLIGATION: u32 = 7;
+// Rust-internal bookkeeping acknowledgement.  The full-root device has
+// already applied this normalization removal; do not send it back to C++.
+const JOURNAL_ACK_REMOVE_LEMMA: u32 = 8;
 
 static MIRROR: OnceLock<Mutex<ResidentBlockMirror>> = OnceLock::new();
 static BATCHES: AtomicU64 = AtomicU64::new(0);
@@ -97,6 +100,7 @@ enum JournalOperation {
     InsertObligation(Obligation),
     ClearObligations,
     RemoveLemma(Lemma),
+    AcknowledgeRemoveLemma(Lemma),
     InsertLemma(Lemma),
     SetLemmaFrames(u32),
     MoveLemma {
@@ -257,17 +261,17 @@ fn decode_operation(words: &[u32]) -> Result<JournalOperation, String> {
                 JournalOperation::InsertObligation(obligation)
             }
         }
-        JOURNAL_REMOVE_LEMMA | JOURNAL_INSERT_LEMMA => {
+        JOURNAL_REMOVE_LEMMA | JOURNAL_INSERT_LEMMA | JOURNAL_ACK_REMOVE_LEMMA => {
             let frame = take(words, &mut at)?;
             let payload_words = take(words, &mut at)? as usize;
             let lemma = Lemma {
                 frame,
                 payload: take_payload(words, &mut at, payload_words)?,
             };
-            if command == JOURNAL_REMOVE_LEMMA {
-                JournalOperation::RemoveLemma(lemma)
-            } else {
-                JournalOperation::InsertLemma(lemma)
+            match command {
+                JOURNAL_REMOVE_LEMMA => JournalOperation::RemoveLemma(lemma),
+                JOURNAL_INSERT_LEMMA => JournalOperation::InsertLemma(lemma),
+                _ => JournalOperation::AcknowledgeRemoveLemma(lemma),
             }
         }
         JOURNAL_SET_LEMMA_FRAMES => JournalOperation::SetLemmaFrames(take(words, &mut at)?),
@@ -799,8 +803,7 @@ impl ResidentBlockMirror {
         if matches!(
             response.status,
             BlockFullRootStatus::Fallback | BlockFullRootStatus::CompactionRequired
-        ) || response.unsat_commits != 0
-        {
+        ) {
             self.compact_after_full_root_response = true;
         }
         ROOT_WAVES.fetch_add(response.cdcl_waves as u64, Ordering::Relaxed);
@@ -1362,6 +1365,26 @@ impl ResidentBlockMirror {
                     commands.push(remove);
                     actions.push(PendingAction::None);
                 }
+                JournalOperation::AcknowledgeRemoveLemma(lemma) => {
+                    let key = lemma.key();
+                    let handles = self
+                        .lemma_descriptors
+                        .get_mut(&key)
+                        .ok_or_else(|| "preapplied remove of unknown resident lemma".to_string())?;
+                    if handles.is_empty() {
+                        return Err(
+                            "preapplied remove found an empty resident lemma stack".to_string()
+                        );
+                    }
+                    // Descriptors are appended in device commit order.  A
+                    // same-key normalization removes the pre-existing (oldest)
+                    // descriptor before appending the replacement, so retire
+                    // the FIFO head rather than the newest handle.
+                    handles.remove(0);
+                    if handles.is_empty() {
+                        self.lemma_descriptors.remove(&key);
+                    }
+                }
                 JournalOperation::InsertLemma(lemma) => {
                     let key = lemma.key();
                     let mut insert = command(BLOCK_SEMANTIC_EVENT_INSERT_LEMMA);
@@ -1469,6 +1492,13 @@ impl ResidentBlockMirror {
                 // committed a prefix, so retrying individual operations is
                 // unsafe; a complete rebase is the transactional recovery.
                 CAPACITY_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+                self.rebase(hardware, obligation_image, lemma_image)
+            }
+            Err(error) if error.starts_with("preapplied remove") => {
+                // The acknowledgement only changes the host descriptor map;
+                // the device mutation already happened.  Rebuilding from the
+                // authoritative CPU image is a safe synchronization fallback.
+                FULL_ROOT_RESPONSE_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
                 self.rebase(hardware, obligation_image, lemma_image)
             }
             Err(error) => Err(error),
@@ -1608,7 +1638,7 @@ pub(super) fn root_metrics() -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::semantic_capacity_error;
+    use super::{JournalOperation, decode_operation, semantic_capacity_error};
 
     #[test]
     fn only_semantic_arena_capacity_triggers_epoch_compaction() {
@@ -1621,5 +1651,15 @@ mod tests {
         assert!(!semantic_capacity_error(
             "incremental CDCL hardware error: InvalidResponse"
         ));
+    }
+
+    #[test]
+    fn decodes_preapplied_lemma_removal_acknowledgement() {
+        let operation = decode_operation(&[8, 3, 3, 2, 11, 17]).unwrap();
+        let JournalOperation::AcknowledgeRemoveLemma(lemma) = operation else {
+            panic!("unexpected journal operation");
+        };
+        assert_eq!(lemma.frame, 3);
+        assert_eq!(lemma.payload, vec![2, 11, 17]);
     }
 }
