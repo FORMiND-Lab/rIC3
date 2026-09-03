@@ -24,8 +24,8 @@ use logicrs::{Lit, LitSet, LitVec, Var, VarMap};
 use propagate::Watchers;
 pub use query::{
     BatchDecodeError, IncrementalCdcl, IncrementalQuery, IncrementalResult, QueryBudget,
-    decode_batch_results, encoded_domain_words, pack_batch, solve_on_cpu_after_hardware_unknown,
-    solve_with_cpu_fallback,
+    bank_aligned_domain_enabled, decode_batch_results, encoded_domain_words, pack_batch,
+    solve_on_cpu_after_hardware_unknown, solve_with_cpu_fallback,
 };
 use rand::RngExt;
 use rand::{SeedableRng, rngs::SmallRng};

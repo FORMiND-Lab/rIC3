@@ -880,6 +880,7 @@ impl MicHeader {
     pub fn valid_for(&self, payload: &[u32]) -> bool {
         if self.version != ABI_VERSION
             || self.n_cube < 2
+            || self.flags & BANK_ALIGNED_DOMAIN != 0 && self.n_domain & 3 != 0
             || self.payload_words() != Some(payload.len())
         {
             return false;

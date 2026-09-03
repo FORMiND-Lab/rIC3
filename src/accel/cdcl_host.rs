@@ -5,9 +5,9 @@
 //! `IncrementalCdcl` implementation; they are never interpreted as SAT/UNSAT.
 
 use super::cdcl::{
-    ABI_VERSION, BLOCK_ROOT_BATCH_OFFSET, BLOCK_SEMANTIC_EVENT_RESET_EPOCH, BLOCK_SEMANTIC_RESET,
-    BatchHeader, BlockFullRootEvent, BlockFullRootResponse, BlockFullRootStatus,
-    BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
+    ABI_VERSION, BANK_ALIGNED_DOMAIN, BLOCK_ROOT_BATCH_OFFSET, BLOCK_SEMANTIC_EVENT_RESET_EPOCH,
+    BLOCK_SEMANTIC_RESET, BatchHeader, BlockFullRootEvent, BlockFullRootResponse,
+    BlockFullRootStatus, BlockRootExecutionStatus, BlockRootResponse, BlockSemanticCommand,
     BlockSemanticCommandResponse, MIC_BATCH_HEADER_WORDS, MIC_BATCH_RESPONSE_HEADER_WORDS,
     MIC_MODEL_SHRINK, MIC_PROTECT_INDEX, MIC_PROTECTED_INDEX_SHIFT, MIC_RESPONSE_HEADER_WORDS,
     MicHeader, MicResponseHeader, PROFILE_ANALYZE, PROFILE_ANALYZED_LITERALS, PROFILE_BACKTRACK,
@@ -26,7 +26,8 @@ use super::cdcl::{
 use crate::gipsat::decode_batch_results;
 use crate::gipsat::{
     BatchDecodeError, DagCnfSolver, IncrementalCdcl, IncrementalQuery, IncrementalResult,
-    QueryBudget, encoded_domain_words, pack_batch, solve_on_cpu_after_hardware_unknown,
+    QueryBudget, bank_aligned_domain_enabled, encoded_domain_words, pack_batch,
+    solve_on_cpu_after_hardware_unknown,
 };
 use logicrs::{Lit, LitVec, Var};
 use std::collections::{HashMap, HashSet};
@@ -715,8 +716,10 @@ fn pack_mic_chain_request(
             domain.push(var as u32);
         }
     }
+    let bank_aligned = bank_aligned_domain_enabled();
+    let encoded_domain = encode_mic_domain(&domain, bank_aligned)?;
     let payload_words = constraint_words
-        .checked_add(domain.len())
+        .checked_add(encoded_domain.len())
         .and_then(|words| words.checked_add(2 * cube.len()))
         .ok_or(HardwareError::Capacity)?;
     let total_words = super::cdcl::MIC_HEADER_WORDS
@@ -730,6 +733,7 @@ fn pack_mic_chain_request(
         frame,
         flags: MIC_PROTECT_INDEX
             | ((protected_index as u32) << MIC_PROTECTED_INDEX_SHIFT)
+            | if bank_aligned { BANK_ALIGNED_DOMAIN } else { 0 }
             | if mic_chain_model_shrink() {
                 MIC_MODEL_SHRINK
             } else {
@@ -737,7 +741,7 @@ fn pack_mic_chain_request(
             },
         n_cube: cube.len() as u32,
         n_constraint_words: constraint_words as u32,
-        n_domain: domain.len() as u32,
+        n_domain: encoded_domain.len() as u32,
         decision_budget,
         conflict_budget,
         max_trials,
@@ -748,13 +752,36 @@ fn pack_mic_chain_request(
         request.push(clause.len() as u32);
         request.extend(clause.iter().map(|lit| u32::from(*lit)));
     }
-    request.extend(domain);
+    request.extend(encoded_domain);
     for &(current, next) in cube {
         request.push(current.into());
         request.push(next.into());
     }
     debug_assert!(header.valid_for(&request[super::cdcl::MIC_HEADER_WORDS..]));
     Ok(request)
+}
+
+fn encode_mic_domain(domain: &[u32], bank_aligned: bool) -> Result<Vec<u32>, HardwareError> {
+    if !bank_aligned {
+        return Ok(domain.to_vec());
+    }
+    if domain.len() > 32768 || domain.iter().any(|&variable| variable >= 32768) {
+        return Err(HardwareError::Capacity);
+    }
+    let mut banks: [Vec<(u16, u16)>; 4] = std::array::from_fn(|_| Vec::new());
+    for (rank, &variable) in domain.iter().enumerate() {
+        banks[(variable & 3) as usize].push((rank as u16, variable as u16));
+    }
+    let lines = banks.iter().map(Vec::len).max().unwrap_or(0);
+    let mut encoded = Vec::with_capacity(4 * lines);
+    for line in 0..lines {
+        for bank in &banks {
+            encoded.push(bank.get(line).map_or(0, |&(rank, variable)| {
+                0x8000_0000 | (u32::from(rank) << 16) | u32::from(variable)
+            }));
+        }
+    }
+    Ok(encoded)
 }
 
 fn pack_mic_chains_request(
@@ -8547,6 +8574,18 @@ mod tests {
                 u32::from(l(5)),
             ]
         );
+    }
+
+    #[test]
+    fn mic_domain_uses_the_same_four_bank_schedule_as_short_queries() {
+        let encoded = encode_mic_domain(&[5, 2, 8, 3, 4], true).unwrap();
+        assert_eq!(encoded.len(), 8);
+        assert_eq!(encoded[0], 0x8002_0008);
+        assert_eq!(encoded[1], 0x8000_0005);
+        assert_eq!(encoded[2], 0x8001_0002);
+        assert_eq!(encoded[3], 0x8003_0003);
+        assert_eq!(encoded[4], 0x8004_0004);
+        assert_eq!(&encoded[5..], &[0, 0, 0]);
     }
 
     #[test]
