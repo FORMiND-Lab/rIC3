@@ -2700,6 +2700,8 @@ static ACTIVE_BLOCK_BROKER_JOBS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_BROKER_QUERIES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_BROKER_QUEUE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_BROKER_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BROKER_STREAM_REPLIES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BROKER_REPLY_TAIL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_JOIN_NS: AtomicU64 = AtomicU64::new(0);
@@ -6810,9 +6812,44 @@ pub fn solve_active_batch_with_min(
     requests: Vec<(&DagCnfSolver, IncrementalQuery)>,
     min_batch_size: usize,
 ) -> Vec<IncrementalResult> {
+    solve_active_batch_reporting(requests, min_batch_size, &mut |_, _| {})
+}
+
+/// Publish indexed answers as physical batches finish. All solver-dependent
+/// planning and diagnostics finish before the first callback. The execution
+/// function accepts owned data only: a completed client's DagCnf may go away
+/// while other clients' batches are still running. Callbacks must not block or
+/// re-enter the hardware backend (its device-state lock is held).
+pub fn solve_active_batch_stream(
+    requests: Vec<(&DagCnfSolver, IncrementalQuery)>,
+    mut completed: impl FnMut(usize, &IncrementalResult),
+) {
+    let mut emitted = vec![false; requests.len()];
+    let output = solve_active_batch_reporting(requests, active_min_batch_size(), &mut |index, result| {
+        emitted[index] = true;
+        completed(index, result);
+    });
+    // Admission failures, trace-only/paired modes and an interrupted device
+    // group still terminate every request, with their ordinary UNKNOWN reply.
+    for (index, result) in output.iter().enumerate() {
+        if !emitted[index] { completed(index, result); }
+    }
+}
+
+struct ActiveBatchGroup {
+    context: ShadowContext,
+    pending: Vec<(usize, IncrementalQuery, ShadowContext)>,
+    batches: Vec<std::ops::Range<usize>>,
+}
+
+fn solve_active_batch_reporting(
+    requests: Vec<(&DagCnfSolver, IncrementalQuery)>,
+    min_batch_size: usize,
+    completed: &mut impl FnMut(usize, &IncrementalResult),
+) -> Vec<IncrementalResult> {
     let min_batch_size = min_batch_size.clamp(1, DEFAULT_SHADOW_BATCH_SIZE);
     let unknown = IncrementalResult::Unknown(super::cdcl::UnknownReason::BackendError);
-    let mut output = vec![unknown.clone(); requests.len()];
+    let output = vec![unknown.clone(); requests.len()];
     if requests.is_empty() || !(active_enabled() || paired_enabled()) {
         return output;
     }
@@ -6851,12 +6888,7 @@ pub fn solve_active_batch_with_min(
         ACTIVE_SKIPPED_SMALL_BATCH.fetch_add(selected_count as u64, Ordering::Relaxed);
         return output;
     }
-    struct Group {
-        context: ShadowContext,
-        pending: Vec<(usize, IncrementalQuery, ShadowContext)>,
-        batches: Vec<std::ops::Range<usize>>,
-    }
-    let mut groups: Vec<Group> = Vec::new();
+    let mut groups: Vec<ActiveBatchGroup> = Vec::new();
     let mut caches = Vec::new();
     let prefer_query_lemmas = !(active_resident_lemmas() || active_frame_ranges());
     // Exact/architecture traces encode one context per recorded batch. Keep
@@ -6897,7 +6929,7 @@ pub fn solve_active_batch_with_min(
         {
             group.pending.push((index, query, context.clone()));
         } else {
-            groups.push(Group {
+            groups.push(ActiveBatchGroup {
                 context: context.clone(),
                 pending: vec![(index, query, context.clone())],
                 batches: Vec::new(),
@@ -7032,6 +7064,29 @@ pub fn solve_active_batch_with_min(
         return output;
     }
 
+    // Nothing below this boundary can read a source solver or its non-owning
+    // DagCnf pointer, even after the callback releases an original client.
+    drop(caches);
+    drop(requests);
+    if !paired {
+        for (index, is_planned) in planned.iter().enumerate() {
+            if !is_planned { completed(index, &output[index]); }
+        }
+    }
+    execute_prepared_active_batch(groups, output, arena_views, paired, pass_id,
+                                  reference_cpu, paired_preflight, completed)
+}
+
+fn execute_prepared_active_batch(
+    groups: Vec<ActiveBatchGroup>,
+    mut output: Vec<IncrementalResult>,
+    arena_views: bool,
+    paired: bool,
+    pass_id: u64,
+    reference_cpu: Option<Vec<PairedCpuWork>>,
+    paired_preflight: Option<Vec<PairedPreflightWork>>,
+    completed: &mut impl FnMut(usize, &IncrementalResult),
+) -> Vec<IncrementalResult> {
     let state_wait_start = std::time::Instant::now();
     let state = active_state().lock();
     ACTIVE_STATE_WAIT_NS.fetch_add(
@@ -7294,7 +7349,7 @@ pub fn solve_active_batch_with_min(
                 }
             }
             match result {
-                Ok(results) => {
+                Ok(results) if results.len() == end - start => {
                     for ((index, _, _), result) in group.pending[start..end].iter().zip(results) {
                         match &result {
                             IncrementalResult::Sat { .. } => {
@@ -7309,6 +7364,13 @@ pub fn solve_active_batch_with_min(
                         }
                         output[*index] = result;
                     }
+                }
+                Ok(_) => {
+                    // Do not publish a prefix of a malformed physical reply.
+                    ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                    note_active_block_broker_reply_error();
+                    context_ready = false;
+                    state.loaded_context = None;
                 }
                 Err(error) => {
                     // A top-level request/arena capacity rejection means that
@@ -7331,10 +7393,15 @@ pub fn solve_active_batch_with_min(
                     }
                 }
             }
+            if !paired {
+                for (index, _, _) in &group.pending[start..end] {
+                    completed(*index, &output[*index]);
+                }
+            }
         }
     }
     if paired {
-        output.fill(unknown);
+        output.fill(IncrementalResult::Unknown(UnknownReason::BackendError));
     }
     output
 }
@@ -7692,6 +7759,11 @@ pub fn note_active_block_broker_dispatch(jobs: usize, queries: usize, queued_ns:
 
 pub fn note_active_block_broker_reply_error() {
     ACTIVE_BLOCK_BROKER_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_block_broker_stream(replies: usize, tail_ns: u64) {
+    ACTIVE_BLOCK_BROKER_STREAM_REPLIES.fetch_add(replies as u64, Ordering::Relaxed);
+    ACTIVE_BLOCK_BROKER_REPLY_TAIL_NS.fetch_add(tail_ns, Ordering::Relaxed);
 }
 
 pub fn note_active_block_async_root_tail(queries: usize) {
@@ -8067,13 +8139,15 @@ pub fn flush_and_report() {
             ACTIVE_BLOCK_ASYNC_DEMAND_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         );
         eprintln!(
-            "inductor-cdcl: async broker groups={} jobs={} queries={} queue_wait_ms={:.3} state_wait_ms={:.3} reply_errors={}",
+            "inductor-cdcl: async broker groups={} jobs={} queries={} queue_wait_ms={:.3} state_wait_ms={:.3} reply_errors={} stream_replies={} reply_tail_ms={:.3}",
             ACTIVE_BLOCK_BROKER_GROUPS.load(Ordering::Relaxed),
             ACTIVE_BLOCK_BROKER_JOBS.load(Ordering::Relaxed),
             ACTIVE_BLOCK_BROKER_QUERIES.load(Ordering::Relaxed),
             ACTIVE_BLOCK_BROKER_QUEUE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_STATE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ACTIVE_BLOCK_BROKER_REPLY_ERRORS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BROKER_STREAM_REPLIES.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BROKER_REPLY_TAIL_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         );
         let kernel_ns = direct_kernel_ns();
         if kernel_ns != 0 {
@@ -9309,6 +9383,39 @@ mod tests {
                 .iter()
                 .any(|clause| clause.as_slice() == [a, !b])
         );
+    }
+
+    #[test]
+    fn prepared_group_keeps_exact_formula_after_source_solvers_and_cnf_are_dropped() {
+        let (group, a, b) = {
+            let mut dc = DagCnf::new();
+            let a = dc.new_var().lit();
+            let b = dc.new_var().lit();
+            dc.add_rel(b.var(), &[LitVec::from([a, b])]);
+            let mut first = DagCnfSolver::new(&dc);
+            first.add_clause(&[!a, b]);
+            let mut second = first.clone();
+            second.add_clause(&[a, !b]);
+            let mut pending = Vec::new();
+            for (index, solver) in [&first, &second].into_iter().enumerate() {
+                let mut cache = BatchedSolverContext::new(solver);
+                let query = cache.prepare_query(IncrementalQuery::new(0, LitVec::from([a])), true);
+                pending.push((index, query, cache.context(true).clone()));
+            }
+            let group = ActiveBatchGroup {
+                context: pending[0].2.clone(), pending, batches: vec![0..2],
+            };
+            drop(second);
+            drop(first);
+            drop(dc);
+            (group, a, b)
+        };
+        assert!(group.context.clauses.iter().any(|clause| clause.literals.as_slice() == [a, b]));
+        assert_eq!(group.pending[0].2, group.pending[1].2);
+        assert!(group.pending[0].1.constraints.iter().any(|clause| clause.as_slice() == [!a, b]));
+        assert!(!group.pending[0].1.constraints.iter().any(|clause| clause.as_slice() == [a, !b]));
+        assert!(group.pending[1].1.constraints.iter().any(|clause| clause.as_slice() == [a, !b]));
+        assert_eq!(group.batches[0], 0..2);
     }
 
     #[test]

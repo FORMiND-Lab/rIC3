@@ -201,11 +201,168 @@ struct AsyncBlockExecutor {
     next: AtomicUsize,
 }
 
+// Own only reply channels and indexed slots, never solver/CNF references.
+// Physical batches may complete jobs in a different order from submission.
+struct AsyncJobReplies {
+    owners: Vec<(usize, usize)>,
+    seen: Vec<bool>,
+    replies: Vec<(Sender<Vec<IncrementalResult>>, Vec<IncrementalResult>, usize)>,
+    published: Vec<Instant>,
+    failed: bool,
+}
+
+impl AsyncJobReplies {
+    fn new(jobs: &[AsyncBlockJob]) -> Self {
+        let mut owners = Vec::new();
+        let replies = jobs.iter().enumerate().map(|(job_index, job)| {
+            owners.extend((0..job.requests.len()).map(|index| (job_index, index)));
+            if job.requests.is_empty() { let _ = job.result.send(Vec::new()); }
+            (job.result.clone(), vec![IncrementalResult::Unknown(
+                crate::accel::cdcl::UnknownReason::BackendError); job.requests.len()], job.requests.len())
+        }).collect();
+        Self { seen: vec![false; owners.len()], owners, replies, published: Vec::new(), failed: false }
+    }
+
+    fn complete(&mut self, index: usize, result: &IncrementalResult) {
+        if self.failed { return; }
+        if self.seen.get(index).is_none_or(|seen| *seen) {
+            // Already delivered jobs cannot be revoked. The indexed backend
+            // emits each index exactly once; a violated contract fails every
+            // still-pending client closed and is a validation-gate failure.
+            self.failed = true;
+            crate::accel::cdcl_host::note_active_block_broker_reply_error();
+            return;
+        }
+        self.seen[index] = true;
+        let (job, local) = self.owners[index];
+        let (sender, slots, remaining) = &mut self.replies[job];
+        slots[local] = result.clone();
+        *remaining -= 1;
+        if *remaining == 0 {
+            let _ = sender.send(std::mem::take(slots));
+            self.published.push(Instant::now());
+        }
+    }
+
+    fn finish(mut self) {
+        let now = Instant::now();
+        crate::accel::cdcl_host::note_active_block_broker_stream(
+            self.published.len(), self.published.iter().fold(0u64, |sum, at| {
+                sum.saturating_add(now.duration_since(*at).as_nanos().min(u64::MAX as u128) as u64)
+            }));
+        if !self.failed && self.seen.iter().any(|seen| !seen) {
+            crate::accel::cdcl_host::note_active_block_broker_reply_error();
+        }
+        for (sender, slots, remaining) in &mut self.replies {
+            if *remaining > 0 {
+                // A missing/invalid reply cannot leak a partial SAT/UNSAT job.
+                slots.fill(IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::BackendError));
+                let _ = sender.send(std::mem::take(slots));
+            }
+        }
+    }
+}
+
+fn execute_async_jobs_stream(
+    jobs: Vec<AsyncBlockJob>,
+    solve: impl FnOnce(Vec<(&crate::gipsat::DagCnfSolver, IncrementalQuery)>,
+                      &mut dyn FnMut(usize, &IncrementalResult)),
+) {
+    let mut replies = AsyncJobReplies::new(&jobs);
+    let queued_ns = jobs.iter().fold(0u64, |sum, job| {
+        sum.saturating_add(job.queued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+    });
+    let requests: Vec<_> = jobs.iter().flat_map(|job| {
+        job.requests.iter().map(|(solver, query)| (&job.solvers[*solver], query.clone()))
+    }).collect();
+    crate::accel::cdcl_host::note_active_block_broker_dispatch(jobs.len(), requests.len(), queued_ns);
+    solve(requests, &mut |index, result| replies.complete(index, result));
+    replies.finish();
+}
+
 #[cfg(test)]
 mod async_broker_tests {
     use super::*;
     use crate::{accel::cdcl::UnknownReason, gipsat::DagCnfSolver};
     use logicrs::DagCnf;
+
+    fn reply_jobs(sizes: &[usize]) -> (Vec<AsyncBlockJob>, Vec<Receiver<Vec<IncrementalResult>>>) {
+        let mut receivers = Vec::new();
+        let jobs = sizes.iter().map(|size| {
+            let (result, receiver) = mpsc::channel();
+            receivers.push(receiver);
+            AsyncBlockJob {
+                solvers: Vec::new(),
+                requests: (0..*size).map(|_| (0, IncrementalQuery::new(0, LitVec::new()))).collect(),
+                result, queued_at: Instant::now(),
+            }
+        }).collect();
+        (jobs, receivers)
+    }
+
+    #[test]
+    fn streaming_returns_finished_job_before_delayed_head_and_restores_local_order() {
+        let (jobs, rx) = reply_jobs(&[2, 1, 0]);
+        let mut replies = AsyncJobReplies::new(&jobs);
+        let conflict = IncrementalResult::Unknown(UnknownReason::ConflictBudget);
+        let decision = IncrementalResult::Unknown(UnknownReason::DecisionBudget);
+        replies.complete(1, &decision);
+        assert!(matches!(rx[0].try_recv(), Err(TryRecvError::Empty)));
+        replies.complete(2, &conflict);
+        // No finish() and no completion for the head yet: the second client
+        // can proceed while another client's physical batch is still pending.
+        assert_eq!(rx[1].try_recv().unwrap().len(), 1);
+        assert!(rx[2].try_recv().unwrap().is_empty());
+        replies.complete(0, &conflict);
+        let first = rx[0].try_recv().unwrap();
+        assert!(matches!(first[0], IncrementalResult::Unknown(UnknownReason::ConflictBudget)));
+        assert!(matches!(first[1], IncrementalResult::Unknown(UnknownReason::DecisionBudget)));
+        replies.finish();
+        for client in rx { assert!(client.try_recv().is_err()); }
+    }
+
+    #[test]
+    fn missing_duplicate_and_out_of_bounds_stream_answers_fail_pending_jobs_closed() {
+        for invalid in [None, Some(0), Some(3)] {
+            let (jobs, clients) = reply_jobs(&[2, 1]);
+            let mut replies = AsyncJobReplies::new(&jobs);
+            let unsat = IncrementalResult::Unsat { core: LitVec::new(), used_constraints: false };
+            replies.complete(0, &unsat);
+            if let Some(index) = invalid { replies.complete(index, &unsat); }
+            replies.finish();
+            for (client, len) in clients.into_iter().zip([2, 1]) {
+                let results = client.recv().unwrap();
+                assert_eq!(results.len(), len);
+                assert!(results.iter().all(|result| matches!(result,
+                    IncrementalResult::Unknown(UnknownReason::BackendError))));
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_executor_preserves_distinct_formula_identity() {
+        let mut dc = DagCnf::new();
+        let lit = dc.new_var().lit();
+        let one = DagCnfSolver::new(&dc);
+        let mut two = one.clone();
+        two.add_clause(&[lit]);
+        let (mut jobs, clients) = reply_jobs(&[1, 1]);
+        jobs[0].solvers.push(one);
+        jobs[1].solvers.push(two);
+        execute_async_jobs_stream(jobs, |requests, completed| {
+            assert_eq!(requests[0].0.incremental_context_revision(), 0);
+            assert_eq!(requests[1].0.incremental_context_revision(), 1);
+            // Materialize owned inputs before allowing either client to run.
+            let prepared: Vec<_> = requests.iter().map(|(solver, _)| solver.incremental_context_revision()).collect();
+            drop(requests);
+            completed(1, &IncrementalResult::Unknown(UnknownReason::DecisionBudget));
+            assert_eq!(clients[1].try_recv().unwrap().len(), 1);
+            assert!(matches!(clients[0].try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(prepared, [0, 1]);
+            completed(0, &IncrementalResult::Unknown(UnknownReason::ConflictBudget));
+            assert_eq!(clients[0].try_recv().unwrap().len(), 1);
+        });
+    }
 
     #[test]
     fn joined_jobs_preserve_solver_identity_and_restore_reply_boundaries() {
@@ -309,7 +466,13 @@ impl AsyncBlockExecutor {
                     // workers when explicitly selected, while logical async
                     // depth and the proof-wide submission limit stay unchanged.
                     let jobs = collect_ready_jobs(job, &receiver, broker_jobs.unwrap_or(1));
-                    execute_async_jobs(jobs, crate::accel::cdcl_host::solve_active_batch);
+                    if std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC_EARLY_REPLY").as_deref() == Ok("1") {
+                        execute_async_jobs_stream(jobs, |requests, completed| {
+                            crate::accel::cdcl_host::solve_active_batch_stream(requests, completed);
+                        });
+                    } else {
+                        execute_async_jobs(jobs, crate::accel::cdcl_host::solve_active_batch);
+                    }
                 }
             });
             workers.push(sender);
