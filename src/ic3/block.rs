@@ -74,6 +74,10 @@ impl PendingBlockBatch {
     }
 
     fn finish(&mut self) -> Vec<CachedBlockInquiry> {
+        self.finish_with_policy(BlockBatchCache::async_discard_results())
+    }
+
+    fn finish_with_policy(&mut self, discard: bool) -> Vec<CachedBlockInquiry> {
         let wait_start = Instant::now();
         let n_hardware = self.hardware_indices.len();
         let ready = self.ready.take();
@@ -92,6 +96,16 @@ impl PendingBlockBatch {
         );
         for (index, result) in self.hardware_indices.iter().copied().zip(results) {
             self.inquiries[index].result = result;
+        }
+        if discard {
+            // Attribution control: the real backend has completed and all its
+            // timing/work counters have been recorded. Suppress only feedback
+            // into IC3; CPU preflight answers remain ordinary CPU work.
+            let before = self.inquiries.len();
+            self.inquiries.retain(|entry| !entry.hardware_selected);
+            crate::accel::cdcl_host::note_active_block_async_discarded(
+                before - self.inquiries.len(),
+            );
         }
         std::mem::take(&mut self.inquiries)
     }
@@ -1344,10 +1358,24 @@ mod block_accel_policy_tests {
 
     #[test]
     fn revision_trust_requires_the_exact_captured_formula() {
-        assert!(BlockBatchCache::trusted_sat_snapshot_fresh(0, 7, 8, false));
-        assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 7, false));
-        assert!(BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 7, true));
-        assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 8, true));
+        assert!(BlockBatchCache::trusted_sat_snapshot_fresh(0, 7, 8, false, false));
+        assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 7, false, false));
+        assert!(BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 7, true, false));
+        assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(2, 7, 8, true, false));
+    }
+
+    #[test]
+    fn asynchronous_sat_age_starts_at_harvest_and_cannot_prove_freshness() {
+        // CPU may strengthen the frame while the job is running. A freshly
+        // harvested (age zero) SAT answer must still compare formula versions.
+        for age in [0, 1, 4] {
+            assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(age, 7, 8, true, true));
+            assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(age, 7, 7, false, true));
+            assert!(BlockBatchCache::trusted_sat_snapshot_fresh(age, 7, 7, true, true));
+        }
+        assert!(!BlockBatchCache::trusted_sat_snapshot_fresh(
+            0, u64::MAX, u64::MAX, true, true,
+        ));
     }
 
     #[test]
@@ -1443,6 +1471,40 @@ mod block_accel_policy_tests {
         assert!(pending.receiver.is_none());
         assert!(pending.ready.is_none());
     }
+
+    #[test]
+    fn asynchronous_ablation_drains_device_results_and_preserves_cpu_answers() {
+        let lit = Lit::new(Var::from(1), true);
+        for discard in [false, true] {
+            let result = IncrementalResult::Unsat {
+                core: LitVec::from([lit]),
+                used_constraints: false,
+            };
+            let mut cpu = cached_inquiry(2, lit, result.clone());
+            cpu.hardware_selected = false;
+            cpu.trusted_cpu = true;
+            let hardware = cached_inquiry(
+                2, lit, IncrementalResult::Unknown(UnknownReason::None),
+            );
+            let (sender, receiver) = mpsc::channel();
+            sender.send(vec![result]).unwrap();
+            let mut pending = PendingBlockBatch {
+                inquiries: vec![cpu, hardware],
+                hardware_indices: vec![1],
+                receiver: Some(receiver),
+                ready: None,
+                launched_at: Instant::now(),
+            };
+            let entries = pending.finish_with_policy(discard);
+            assert_eq!(entries.len(), if discard { 1 } else { 2 });
+            assert!(entries[0].trusted_cpu);
+            assert!(entries.iter().all(|entry| matches!(
+                entry.result, IncrementalResult::Unsat { .. }
+            )));
+            assert!(pending.receiver.is_none());
+            assert!(pending.inquiries.is_empty());
+        }
+    }
 }
 
 impl BlockBatchCache {
@@ -1503,7 +1565,17 @@ impl BlockBatchCache {
         captured_revision: u64,
         current_revision: u64,
         revision_trust: bool,
+        asynchronous: bool,
     ) -> bool {
+        if asynchronous {
+            // The cache is local to this block() and solvers are not replaced
+            // while it lives. add_clause increments the frame revision; an
+            // equal, non-saturated version therefore identifies the captured
+            // formula. Cache age alone starts too late (at harvest).
+            return revision_trust
+                && captured_revision != u64::MAX
+                && captured_revision == current_revision;
+        }
         cache_age == 0 || revision_trust && captured_revision == current_revision
     }
 
@@ -1526,6 +1598,15 @@ impl BlockBatchCache {
                 .ok()
                 .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
                 .unwrap_or(false)
+        })
+    }
+
+    fn async_discard_results() -> bool {
+        static DISCARD: OnceLock<bool> = OnceLock::new();
+        *DISCARD.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC_DISCARD_RESULTS")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
         })
     }
 
@@ -3138,11 +3219,10 @@ impl IC3 {
                     }
                     (false, IncrementalResult::Sat { model }) => {
                         let validation_start = Instant::now();
-                        // The production rule accepts only the same block
-                        // epoch. The research rule replaces that conservative
-                        // proxy with the exact captured per-frame formula
-                        // revision; any CPU strengthening changes the revision
-                        // and still forces the ordinary fallback.
+                        // Synchronous results can use the block epoch. For a
+                        // background job, age starts at harvest and says nothing
+                        // about CPU strengthening during execution; explicit
+                        // revision trust must match the captured frame formula.
                         let current_revision = self.solvers[po.frame - 1]
                             .dcs
                             .incremental_context_revision();
@@ -3151,10 +3231,10 @@ impl IC3 {
                             entry.context_revision,
                             current_revision,
                             BlockBatchCache::revision_trust_enabled(),
+                            BlockBatchCache::async_enabled(),
                         );
                         let direct_trust = crate::accel::cdcl_host::active_skip_cpu_check()
-                            && snapshot_fresh
-                            && !BlockBatchCache::async_enabled();
+                            && snapshot_fresh;
                         let stale_trusted =
                             crate::accel::cdcl_host::active_skip_cpu_check() && !direct_trust;
                         if direct_trust && entry.cache_age > 0 {

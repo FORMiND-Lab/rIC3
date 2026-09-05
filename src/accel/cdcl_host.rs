@@ -2688,6 +2688,7 @@ static ACTIVE_BLOCK_WAVE_RESERVED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_WAVE_TAKEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_LAUNCHED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_HARVESTED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_DISCARDED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_JOIN_NS: AtomicU64 = AtomicU64::new(0);
@@ -7663,6 +7664,10 @@ pub fn note_active_block_async_launch(prepare_ns: u64) {
     ACTIVE_BLOCK_ASYNC_PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
 }
 
+pub fn note_active_block_async_discarded(queries: usize) {
+    ACTIVE_BLOCK_ASYNC_DISCARDED.fetch_add(queries as u64, Ordering::Relaxed);
+}
+
 pub fn note_active_block_async_harvest(wall_ns: u64, join_ns: u64) {
     ACTIVE_BLOCK_ASYNC_HARVESTED.fetch_add(1, Ordering::Relaxed);
     ACTIVE_BLOCK_ASYNC_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
@@ -8008,6 +8013,10 @@ pub fn flush_and_report() {
             ACTIVE_TRUSTED_SAT_STALE_REVALIDATED.load(Ordering::Relaxed),
         );
         let _ = std::io::stderr().lock().write_all(qualification.as_bytes());
+        eprintln!(
+            "inductor-cdcl: async ablation discarded_queries={}",
+            ACTIVE_BLOCK_ASYNC_DISCARDED.load(Ordering::Relaxed),
+        );
         let kernel_ns = direct_kernel_ns();
         if kernel_ns != 0 {
             let load_kernel_ns = ACTIVE_CONTEXT_LOAD_KERNEL_NS.load(Ordering::Relaxed);
