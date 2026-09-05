@@ -43,6 +43,8 @@ pub const BLOCK_PREDECESSOR_LIFT: u32 = 1 << 10;
 pub const BLOCK_PUSH_LEMMA: u32 = 1 << 11;
 pub const BLOCK_REQUEUE: u32 = 1 << 12;
 pub const BLOCK_COVERED: u32 = 1 << 13;
+pub const BLOCK_DEFER_FUTURE: u32 = 1 << 14;
+pub const BLOCK_DEFERRED_DESCRIPTOR: u32 = u32::MAX - 1;
 pub const MIC_PROTECTED_INDEX_SHIFT: u32 = 16;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"

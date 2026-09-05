@@ -1483,6 +1483,9 @@ impl HardwareCdcl {
         if predecessor_lift {
             request[5] |= crate::accel::cdcl::BLOCK_PREDECESSOR_LIFT;
         }
+        if block_future_queue_enabled() {
+            request[5] |= crate::accel::cdcl::BLOCK_DEFER_FUTURE;
+        }
         if max_frame < u32::MAX
             && std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_EXACT_MAX_FRAME").is_none()
             && std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_PUSH_LEMMA")
@@ -4462,6 +4465,17 @@ pub fn block_full_root_enabled() -> bool {
     })
 }
 
+/// Keep only executable frames resident; future-frame proof objects remain
+/// on the host until the next frame boundary. Requires the requeue protocol.
+pub fn block_future_queue_enabled() -> bool {
+    block_full_root_enabled()
+        && ["INDUCTOR_CDCL_BLOCK_FULL_ROOT_FUTURE_QUEUE",
+            "INDUCTOR_CDCL_BLOCK_FULL_ROOT_REQUEUE"].iter().all(|name| {
+                std::env::var(name).ok()
+                    .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            })
+}
+
 fn full_root_wire_limit(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -4902,7 +4916,7 @@ fn finish_block_controller_sim(result: Result<(), String>) {
     }
 }
 
-fn reconcile_block_controller_sim(obligation_image: &[u32], lemma_image: &[u32]) {
+fn reconcile_block_controller_sim(obligation_image: &[u32], lemma_image: &[u32], max_frame: Option<u32>) {
     if !block_controller_sim_enabled() {
         return;
     }
@@ -4914,7 +4928,7 @@ fn reconcile_block_controller_sim(obligation_image: &[u32], lemma_image: &[u32])
                 .hardware
                 .as_mut()
                 .ok_or_else(|| "active hardware transport unavailable".to_string())?;
-            super::block_controller_sim::reconcile(hardware, obligation_image, lemma_image)
+            super::block_controller_sim::reconcile(hardware, obligation_image, lemma_image, max_frame)
         });
     finish_block_controller_sim(result);
 }
@@ -5392,7 +5406,7 @@ pub fn begin_exact_block_progress(
     if phase != inductor_trace::Phase::Block || op_id == 0 {
         return None;
     }
-    reconcile_block_controller_sim(&obligation_image, &lemma_image);
+    reconcile_block_controller_sim(&obligation_image, &lemma_image, Some(frame.min(u32::MAX as usize) as u32));
     Some(ExactBlockProgressCapture {
         op_id,
         frame: frame.min(u32::MAX as usize) as u32,
@@ -5422,7 +5436,7 @@ pub fn begin_exact_frame_events(
 ) -> Option<ExactFrameEventCapture> {
     (std::env::var_os("INDUCTOR_CDCL_EXACT_REPLAY").is_some() || block_controller_sim_requested())
         .then(|| {
-            reconcile_block_controller_sim(&obligation_image, &lemma_image);
+            reconcile_block_controller_sim(&obligation_image, &lemma_image, None);
             let wave_id = (EXACT_REPLAY_FRAME_EVENTS.fetch_add(1, Ordering::Relaxed) + 1)
                 .min(u64::from(u32::MAX)) as u32;
             ExactFrameEventCapture {

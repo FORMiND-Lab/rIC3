@@ -2371,7 +2371,13 @@ impl IC3 {
                     if *frame != u32::MAX {
                         let mut source = source;
                         source.push_to(*frame as usize + 1);
-                        if self.add_obligation_if_new(source) != (*requeued_descriptor != u32::MAX) {
+                        let inserted = self.add_obligation_if_new(source);
+                        let deferred = *requeued_descriptor == crate::accel::cdcl::BLOCK_DEFERRED_DESCRIPTOR;
+                        if deferred && (!crate::accel::cdcl_host::block_future_queue_enabled()
+                            || *frame as usize + 1 <= self.level()) {
+                            return Err("resident covered future requeue outside lease".to_string());
+                        }
+                        if !deferred && inserted != (*requeued_descriptor != u32::MAX) {
                             return Err("resident covered obligation CPU dedup mismatch".to_string());
                         }
                     } else if *requeued_descriptor != u32::MAX {
@@ -2504,7 +2510,13 @@ impl IC3 {
                     let mut source = source;
                     if let Some(requeued) = requeued_descriptor {
                         source.push_to(*frame as usize + 1);
-                        if self.add_obligation_if_new(source.clone()) != (*requeued != u32::MAX) {
+                        let inserted = self.add_obligation_if_new(source.clone());
+                        let deferred = *requeued == crate::accel::cdcl::BLOCK_DEFERRED_DESCRIPTOR;
+                        if deferred && (!crate::accel::cdcl_host::block_future_queue_enabled()
+                            || *frame as usize + 1 <= self.level()) {
+                            return Err("resident lemma future requeue outside lease".to_string());
+                        }
+                        if !deferred && inserted != (*requeued != u32::MAX) {
                             return Err("resident promoted obligation CPU dedup mismatch".to_string());
                         }
                     }

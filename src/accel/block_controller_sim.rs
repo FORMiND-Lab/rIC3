@@ -66,6 +66,9 @@ static ROOT_OK: AtomicU64 = AtomicU64::new(0);
 static ROOT_CPU_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 static ROOT_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
 static ROOT_COVERED: AtomicU64 = AtomicU64::new(0);
+static ROOT_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static MAX_FUTURE_OBLIGATIONS: AtomicU64 = AtomicU64::new(0);
+static MAX_ACTIVE_OBLIGATIONS: AtomicU64 = AtomicU64::new(0);
 // Current persistent/native BLOCK descriptor ABI has 1024 queue entries.
 // Live entries cannot be reclaimed by copying GC. Suspend only the queue
 // controller at an authoritative CPU-image boundary, not the CDCL transport.
@@ -167,6 +170,7 @@ struct ResidentBlockMirror {
     pending_owned_pop: Option<PendingOwnedPop>,
     owned_selection_keys: HashMap<u64, Vec<u32>>,
     compact_after_full_root_response: bool,
+    resident_max_frame: Option<u32>,
 }
 
 pub(super) struct OwnedBlockRootWave {
@@ -230,6 +234,30 @@ fn decode_obligations(image: &[u32]) -> Result<Vec<Obligation>, String> {
         return Err("trailing obligation image words".to_string());
     }
     Ok(obligations)
+}
+
+// Preserve full payloads, multiplicity and relative order. No priority-limited
+// page is selected: ALL obligations eligible at max_frame must be resident.
+fn project_active_obligations(image: &[u32], max_frame: u32) -> Result<Vec<u32>, String> {
+    let obligations = decode_obligations(image)?;
+    let mut result = vec![0];
+    for obligation in &obligations {
+        if obligation.frame <= max_frame {
+            result[0] += 1;
+            result.extend(obligation.key());
+        }
+    }
+    MAX_ACTIVE_OBLIGATIONS.fetch_max(u64::from(result[0]), Ordering::Relaxed);
+    MAX_FUTURE_OBLIGATIONS.fetch_max((obligations.len() - result[0] as usize) as u64, Ordering::Relaxed);
+    Ok(result)
+}
+
+fn operation_is_active(operation: &JournalOperation, max_frame: u32) -> bool {
+    match operation {
+        JournalOperation::RemoveObligation(obligation)
+        | JournalOperation::InsertObligation(obligation) => obligation.frame <= max_frame,
+        _ => true,
+    }
 }
 
 fn decode_lemmas(image: &[u32]) -> Result<(u32, Vec<Lemma>), String> {
@@ -416,6 +444,23 @@ fn multiset<T>(items: &[T], key: impl Fn(&T) -> Vec<u32>) -> HashMap<Vec<u32>, u
 }
 
 impl ResidentBlockMirror {
+    fn check_queue_frame(&self, max_frame: u32) -> Result<(), String> {
+        if self.resident_max_frame.is_some_and(|resident| resident != max_frame) {
+            return Err("resident queue frame lease mismatch".to_string());
+        }
+        Ok(())
+    }
+
+    fn deferred_requeue(&self, frame: u32, descriptor: u32) -> Result<bool, String> {
+        let future = self.resident_max_frame.is_some_and(|max_frame| frame > max_frame);
+        let deferred = descriptor == super::cdcl::BLOCK_DEFERRED_DESCRIPTOR;
+        if future != deferred {
+            return Err("resident future requeue marker/frame mismatch".to_string());
+        }
+        if deferred { ROOT_DEFERRED.fetch_add(1, Ordering::Relaxed); }
+        Ok(deferred)
+    }
+
     fn insert_lemma_descriptor(&mut self, key: Vec<u32>, handle: u32) {
         self.lemma_frame_order.entry(key[0]).or_default().push(handle);
         self.lemma_descriptors.entry(key).or_default().push(handle);
@@ -533,6 +578,7 @@ impl ResidentBlockMirror {
         hardware: &mut HardwareCdcl,
         max_frame: u32,
     ) -> Result<Option<u64>, String> {
+        self.check_queue_frame(max_frame)?;
         if !self.initialized {
             return Err("resident BLOCK mirror was not rebased".to_string());
         }
@@ -597,6 +643,7 @@ impl ResidentBlockMirror {
         next_var_by_current: &[u32],
         query_template: &IncrementalQuery,
     ) -> Result<OwnedBlockRootWave, String> {
+        self.check_queue_frame(max_frame)?;
         if !self.initialized {
             return Err("resident BLOCK mirror was not rebased".to_string());
         }
@@ -719,6 +766,7 @@ impl ResidentBlockMirror {
         compacted_retry: bool,
         predecessor_lift: bool,
     ) -> Result<OwnedBlockFullRootWave, String> {
+        self.check_queue_frame(max_frame)?;
         if !self.initialized {
             return Err("resident BLOCK mirror was not rebased".to_string());
         }
@@ -754,6 +802,10 @@ impl ResidentBlockMirror {
                     }
                     source_keys.push(source_key.clone());
                     if *frame != u32::MAX {
+                        if self.deferred_requeue(frame + 1, *requeued_descriptor)? {
+                            ROOT_COVERED.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         let count = source_key[3] as usize;
                         let target = frame + 1;
                         let duplicate = self.has_equivalent_obligation(
@@ -879,6 +931,7 @@ impl ResidentBlockMirror {
                         let count = source_key[3] as usize;
                         let target_frame = frame.checked_add(1)
                             .ok_or_else(|| "resident requeue frame overflow".to_string())?;
+                        if self.deferred_requeue(target_frame, *requeued)? { continue; }
                         let duplicate = self.has_equivalent_obligation(
                             target_frame, source_key[1], source_key[2],
                             &source_key[4..4 + count],
@@ -1179,6 +1232,9 @@ impl ResidentBlockMirror {
         obligation_image: &[u32],
         lemma_image: &[u32],
     ) -> Result<(), String> {
+        let projected = self.resident_max_frame
+            .map(|frame| project_active_obligations(obligation_image, frame)).transpose()?;
+        let obligation_image = projected.as_deref().unwrap_or(obligation_image);
         if self.capacity_boundary(hardware, obligation_image, lemma_image)? {
             return Ok(());
         }
@@ -1560,10 +1616,16 @@ impl ResidentBlockMirror {
         obligation_image: &[u32],
         lemma_image: &[u32],
     ) -> Result<(), String> {
-        let operations = semantic_ops
+        let mut operations = semantic_ops
             .iter()
             .map(|words| decode_operation(words))
             .collect::<Result<Vec<_>, _>>()?;
+        let projected = self.resident_max_frame
+            .map(|frame| project_active_obligations(obligation_image, frame)).transpose()?;
+        let obligation_image = projected.as_deref().unwrap_or(obligation_image);
+        if let Some(frame) = self.resident_max_frame {
+            operations.retain(|operation| operation_is_active(operation, frame));
+        }
         if self.capacity_boundary(hardware, obligation_image, lemma_image)? {
             return Ok(());
         }
@@ -1599,12 +1661,19 @@ pub(super) fn reconcile(
     hardware: &mut HardwareCdcl,
     obligation_image: &[u32],
     lemma_image: &[u32],
+    max_frame: Option<u32>,
 ) -> Result<(), String> {
-    MIRROR
+    let mut mirror = MIRROR
         .get_or_init(Default::default)
         .lock()
-        .map_err(|_| "resident BLOCK mirror lock poisoned".to_string())?
-        .reconcile(hardware, obligation_image, lemma_image)
+        .map_err(|_| "resident BLOCK mirror lock poisoned".to_string())?;
+    if super::cdcl_host::block_future_queue_enabled() {
+        if let Some(frame) = max_frame {
+            if frame == u32::MAX { return Err("future queue cannot lease infinity".to_string()); }
+            mirror.resident_max_frame = Some(frame);
+        }
+    }
+    mirror.reconcile(hardware, obligation_image, lemma_image)
 }
 
 pub(super) fn apply(
@@ -1692,6 +1761,9 @@ pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
 }
 
 pub(super) fn report() {
+    eprintln!("inductor-cdcl: future queue deferred {}, peak active {}, peak host future {} obligations",
+        ROOT_DEFERRED.load(Ordering::Relaxed), MAX_ACTIVE_OBLIGATIONS.load(Ordering::Relaxed),
+        MAX_FUTURE_OBLIGATIONS.load(Ordering::Relaxed));
     eprintln!("inductor-cdcl: resident covered-obligation operations {} (not CDCL inquiries)", ROOT_COVERED.load(Ordering::Relaxed));
     eprintln!(
         "inductor-cdcl: resident queue capacity pauses {}, resumes {}, CPU-only boundaries {}, paused {}",
@@ -1737,6 +1809,49 @@ pub(super) fn root_metrics() -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn future_projection_preserves_active_payloads_and_promotes_at_frame_boundary() {
+        // State plus one input-history segment; future copies have distinct
+        // input history and must not be silently merged by projection.
+        let image = [3, 2, 7, 0, 1, 4, 1, 1, 6,
+            4, 8, 0, 1, 2, 1, 1, 8, 4, 8, 0, 1, 2, 1, 1, 10];
+        let active = super::project_active_obligations(&image, 2).unwrap();
+        assert_eq!(active, [1, 2, 7, 0, 1, 4, 1, 1, 6]);
+        assert_eq!(super::project_active_obligations(&image, 4).unwrap(), image);
+        assert_eq!(super::project_active_obligations(&image, 1).unwrap(), [0]);
+        assert!(super::project_active_obligations(&image[..image.len()-1], 2).is_err());
+    }
+
+    #[test]
+    fn future_projection_does_not_truncate_an_oversized_active_frontier() {
+        let mut image = vec![2049];
+        image.extend([1, 1, 0, 1, 0, 0]);
+        for depth in 0..2048 { image.extend([2, depth, 0, 1, 2, 0]); }
+        let active = super::project_active_obligations(&image, 1).unwrap();
+        assert_eq!(active[0], 1);
+        assert!(!super::queue_capacity_wait(active[0] as usize, false));
+        let advanced = super::project_active_obligations(&image, 2).unwrap();
+        assert_eq!(advanced, image);
+        assert!(super::queue_capacity_wait(advanced[0] as usize, false));
+    }
+
+    #[test]
+    fn future_requeue_marker_requires_matching_frame_lease() {
+        let mut mirror = super::ResidentBlockMirror::default();
+        let deferred = super::super::cdcl::BLOCK_DEFERRED_DESCRIPTOR;
+        assert!(mirror.deferred_requeue(4, deferred).is_err());
+        mirror.resident_max_frame = Some(3);
+        assert!(mirror.deferred_requeue(4, deferred).unwrap());
+        assert!(mirror.deferred_requeue(3, deferred).is_err());
+        assert!(mirror.deferred_requeue(4, 7).is_err());
+        assert!(!mirror.deferred_requeue(3, u32::MAX).unwrap());
+        assert!(mirror.check_queue_frame(4).is_err());
+        assert!(mirror.check_queue_frame(3).is_ok());
+        let future = super::Obligation { frame: 4, depth: 1, removed: 0, payload: vec![0, 0] };
+        assert!(!super::operation_is_active(&super::JournalOperation::InsertObligation(future), 3));
+        assert!(super::operation_is_active(&super::JournalOperation::ClearObligations, 3));
+    }
+
     use super::{JournalOperation, decode_operation, semantic_capacity_error, queue_capacity_wait};
 
     #[test]
