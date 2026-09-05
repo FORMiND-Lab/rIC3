@@ -23,7 +23,7 @@ use super::{
 use crate::gipsat::IncrementalQuery;
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Mutex, OnceLock},
     time::Instant,
 };
@@ -40,6 +40,7 @@ const JOURNAL_POP_OBLIGATION: u32 = 7;
 // Rust-internal bookkeeping acknowledgement.  The full-root device has
 // already applied this normalization removal; do not send it back to C++.
 const JOURNAL_ACK_REMOVE_LEMMA: u32 = 8;
+const JOURNAL_ACK_INSERT_LEMMA: u32 = 9;
 
 static MIRROR: OnceLock<Mutex<ResidentBlockMirror>> = OnceLock::new();
 static BATCHES: AtomicU64 = AtomicU64::new(0);
@@ -64,6 +65,22 @@ static ROOT_WORK: AtomicU64 = AtomicU64::new(0);
 static ROOT_OK: AtomicU64 = AtomicU64::new(0);
 static ROOT_CPU_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 static ROOT_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
+// Current persistent/native BLOCK descriptor ABI has 1024 queue entries.
+// Live entries cannot be reclaimed by copying GC. Suspend only the queue
+// controller at an authoritative CPU-image boundary, not the CDCL transport.
+const QUEUE_DESCRIPTOR_CAPACITY: usize = 1024;
+static QUEUE_CAPACITY_PAUSED: AtomicBool = AtomicBool::new(false);
+static QUEUE_CAPACITY_PAUSES: AtomicU64 = AtomicU64::new(0);
+static QUEUE_CAPACITY_RESUMES: AtomicU64 = AtomicU64::new(0);
+static QUEUE_CAPACITY_CPU_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn capacity_paused() -> bool {
+    QUEUE_CAPACITY_PAUSED.load(Ordering::Relaxed)
+}
+
+fn queue_capacity_wait(count: usize, paused: bool) -> bool {
+    count > if paused { QUEUE_DESCRIPTOR_CAPACITY / 2 } else { QUEUE_DESCRIPTOR_CAPACITY }
+}
 
 #[derive(Clone, Debug)]
 struct Obligation {
@@ -101,6 +118,7 @@ enum JournalOperation {
     ClearObligations,
     RemoveLemma(Lemma),
     AcknowledgeRemoveLemma(Lemma),
+    AcknowledgeInsertLemma { lemma: Lemma, payload_handle: u32, descriptor_handle: u32 },
     InsertLemma(Lemma),
     SetLemmaFrames(u32),
     MoveLemma {
@@ -143,6 +161,7 @@ struct ResidentBlockMirror {
     lemma_payloads: HashMap<Vec<u32>, u32>,
     obligation_descriptors: HashMap<Vec<u32>, Vec<ResidentObligationDescriptor>>,
     lemma_descriptors: HashMap<Vec<u32>, Vec<u32>>,
+    lemma_frame_order: HashMap<u32, Vec<u32>>,
     next_user_tag: u64,
     pending_owned_pop: Option<PendingOwnedPop>,
     owned_selection_keys: HashMap<u64, Vec<u32>>,
@@ -243,6 +262,17 @@ fn decode_operation(words: &[u32]) -> Result<JournalOperation, String> {
     let mut at = 0usize;
     let command = take(words, &mut at)?;
     let operation = match command {
+        JOURNAL_ACK_INSERT_LEMMA => {
+            let frame = take(words, &mut at)?;
+            let payload_handle = take(words, &mut at)?;
+            let descriptor_handle = take(words, &mut at)?;
+            let count = take(words, &mut at)? as usize;
+            let mut payload = vec![count as u32];
+            payload.extend(take_payload(words, &mut at, count)?);
+            JournalOperation::AcknowledgeInsertLemma {
+                lemma: Lemma { frame, payload }, payload_handle, descriptor_handle,
+            }
+        }
         JOURNAL_CLEAR_OBLIGATIONS => JournalOperation::ClearObligations,
         JOURNAL_REMOVE_OBLIGATION | JOURNAL_INSERT_OBLIGATION => {
             let frame = take(words, &mut at)?;
@@ -385,6 +415,55 @@ fn multiset<T>(items: &[T], key: impl Fn(&T) -> Vec<u32>) -> HashMap<Vec<u32>, u
 }
 
 impl ResidentBlockMirror {
+    fn insert_lemma_descriptor(&mut self, key: Vec<u32>, handle: u32) {
+        self.lemma_frame_order.entry(key[0]).or_default().push(handle);
+        self.lemma_descriptors.entry(key).or_default().push(handle);
+    }
+
+    fn retire_lemma_descriptor(&mut self, key: &[u32], stable: bool) -> Result<u32, String> {
+        let handles = self.lemma_descriptors.get_mut(key)
+            .ok_or_else(|| "remove of unknown resident lemma".to_string())?;
+        let order = self.lemma_frame_order.get_mut(&key[0])
+            .ok_or_else(|| "missing resident lemma frame order".to_string())?;
+        let position = order.iter().position(|handle| handles.contains(handle))
+            .ok_or_else(|| "missing resident lemma in frame order".to_string())?;
+        let handle = if stable { order.remove(position) } else { order.swap_remove(position) };
+        handles.retain(|candidate| *candidate != handle);
+        if handles.is_empty() { self.lemma_descriptors.remove(key); }
+        Ok(handle)
+    }
+
+    // Call only after the complete device journal/handoff has been replayed.
+    // No SAT answer is checked again: CPU retains the proof and oversized
+    // queue, and subsequent CPU steps are new work. Resume from the exact live
+    // image, never from the stale device heap or partially applied journal.
+    fn capacity_boundary(
+        &mut self,
+        hardware: &mut HardwareCdcl,
+        obligation_image: &[u32],
+        lemma_image: &[u32],
+    ) -> Result<bool, String> {
+        let count = decode_obligations(obligation_image)?.len();
+        let paused = capacity_paused();
+        if queue_capacity_wait(count, paused) {
+            if !paused {
+                QUEUE_CAPACITY_PAUSED.store(true, Ordering::Relaxed);
+                QUEUE_CAPACITY_PAUSES.fetch_add(1, Ordering::Relaxed);
+                eprintln!("inductor-cdcl: resident queue capacity pause: {count} live obligations exceed {QUEUE_DESCRIPTOR_CAPACITY}; CPU owns queue until at most {} remain", QUEUE_DESCRIPTOR_CAPACITY / 2);
+            }
+            QUEUE_CAPACITY_CPU_BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        }
+        if paused {
+            self.rebase(hardware, obligation_image, lemma_image)?;
+            QUEUE_CAPACITY_PAUSED.store(false, Ordering::Relaxed);
+            QUEUE_CAPACITY_RESUMES.fetch_add(1, Ordering::Relaxed);
+            eprintln!("inductor-cdcl: resident queue capacity resume: rebuilt {count} live obligations");
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn has_equivalent_obligation(
         &self,
         frame: u32,
@@ -758,9 +837,8 @@ impl ResidentBlockMirror {
                     frame,
                     begin_frame,
                     proof_tag,
-                    payload_handle,
-                    descriptor_handle,
-                    cube,
+                    requeued_descriptor,
+                    ..
                 } => {
                     if *begin_frame == 0 || *begin_frame > frame.saturating_add(1) {
                         return Err(format!(
@@ -768,17 +846,29 @@ impl ResidentBlockMirror {
                         ));
                     }
                     let (source_key, _) = self.remove_obligation_descriptor_for_tag(*proof_tag)?;
-                    source_keys.push(source_key);
-                    let mut payload = Vec::with_capacity(cube.len() + 1);
-                    payload.push(cube.len().min(u32::MAX as usize) as u32);
-                    payload.extend_from_slice(cube);
-                    let mut key = vec![*frame];
-                    key.extend_from_slice(&payload);
-                    self.lemma_payloads.insert(payload, *payload_handle);
-                    self.lemma_descriptors
-                        .entry(key)
-                        .or_default()
-                        .push(*descriptor_handle);
+                    source_keys.push(source_key.clone());
+                    if let Some(requeued) = requeued_descriptor {
+                        let count = source_key[3] as usize;
+                        let target_frame = frame.checked_add(1)
+                            .ok_or_else(|| "resident requeue frame overflow".to_string())?;
+                        let duplicate = self.has_equivalent_obligation(
+                            target_frame, source_key[1], source_key[2],
+                            &source_key[4..4 + count],
+                        ).is_some();
+                        if (*requeued == u32::MAX) != duplicate {
+                            return Err("resident promoted obligation dedup mismatch".to_string());
+                        }
+                        if !duplicate {
+                            let mut promoted_key = source_key;
+                            promoted_key[0] = target_frame;
+                            self.obligation_descriptors.entry(promoted_key).or_default().push(
+                                ResidentObligationDescriptor { handle: *requeued, user_tag: *proof_tag }
+                            );
+                        }
+                    }
+                    // Lemma handles are replayed with the CPU normalization
+                    // acknowledgements, in event order. Registering the whole
+                    // response here first aliases recycled descriptor slots.
                 }
             }
         }
@@ -883,6 +973,14 @@ impl ResidentBlockMirror {
         lemma_image: &[u32],
         response: Option<&BlockSemanticCommandResponse>,
     ) -> Result<(), String> {
+        let mut live_handles = HashMap::new();
+        for (key, handles) in &self.lemma_descriptors {
+            for handle in handles {
+                if let Some(previous) = live_handles.insert(*handle, key) {
+                    return Err(format!("resident lemma descriptor {handle} aliases {previous:?} and {key:?}"));
+                }
+            }
+        }
         let obligations = decode_obligations(obligation_image)?;
         let (frame_count, lemmas) = decode_lemmas(lemma_image)?;
         let expected_obligations = multiset(&obligations, Obligation::key);
@@ -963,6 +1061,7 @@ impl ResidentBlockMirror {
         self.lemma_payloads.clear();
         self.obligation_descriptors.clear();
         self.lemma_descriptors.clear();
+        self.lemma_frame_order.clear();
         self.pending_owned_pop = None;
         self.owned_selection_keys.clear();
         self.compact_after_full_root_response = false;
@@ -1036,10 +1135,7 @@ impl ResidentBlockMirror {
             .into_iter()
             .zip(response[obligation_insertion_end..response.len() - 1].iter())
         {
-            self.lemma_descriptors
-                .entry(key)
-                .or_default()
-                .push(record.output_handle);
+            self.insert_lemma_descriptor(key, record.output_handle);
         }
         self.validate(obligation_image, lemma_image, response.last())?;
         self.initialized = true;
@@ -1055,6 +1151,9 @@ impl ResidentBlockMirror {
         obligation_image: &[u32],
         lemma_image: &[u32],
     ) -> Result<(), String> {
+        if self.capacity_boundary(hardware, obligation_image, lemma_image)? {
+            return Ok(());
+        }
         if self.initialized
             && self.obligation_image == obligation_image
             && self.lemma_image == lemma_image
@@ -1196,13 +1295,9 @@ impl ResidentBlockMirror {
                         },
                     )
                 }
-                PendingAction::InsertLemma(key) => self
-                    .lemma_descriptors
-                    .entry(key)
-                    .or_default()
-                    .push(record.output_handle),
+                PendingAction::InsertLemma(key) => self.insert_lemma_descriptor(key, record.output_handle),
                 PendingAction::MoveLemma { key, handle } => {
-                    self.lemma_descriptors.entry(key).or_default().push(handle)
+                    self.insert_lemma_descriptor(key, handle)
                 }
             }
         }
@@ -1343,25 +1438,9 @@ impl ResidentBlockMirror {
                 }
                 JournalOperation::RemoveLemma(lemma) => {
                     let key = lemma.key();
-                    if pending_lemmas.contains(&key) {
-                        last_response = self.flush_pending(
-                            hardware,
-                            &mut commands,
-                            &mut actions,
-                            &mut pending_obligations,
-                            &mut pending_lemmas,
-                        )?;
-                    }
-                    let handles = self
-                        .lemma_descriptors
-                        .get_mut(&key)
-                        .ok_or_else(|| "remove of unknown lemma".to_string())?;
-                    let handle = handles
-                        .pop()
-                        .ok_or_else(|| "empty lemma descriptor stack".to_string())?;
-                    if handles.is_empty() {
-                        self.lemma_descriptors.remove(&key);
-                    }
+                    last_response = self.flush_pending(hardware, &mut commands, &mut actions,
+                        &mut pending_obligations, &mut pending_lemmas)?.or(last_response);
+                    let handle = self.retire_lemma_descriptor(&key, false)?;
                     let mut remove = command(BLOCK_SEMANTIC_EVENT_REMOVE_LEMMA);
                     remove.handle = handle;
                     commands.push(remove);
@@ -1369,23 +1448,16 @@ impl ResidentBlockMirror {
                 }
                 JournalOperation::AcknowledgeRemoveLemma(lemma) => {
                     let key = lemma.key();
-                    let handles = self
-                        .lemma_descriptors
-                        .get_mut(&key)
-                        .ok_or_else(|| "preapplied remove of unknown resident lemma".to_string())?;
-                    if handles.is_empty() {
-                        return Err(
-                            "preapplied remove found an empty resident lemma stack".to_string()
-                        );
-                    }
-                    // Descriptors are appended in device commit order.  A
-                    // same-key normalization removes the pre-existing (oldest)
-                    // descriptor before appending the replacement, so retire
-                    // the FIFO head rather than the newest handle.
-                    handles.remove(0);
-                    if handles.is_empty() {
-                        self.lemma_descriptors.remove(&key);
-                    }
+                    last_response = self.flush_pending(hardware, &mut commands, &mut actions,
+                        &mut pending_obligations, &mut pending_lemmas)?.or(last_response);
+                    self.retire_lemma_descriptor(&key, false)
+                        .map_err(|error| format!("preapplied remove: {error}"))?;
+                }
+                JournalOperation::AcknowledgeInsertLemma { lemma, payload_handle, descriptor_handle } => {
+                    last_response = self.flush_pending(hardware, &mut commands, &mut actions,
+                        &mut pending_obligations, &mut pending_lemmas)?.or(last_response);
+                    self.lemma_payloads.insert(lemma.payload.clone(), payload_handle);
+                    self.insert_lemma_descriptor(lemma.key(), descriptor_handle);
                 }
                 JournalOperation::InsertLemma(lemma) => {
                     let key = lemma.key();
@@ -1410,25 +1482,9 @@ impl ResidentBlockMirror {
                     destination,
                 } => {
                     let source_key = source.key();
-                    if pending_lemmas.contains(&source_key) {
-                        last_response = self.flush_pending(
-                            hardware,
-                            &mut commands,
-                            &mut actions,
-                            &mut pending_obligations,
-                            &mut pending_lemmas,
-                        )?;
-                    }
-                    let handles = self
-                        .lemma_descriptors
-                        .get_mut(&source_key)
-                        .ok_or_else(|| "move of unknown lemma".to_string())?;
-                    let handle = handles
-                        .pop()
-                        .ok_or_else(|| "empty moved lemma descriptor stack".to_string())?;
-                    if handles.is_empty() {
-                        self.lemma_descriptors.remove(&source_key);
-                    }
+                    last_response = self.flush_pending(hardware, &mut commands, &mut actions,
+                        &mut pending_obligations, &mut pending_lemmas)?.or(last_response);
+                    let handle = self.retire_lemma_descriptor(&source_key, destination == u32::MAX)?;
                     let destination_key = Lemma {
                         frame: destination,
                         payload: source.payload,
@@ -1480,6 +1536,9 @@ impl ResidentBlockMirror {
             .iter()
             .map(|words| decode_operation(words))
             .collect::<Result<Vec<_>, _>>()?;
+        if self.capacity_boundary(hardware, obligation_image, lemma_image)? {
+            return Ok(());
+        }
         if self.compact_after_full_root_response {
             FULL_ROOT_RESPONSE_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
             return self.rebase(hardware, obligation_image, lemma_image);
@@ -1606,6 +1665,13 @@ pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
 
 pub(super) fn report() {
     eprintln!(
+        "inductor-cdcl: resident queue capacity pauses {}, resumes {}, CPU-only boundaries {}, paused {}",
+        QUEUE_CAPACITY_PAUSES.load(Ordering::Relaxed),
+        QUEUE_CAPACITY_RESUMES.load(Ordering::Relaxed),
+        QUEUE_CAPACITY_CPU_BOUNDARIES.load(Ordering::Relaxed),
+        capacity_paused(),
+    );
+    eprintln!(
         "inductor-cdcl: live BLOCK controller steps {}, rebases {} (capacity compactions {}, post-full-root-response {}), root-reconciles {}, batches {}, commands {}, max-batch {}, service {:.3} ms, peak obligations/lemmas {}/{}, arena obligation/lemma/state/input {}/{}/{}/{} words, queue-pops {}, owned-pops {}, root-waves {}, root-work {}, root-ok {}, root-cpu-handoffs {}, root-service {:.3} ms",
         STEPS.load(Ordering::Relaxed),
         REBASES.load(Ordering::Relaxed),
@@ -1642,7 +1708,59 @@ pub(super) fn root_metrics() -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{JournalOperation, decode_operation, semantic_capacity_error};
+    use super::{JournalOperation, decode_operation, semantic_capacity_error, queue_capacity_wait};
+
+    #[test]
+    fn live_queue_capacity_uses_a_hysteretic_cpu_boundary() {
+        assert!(!queue_capacity_wait(1024, false));
+        assert!(queue_capacity_wait(1025, false));
+        assert!(queue_capacity_wait(1024, true));
+        assert!(queue_capacity_wait(513, true));
+        assert!(!queue_capacity_wait(512, true));
+        assert!(!queue_capacity_wait(0, true));
+    }
+
+    #[test]
+    fn lemma_counts_do_not_hide_recycled_handle_aliases() {
+        let mut mirror = super::ResidentBlockMirror::default();
+        mirror.lemma_descriptors.insert(vec![1, 1, 2], vec![7]);
+        mirror.lemma_descriptors.insert(vec![2, 1, 4], vec![7]);
+        let image = [3, 0, 1, 1, 2, 1, 1, 4, 0];
+        assert!(mirror.validate(&[0], &image, None).unwrap_err().contains("aliases"));
+        mirror.lemma_descriptors.insert(vec![2, 1, 4], vec![8]);
+        assert!(mirror.validate(&[0], &image, None).is_ok());
+    }
+
+    #[test]
+    fn duplicate_lemma_retirement_follows_frame_swap_order_not_fifo() {
+        let mut mirror = super::ResidentBlockMirror::default();
+        let a = vec![1, 1, 2];
+        let duplicate = vec![1, 1, 4];
+        let b = vec![1, 1, 6];
+        mirror.insert_lemma_descriptor(a.clone(), 0);
+        mirror.insert_lemma_descriptor(duplicate.clone(), 1);
+        mirror.insert_lemma_descriptor(duplicate.clone(), 2);
+        mirror.insert_lemma_descriptor(b.clone(), 3);
+        assert_eq!(mirror.retire_lemma_descriptor(&a, false).unwrap(), 0);
+        assert_eq!(mirror.retire_lemma_descriptor(&b, false).unwrap(), 3);
+        assert_eq!(mirror.retire_lemma_descriptor(&duplicate, false).unwrap(), 2);
+        // Slot 2 is now reusable; the surviving duplicate still owns slot 1.
+        mirror.insert_lemma_descriptor(vec![2, 1, 8], 2);
+        assert_eq!(mirror.lemma_descriptors[&duplicate], vec![1]);
+        assert_eq!(mirror.lemma_frame_order[&1], vec![1]);
+        assert_eq!(mirror.lemma_frame_order[&2], vec![2]);
+    }
+
+    #[test]
+    fn decodes_ordered_resident_lemma_insert_acknowledgement() {
+        let words = [9, 135, 200, 269, 3, 30, 66, 72];
+        let JournalOperation::AcknowledgeInsertLemma { lemma, payload_handle, descriptor_handle }
+            = decode_operation(&words).unwrap() else { panic!("wrong journal operation") };
+        assert_eq!(lemma.frame, 135);
+        assert_eq!(lemma.payload, vec![3, 30, 66, 72]);
+        assert_eq!((payload_handle, descriptor_handle), (200, 269));
+        assert!(decode_operation(&words[..7]).is_err());
+    }
 
     #[test]
     fn only_semantic_arena_capacity_triggers_epoch_compaction() {

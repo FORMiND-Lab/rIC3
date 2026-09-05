@@ -1466,6 +1466,13 @@ impl HardwareCdcl {
             );
         }
         let mut request = request.ok_or(HardwareError::InvalidContext)?;
+        if max_frame < u32::MAX
+            && std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_REQUEUE")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        {
+            request[5] |= crate::accel::cdcl::BLOCK_REQUEUE;
+        }
         if predecessor_lift {
             request[5] |= crate::accel::cdcl::BLOCK_PREDECESSOR_LIFT;
         }
@@ -1533,6 +1540,13 @@ impl HardwareCdcl {
             record_full_root_transaction(&request, &response, rc);
             let decoded =
                 decode_block_full_root_response(&response).ok_or(HardwareError::InvalidResponse)?;
+            if request[5] & crate::accel::cdcl::BLOCK_REQUEUE != 0
+                && decoded.events.iter().any(|event| matches!(event,
+                    BlockFullRootEvent::UnsatLemma { requeued_descriptor: None, .. }))
+            {
+                self.full_root_projection = None;
+                return Err(HardwareError::InvalidResponse);
+            }
             if decoded.status == BlockFullRootStatus::StepBudget {
                 if reuse_handle.is_none() {
                     self.full_root_projection = Some(FullRootProjectionLease {
@@ -4542,6 +4556,7 @@ pub fn run_resident_block_root(
     if !block_root_executor_enabled()
         || !block_controller_owns_queue()
         || !block_controller_sim_enabled()
+        || super::block_controller_sim::capacity_paused()
     {
         return ResidentBlockRoot::Disabled;
     }
@@ -4655,6 +4670,7 @@ pub fn run_resident_block_full_root(
     if !block_full_root_enabled()
         || !block_controller_owns_queue()
         || !block_controller_sim_enabled()
+        || super::block_controller_sim::capacity_paused()
     {
         return ResidentBlockFullRoot::Disabled;
     }
@@ -4827,7 +4843,9 @@ pub fn run_resident_block_full_root(
 /// Only the opaque tag crosses this scheduling boundary; proof payloads remain
 /// resident on each side.
 pub fn pop_resident_block_obligation(max_frame: usize) -> ResidentBlockPop {
-    if !block_controller_owns_queue() || !block_controller_sim_enabled() {
+    if !block_controller_owns_queue() || !block_controller_sim_enabled()
+        || super::block_controller_sim::capacity_paused()
+    {
         return ResidentBlockPop::Disabled;
     }
     let state = active_state().lock();

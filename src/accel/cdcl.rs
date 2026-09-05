@@ -41,6 +41,7 @@ pub const PACKED_SAT_MODEL: u32 = 1 << 9;
 /// Full-root control only; stripped before ordinary CDCL inquiries.
 pub const BLOCK_PREDECESSOR_LIFT: u32 = 1 << 10;
 pub const BLOCK_PUSH_LEMMA: u32 = 1 << 11;
+pub const BLOCK_REQUEUE: u32 = 1 << 12;
 pub const MIC_PROTECTED_INDEX_SHIFT: u32 = 16;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
@@ -142,6 +143,7 @@ pub const BLOCK_FULL_ROOT_REUSE_PROJECTION: u32 = 1 << 30;
 pub const BLOCK_FULL_ROOT_COMPACTED_RETRY: u32 = 1 << 31;
 pub const BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR: u32 = 1;
 pub const BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA: u32 = 2;
+pub const BLOCK_FULL_ROOT_EVENT_UNSAT_REQUEUE: u32 = 3;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +342,7 @@ pub enum BlockFullRootEvent {
         proof_tag: u64,
         payload_handle: u32,
         descriptor_handle: u32,
+        requeued_descriptor: Option<u32>,
         cube: Vec<u32>,
     },
 }
@@ -560,12 +563,15 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
         let end = at.checked_add(record_words)?;
         let record = words.get(at..end)?;
         let event = match kind {
-            BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA => {
+            BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA | BLOCK_FULL_ROOT_EVENT_UNSAT_REQUEUE => {
                 if record.len() < BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS {
                     return None;
                 }
                 let cube_words = usize::try_from(record[6]).ok()?;
-                if record.len() != BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS.checked_add(cube_words)? {
+                let requeue = kind == BLOCK_FULL_ROOT_EVENT_UNSAT_REQUEUE;
+                if requeue && record[0] == u32::MAX { return None; }
+                let header_words = BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS + usize::from(requeue);
+                if record.len() != header_words.checked_add(cube_words)? {
                     return None;
                 }
                 unsat_events = unsat_events.checked_add(1)?;
@@ -575,7 +581,8 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
                     proof_tag: u64::from(record[2]) | (u64::from(record[3]) << 32),
                     payload_handle: record[4],
                     descriptor_handle: record[5],
-                    cube: record[BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS..].to_vec(),
+                    requeued_descriptor: requeue.then(|| record[7]),
+                    cube: record[header_words..].to_vec(),
                 }
             }
             BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR => {
@@ -1382,6 +1389,23 @@ mod tests {
             BlockFullRootEvent::UnsatLemma { frame: 2, begin_frame: 2, cube, .. }
                 if cube == &[0, 2]
         ));
+
+        // Kind 3 extends only this lemma record; old kinds/offsets stay valid.
+        let mut requeue_response = response.to_vec();
+        let lemma_at = requeue_response.len() - 11;
+        requeue_response[lemma_at] = BLOCK_FULL_ROOT_EVENT_UNSAT_REQUEUE;
+        requeue_response[lemma_at + 1] += 1;
+        requeue_response[8] += 1;
+        requeue_response.insert(lemma_at + 2 + 7, 17);
+        assert!(matches!(
+            &decode_block_full_root_response(&requeue_response).unwrap().events[1],
+            BlockFullRootEvent::UnsatLemma { requeued_descriptor: Some(17), cube, .. }
+                if cube == &[0, 2]
+        ));
+        requeue_response[lemma_at + 2 + 7] = u32::MAX;
+        assert!(decode_block_full_root_response(&requeue_response).is_some());
+        requeue_response.pop();
+        assert!(decode_block_full_root_response(&requeue_response).is_none());
 
         let compact = decode_block_full_root_response(&[
             BLOCK_FULL_ROOT_PROTOCOL_VERSION,

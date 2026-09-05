@@ -762,6 +762,7 @@ const BLOCK_SEMANTIC_INSERT_LEMMA: u32 = 4;
 // mirror must retire its descriptor without issuing a duplicate device
 // command.  This never crosses the hardware protocol boundary.
 const BLOCK_SEMANTIC_ACK_REMOVE_LEMMA: u32 = 8;
+const BLOCK_SEMANTIC_ACK_INSERT_LEMMA: u32 = 9;
 // A queue-owned pop is distinct from an arbitrary descriptor removal. The
 // resident controller must independently choose the same heap head and return
 // its opaque tag before CPU proof processing continues.
@@ -2401,7 +2402,7 @@ impl IC3 {
                         ));
                     }
                 }
-                BlockFullRootEvent::UnsatLemma { frame, cube, .. } => {
+                BlockFullRootEvent::UnsatLemma { frame, cube, requeued_descriptor, payload_handle, descriptor_handle, .. } => {
                     if source.frame == 0
                         || (*frame as usize) < source.frame
                         || *frame as usize > self.level()
@@ -2469,6 +2470,13 @@ impl IC3 {
                     // matching insertion is consumed by the resident event;
                     // all other mutations (normally subsumed old lemmas) must
                     // still be sent to the semantic handle state.
+                    let mut source = source;
+                    if let Some(requeued) = requeued_descriptor {
+                        source.push_to(*frame as usize + 1);
+                        if self.add_obligation_if_new(source.clone()) != (*requeued != u32::MAX) {
+                            return Err("resident promoted obligation CPU dedup mismatch".to_string());
+                        }
+                    }
                     begin_block_lemma_journal(true);
                     proved |= self.add_lemma(*frame as usize, cube.clone(), false, Some(source));
                     let mutations = finish_block_lemma_journal();
@@ -2491,6 +2499,13 @@ impl IC3 {
                         );
                     }
                     note_preapplied_lemma_removals(&mut semantic_ops, normalization)?;
+                    if let Some(operations) = semantic_ops.as_mut() {
+                        // Apply after this event's removals, before the next
+                        // event can recycle one of its descriptor slots.
+                        let mut insert = vec![BLOCK_SEMANTIC_ACK_INSERT_LEMMA, *frame, *payload_handle, *descriptor_handle, cube.len() as u32];
+                        insert.extend(cube.iter().map(|literal| u32::from(*literal)));
+                        operations.push(insert);
+                    }
                 }
             }
         }
