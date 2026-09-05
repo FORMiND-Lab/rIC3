@@ -14,9 +14,9 @@ use std::{
     sync::{
         OnceLock,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -56,6 +56,33 @@ struct PendingBlockBatch {
 }
 
 impl PendingBlockBatch {
+    fn contains_hardware(&self, po: &ProofObligation) -> bool {
+        self.hardware_indices.iter().any(|index| {
+            let entry = &self.inquiries[*index];
+            entry.frame == po.frame && entry.state == po.state
+        })
+    }
+
+    fn wait_ready(&mut self, budget: Duration) -> bool {
+        if self.is_finished() {
+            return true;
+        }
+        if budget.is_zero() {
+            return false;
+        }
+        match self.receiver.as_ref().unwrap().recv_timeout(budget) {
+            Ok(results) => {
+                self.ready = Some(results);
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.receiver = None;
+                true
+            }
+        }
+    }
+
     fn is_finished(&mut self) -> bool {
         if self.ready.is_some() || self.receiver.is_none() {
             return true;
@@ -114,6 +141,9 @@ impl PendingBlockBatch {
 impl Drop for PendingBlockBatch {
     fn drop(&mut self) {
         if self.receiver.is_some() || self.ready.is_some() {
+            crate::accel::cdcl_host::note_active_block_async_root_tail(
+                self.hardware_indices.len(),
+            );
             let _ = self.finish();
         }
     }
@@ -186,6 +216,16 @@ struct BlockBatchCache {
     inquiries: Vec<CachedBlockInquiry>,
     pending: Vec<PendingBlockBatch>,
     epoch: u64,
+}
+
+impl Drop for BlockBatchCache {
+    fn drop(&mut self) {
+        if Self::async_enabled() {
+            crate::accel::cdcl_host::note_active_block_async_root_unused(
+                self.inquiries.iter().filter(|entry| entry.hardware_selected).count(),
+            );
+        }
+    }
 }
 
 const DEFAULT_BLOCK_ASYNC: bool = false;
@@ -1050,7 +1090,7 @@ mod block_accel_policy_tests {
         ic3::proofoblig::ProofObligation,
     };
     use logicrs::{Lit, LitOrdVec, LitVec, Var};
-    use std::{collections::VecDeque, sync::mpsc, time::Instant};
+    use std::{collections::VecDeque, sync::mpsc, time::{Duration, Instant}};
 
     #[test]
     fn full_root_admission_uses_one_distinct_sample_per_route() {
@@ -1505,9 +1545,102 @@ mod block_accel_policy_tests {
             assert!(pending.inquiries.is_empty());
         }
     }
+
+    #[test]
+    fn demand_timeout_keeps_the_receiver_for_a_later_completion() {
+        let (sender, receiver) = mpsc::channel();
+        let mut pending = PendingBlockBatch {
+            inquiries: Vec::new(), hardware_indices: Vec::new(),
+            receiver: Some(receiver), ready: None, launched_at: Instant::now(),
+        };
+        assert!(!pending.wait_ready(Duration::ZERO));
+        assert!(!pending.wait_ready(Duration::from_nanos(1)));
+        assert!(pending.receiver.is_some());
+        sender.send(Vec::new()).unwrap();
+        assert!(pending.wait_ready(Duration::ZERO));
+        assert!(pending.finish().is_empty());
+        assert!(pending.receiver.is_none());
+    }
+
+    #[test]
+    fn demand_only_waits_for_the_matching_frame_and_cube() {
+        let lit = Lit::new(Var::from(1), true);
+        let entry = cached_inquiry(2, lit, IncrementalResult::Unknown(UnknownReason::None));
+        let (sender, receiver) = mpsc::channel();
+        let mut cache = BlockBatchCache::default();
+        cache.pending.push(PendingBlockBatch {
+            inquiries: vec![entry], hardware_indices: vec![0],
+            receiver: Some(receiver), ready: None, launched_at: Instant::now(),
+        });
+        sender.send(vec![IncrementalResult::Unsat {
+            core: LitVec::from([lit]), used_constraints: false,
+        }]).unwrap();
+        for (frame, state) in [(1, lit), (2, !lit)] {
+            let other = ProofObligation::new(
+                frame, LitOrdVec::new(LitVec::from([state])), Vec::new(), 0, None,
+            );
+            cache.demand(&other, Duration::ZERO);
+            assert_eq!(cache.pending.len(), 1);
+            assert!(cache.inquiries.is_empty());
+        }
+        let po = ProofObligation::new(2, LitOrdVec::new(LitVec::from([lit])), Vec::new(), 0, None);
+        cache.demand(&po, Duration::ZERO);
+        assert!(cache.pending.is_empty());
+        assert!(matches!(cache.take(&po, false).unwrap().result, IncrementalResult::Unsat { .. }));
+        assert!(cache.take(&po, false).is_none());
+    }
+
+    #[test]
+    fn demand_disconnected_backend_becomes_unknown() {
+        let lit = Lit::new(Var::from(1), true);
+        let (sender, receiver) = mpsc::channel();
+        let mut pending = PendingBlockBatch {
+            inquiries: vec![cached_inquiry(2, lit, IncrementalResult::Unknown(UnknownReason::None))],
+            hardware_indices: vec![0], receiver: Some(receiver), ready: None,
+            launched_at: Instant::now(),
+        };
+        drop(sender);
+        assert!(pending.wait_ready(Duration::ZERO));
+        assert!(matches!(
+            pending.finish().pop().unwrap().result,
+            IncrementalResult::Unknown(UnknownReason::BackendError)
+        ));
+    }
+
+    #[test]
+    fn cpu_calibration_answer_must_match_the_demanded_obligation() {
+        let lit = Lit::new(Var::from(1), true);
+        let po = ProofObligation::new(2, LitOrdVec::new(LitVec::from([lit])), Vec::new(), 0, None);
+        let mut sibling = cached_inquiry(2, !lit, IncrementalResult::Unsat {
+            core: LitVec::from([!lit]), used_constraints: false,
+        });
+        sibling.trusted_cpu = true;
+        sibling.hardware_selected = false;
+        assert!(BlockBatchCache::cpu_answer_for(&[sibling.clone()], &po).is_none());
+        let mut same_cube_other_frame = sibling.clone();
+        same_cube_other_frame.state = po.state.clone();
+        same_cube_other_frame.frame = 3;
+        assert!(BlockBatchCache::cpu_answer_for(&[same_cube_other_frame], &po).is_none());
+        let mut matching = cached_inquiry(2, lit, IncrementalResult::Sat {
+            model: LitVec::from([lit]),
+        });
+        assert!(BlockBatchCache::cpu_answer_for(&[matching.clone()], &po).is_none());
+        matching.trusted_cpu = true;
+        matching.hardware_selected = false;
+        let answer = BlockBatchCache::cpu_answer_for(&[sibling, matching], &po).unwrap();
+        assert!(matches!(answer.result, IncrementalResult::Sat { .. }));
+    }
 }
 
 impl BlockBatchCache {
+    fn cpu_answer_for(
+        inquiries: &[CachedBlockInquiry], po: &ProofObligation,
+    ) -> Option<CachedBlockInquiry> {
+        inquiries.iter().find(|entry| {
+            entry.trusted_cpu && entry.frame == po.frame && entry.state == po.state
+        }).cloned()
+    }
+
     fn window_setting(value: Option<&str>) -> usize {
         value
             .and_then(|value| value.parse().ok())
@@ -1607,6 +1740,16 @@ impl BlockBatchCache {
             std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC_DISCARD_RESULTS")
                 .ok()
                 .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        })
+    }
+
+    fn async_demand_wait() -> Option<Duration> {
+        static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC_DEMAND_WAIT_US")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|us| Duration::from_micros(us.min(10_000)))
         })
     }
 
@@ -1821,6 +1964,19 @@ impl BlockBatchCache {
             let inquiries = pending.finish();
             self.insert(inquiries);
         }
+    }
+
+    fn demand(&mut self, po: &ProofObligation, budget: Duration) {
+        let Some(pending) = self.pending.iter_mut().find(|batch| batch.contains_hardware(po))
+        else {
+            return;
+        };
+        let start = Instant::now();
+        let ready = pending.wait_ready(budget);
+        crate::accel::cdcl_host::note_active_block_async_demand(
+            ready, start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+        self.harvest_ready();
     }
 
     fn start(&mut self, pending: PendingBlockBatch) {
@@ -2753,10 +2909,9 @@ impl IC3 {
 
             // The queue already contains multiple independent obligations.
             // Snapshot at most one hardware batch before mutating frames or
-            // adding successors. Results remain candidates: a SAT model must
-            // satisfy the exact live frame when this obligation is consumed,
-            // and an UNSAT core is re-proved by exact GipSAT. New lemmas can
-            // therefore invalidate speculation but cannot make it unsound.
+            // adding successors. Trusted UNSAT cores survive strengthening;
+            // trusted SAT models require a fresh snapshot. UNKNOWN or stale
+            // results take the ordinary CPU path.
             let needs_calibration = self.block_accel_policy.needs_calibration();
             let direct_cost_eligible =
                 needs_calibration || self.block_accel_policy.should_offload();
@@ -3015,9 +3170,10 @@ impl IC3 {
                     crate::accel::cdcl_host::note_active_block_async_launch(prepare_ns);
                     let launched_at = Instant::now();
                     let receiver = launch_async_block_batch(owned_solvers, owned_requests);
-                    if trusted_cpu.first() == Some(&true) {
-                        cached_block = inquiries.first().cloned();
-                    }
+                    // An earlier pending batch may already contain po, so
+                    // this batch can begin with a sibling. Match the query
+                    // identity before importing a CPU calibration answer.
+                    cached_block = BlockBatchCache::cpu_answer_for(&inquiries, &po);
                     block_batch.start(PendingBlockBatch {
                         inquiries,
                         hardware_indices,
@@ -3175,6 +3331,15 @@ impl IC3 {
                 }
             }
 
+            if cached_block.is_none() && BlockBatchCache::async_enabled() {
+                if let Some(budget) = BlockBatchCache::async_demand_wait() {
+                    // Query construction/cloning can outlast device work. Read
+                    // its completion again at the actual CPU solve boundary,
+                    // waiting only for the batch containing this obligation.
+                    block_batch.demand(&po, budget);
+                    cached_block = block_batch.take(&po, true);
+                }
+            }
             let mut speculative_pred = None;
             let mut speculative_trusted_cpu = false;
             let speculative = cached_block.and_then(|entry| {
@@ -3356,6 +3521,11 @@ impl IC3 {
                         blocked
                     }
                     None => {
+                        if BlockBatchCache::async_enabled()
+                            && block_batch.pending.iter().any(|batch| batch.contains_hardware(&po))
+                        {
+                            crate::accel::cdcl_host::note_active_block_async_cpu_race();
+                        }
                         let cpu_start = crate::inductor::ThreadCpuTimer::start();
                         let blocked = self
                             .blocked(po.frame, &po.state)

@@ -2689,6 +2689,12 @@ static ACTIVE_BLOCK_WAVE_TAKEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_LAUNCHED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_HARVESTED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_DISCARDED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_CPU_RACES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_ROOT_TAIL: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_ROOT_UNUSED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_DEMANDS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_DEMAND_READY: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_ASYNC_DEMAND_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_JOIN_NS: AtomicU64 = AtomicU64::new(0);
@@ -7668,6 +7674,24 @@ pub fn note_active_block_async_discarded(queries: usize) {
     ACTIVE_BLOCK_ASYNC_DISCARDED.fetch_add(queries as u64, Ordering::Relaxed);
 }
 
+pub fn note_active_block_async_cpu_race() {
+    ACTIVE_BLOCK_ASYNC_CPU_RACES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_active_block_async_root_tail(queries: usize) {
+    ACTIVE_BLOCK_ASYNC_ROOT_TAIL.fetch_add(queries as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_block_async_root_unused(queries: usize) {
+    ACTIVE_BLOCK_ASYNC_ROOT_UNUSED.fetch_add(queries as u64, Ordering::Relaxed);
+}
+
+pub fn note_active_block_async_demand(ready: bool, elapsed_ns: u64) {
+    ACTIVE_BLOCK_ASYNC_DEMANDS.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_BLOCK_ASYNC_DEMAND_READY.fetch_add(u64::from(ready), Ordering::Relaxed);
+    ACTIVE_BLOCK_ASYNC_DEMAND_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
 pub fn note_active_block_async_harvest(wall_ns: u64, join_ns: u64) {
     ACTIVE_BLOCK_ASYNC_HARVESTED.fetch_add(1, Ordering::Relaxed);
     ACTIVE_BLOCK_ASYNC_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
@@ -8016,6 +8040,15 @@ pub fn flush_and_report() {
         eprintln!(
             "inductor-cdcl: async ablation discarded_queries={}",
             ACTIVE_BLOCK_ASYNC_DISCARDED.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "inductor-cdcl: async lifecycle cpu_races={} root_tail_queries={} root_unused_answers={} demand_attempts={} demand_ready={} demand_wait_ms={:.3}",
+            ACTIVE_BLOCK_ASYNC_CPU_RACES.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ASYNC_ROOT_TAIL.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ASYNC_ROOT_UNUSED.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ASYNC_DEMANDS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ASYNC_DEMAND_READY.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_ASYNC_DEMAND_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         );
         let kernel_ns = direct_kernel_ns();
         if kernel_ns != 0 {
