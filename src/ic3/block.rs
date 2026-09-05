@@ -153,6 +153,47 @@ struct AsyncBlockJob {
     solvers: Vec<crate::gipsat::DagCnfSolver>,
     requests: Vec<(usize, IncrementalQuery)>,
     result: Sender<Vec<IncrementalResult>>,
+    queued_at: Instant,
+}
+
+fn collect_ready_jobs(
+    first: AsyncBlockJob, receiver: &Receiver<AsyncBlockJob>, limit: usize,
+) -> Vec<AsyncBlockJob> {
+    let mut jobs = vec![first];
+    while jobs.len() < limit {
+        match receiver.try_recv() {
+            Ok(job) => jobs.push(job),
+            Err(_) => break,
+        }
+    }
+    jobs
+}
+
+fn execute_async_jobs(
+    jobs: Vec<AsyncBlockJob>,
+    solve: impl FnOnce(Vec<(&crate::gipsat::DagCnfSolver, IncrementalQuery)>) -> Vec<IncrementalResult>,
+) {
+    let queued_ns = jobs.iter().fold(0u64, |sum, job| {
+        sum.saturating_add(job.queued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+    });
+    let requests: Vec<_> = jobs.iter().flat_map(|job| {
+        job.requests.iter().map(|(solver, query)| (&job.solvers[*solver], query.clone()))
+    }).collect();
+    let expected = requests.len();
+    crate::accel::cdcl_host::note_active_block_broker_dispatch(jobs.len(), expected, queued_ns);
+    // The existing backend partitions by exact formula and checks word limits.
+    // It restores original request order even when it groups physical batches.
+    let mut results = solve(requests);
+    if results.len() != expected {
+        // A truncated reply must never shift one client's answer into another.
+        crate::accel::cdcl_host::note_active_block_broker_reply_error();
+        results = vec![IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::BackendError); expected];
+    }
+    let mut results = results.into_iter();
+    for job in jobs {
+        let reply = results.by_ref().take(job.requests.len()).collect();
+        let _ = job.result.send(reply);
+    }
 }
 
 struct AsyncBlockExecutor {
@@ -160,21 +201,115 @@ struct AsyncBlockExecutor {
     next: AtomicUsize,
 }
 
+#[cfg(test)]
+mod async_broker_tests {
+    use super::*;
+    use crate::{accel::cdcl::UnknownReason, gipsat::DagCnfSolver};
+    use logicrs::DagCnf;
+
+    #[test]
+    fn joined_jobs_preserve_solver_identity_and_restore_reply_boundaries() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let mut first = DagCnfSolver::new(&dc);
+        first.add_clause(&[a]);
+        let mut second = DagCnfSolver::new(&dc);
+        second.add_clause(&[b]);
+        second.add_clause(&[a, b]);
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let jobs = vec![
+            AsyncBlockJob {
+                solvers: vec![first.clone(), second],
+                requests: vec![(1, IncrementalQuery::new(2, LitVec::new())),
+                               (0, IncrementalQuery::new(1, LitVec::new()))],
+                result: tx1, queued_at: Instant::now(),
+            },
+            AsyncBlockJob {
+                solvers: vec![first],
+                requests: vec![(0, IncrementalQuery::new(1, LitVec::new()))],
+                result: tx2, queued_at: Instant::now(),
+            },
+        ];
+        execute_async_jobs(jobs, |requests| {
+            assert_eq!(requests.len(), 3);
+            requests.iter().map(|(solver, query)| {
+                assert_eq!(solver.incremental_context_revision(), u64::from(query.frame));
+                IncrementalResult::Unknown(if query.frame == 2 {
+                    UnknownReason::DecisionBudget
+                } else {
+                    UnknownReason::ConflictBudget
+                })
+            }).collect()
+        });
+        let one = rx1.recv().unwrap();
+        let two = rx2.recv().unwrap();
+        assert_eq!(one.len(), 2);
+        assert_eq!(two.len(), 1);
+        assert!(matches!(one[0], IncrementalResult::Unknown(UnknownReason::DecisionBudget)));
+        assert!(matches!(one[1], IncrementalResult::Unknown(UnknownReason::ConflictBudget)));
+        assert!(matches!(two[0], IncrementalResult::Unknown(UnknownReason::ConflictBudget)));
+        assert!(rx1.try_recv().is_err());
+    }
+
+    #[test]
+    fn malformed_combined_reply_fails_every_job_closed() {
+        let dc = DagCnf::new();
+        let solver = DagCnfSolver::new(&dc);
+        for returned in [1, 3] {
+            let mut jobs = Vec::new();
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let (tx, rx) = mpsc::channel();
+                jobs.push(AsyncBlockJob {
+                    solvers: vec![solver.clone()],
+                    requests: vec![(0, IncrementalQuery::new(0, LitVec::new()))],
+                    result: tx, queued_at: Instant::now(),
+                });
+                clients.push(rx);
+            }
+            execute_async_jobs(jobs, |_| vec![IncrementalResult::Unsat {
+                core: LitVec::new(), used_constraints: false,
+            }; returned]);
+            for client in clients {
+                let result = client.recv().unwrap();
+                assert_eq!(result.len(), 1);
+                assert!(matches!(result[0], IncrementalResult::Unknown(UnknownReason::BackendError)));
+            }
+        }
+    }
+
+    #[test]
+    fn ready_drain_is_bounded_and_does_not_wait_for_a_full_group() {
+        let make = || {
+            let (result, _) = mpsc::channel();
+            AsyncBlockJob { solvers: Vec::new(), requests: Vec::new(), result, queued_at: Instant::now() }
+        };
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..3 { tx.send(make()).unwrap(); }
+        assert_eq!(collect_ready_jobs(rx.recv().unwrap(), &rx, 2).len(), 2);
+        assert_eq!(collect_ready_jobs(rx.recv().unwrap(), &rx, 4).len(), 1);
+        // The producer is still connected and empty. Returning proves that no
+        // receive timeout or synthetic collection window was introduced.
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+}
+
 impl AsyncBlockExecutor {
-    fn new(depth: usize) -> Self {
-        let mut workers = Vec::with_capacity(depth);
-        for _ in 0..depth {
+    fn new(depth: usize, broker_jobs: Option<usize>) -> Self {
+        let workers_count = if broker_jobs.is_some() { 1 } else { depth };
+        let mut workers = Vec::with_capacity(workers_count);
+        for _ in 0..workers_count {
             let (sender, receiver) = mpsc::channel::<AsyncBlockJob>();
             std::thread::spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let requests = job
-                        .requests
-                        .iter()
-                        .map(|(solver, query)| (&job.solvers[*solver], query.clone()))
-                        .collect();
-                    let _ = job
-                        .result
-                        .send(crate::accel::cdcl_host::solve_active_batch(requests));
+                    // Drain only work already queued; never delay a ready head
+                    // to fill a batch. One coordinator replaces mutex-contending
+                    // workers when explicitly selected, while logical async
+                    // depth and the proof-wide submission limit stay unchanged.
+                    let jobs = collect_ready_jobs(job, &receiver, broker_jobs.unwrap_or(1));
+                    execute_async_jobs(jobs, crate::accel::cdcl_host::solve_active_batch);
                 }
             });
             workers.push(sender);
@@ -196,6 +331,7 @@ impl AsyncBlockExecutor {
             solvers,
             requests,
             result,
+            queued_at: Instant::now(),
         });
         receiver
     }
@@ -207,7 +343,9 @@ fn launch_async_block_batch(
 ) -> Receiver<Vec<IncrementalResult>> {
     static EXECUTOR: OnceLock<AsyncBlockExecutor> = OnceLock::new();
     EXECUTOR
-        .get_or_init(|| AsyncBlockExecutor::new(BlockBatchCache::async_depth()))
+        .get_or_init(|| AsyncBlockExecutor::new(
+            BlockBatchCache::async_depth(), BlockBatchCache::async_broker_jobs(),
+        ))
         .launch(solvers, requests)
 }
 
@@ -1750,6 +1888,16 @@ impl BlockBatchCache {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(|us| Duration::from_micros(us.min(10_000)))
+        })
+    }
+
+    fn async_broker_jobs() -> Option<usize> {
+        static JOBS: OnceLock<Option<usize>> = OnceLock::new();
+        *JOBS.get_or_init(|| {
+            std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC_BROKER_JOBS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|jobs| jobs.clamp(1, 8))
         })
     }
 

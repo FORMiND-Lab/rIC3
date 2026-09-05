@@ -2695,6 +2695,11 @@ static ACTIVE_BLOCK_ASYNC_ROOT_UNUSED: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_DEMANDS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_DEMAND_READY: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_DEMAND_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BROKER_GROUPS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BROKER_JOBS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BROKER_QUERIES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BROKER_QUEUE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BLOCK_BROKER_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BLOCK_ASYNC_JOIN_NS: AtomicU64 = AtomicU64::new(0);
@@ -7678,6 +7683,17 @@ pub fn note_active_block_async_cpu_race() {
     ACTIVE_BLOCK_ASYNC_CPU_RACES.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn note_active_block_broker_dispatch(jobs: usize, queries: usize, queued_ns: u64) {
+    ACTIVE_BLOCK_BROKER_GROUPS.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_BLOCK_BROKER_JOBS.fetch_add(jobs as u64, Ordering::Relaxed);
+    ACTIVE_BLOCK_BROKER_QUERIES.fetch_add(queries as u64, Ordering::Relaxed);
+    ACTIVE_BLOCK_BROKER_QUEUE_NS.fetch_add(queued_ns, Ordering::Relaxed);
+}
+
+pub fn note_active_block_broker_reply_error() {
+    ACTIVE_BLOCK_BROKER_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn note_active_block_async_root_tail(queries: usize) {
     ACTIVE_BLOCK_ASYNC_ROOT_TAIL.fetch_add(queries as u64, Ordering::Relaxed);
 }
@@ -8049,6 +8065,15 @@ pub fn flush_and_report() {
             ACTIVE_BLOCK_ASYNC_DEMANDS.load(Ordering::Relaxed),
             ACTIVE_BLOCK_ASYNC_DEMAND_READY.load(Ordering::Relaxed),
             ACTIVE_BLOCK_ASYNC_DEMAND_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        );
+        eprintln!(
+            "inductor-cdcl: async broker groups={} jobs={} queries={} queue_wait_ms={:.3} state_wait_ms={:.3} reply_errors={}",
+            ACTIVE_BLOCK_BROKER_GROUPS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BROKER_JOBS.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BROKER_QUERIES.load(Ordering::Relaxed),
+            ACTIVE_BLOCK_BROKER_QUEUE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_STATE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ACTIVE_BLOCK_BROKER_REPLY_ERRORS.load(Ordering::Relaxed),
         );
         let kernel_ns = direct_kernel_ns();
         if kernel_ns != 0 {
