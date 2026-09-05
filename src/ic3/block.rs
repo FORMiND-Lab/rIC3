@@ -2402,7 +2402,10 @@ impl IC3 {
                     }
                 }
                 BlockFullRootEvent::UnsatLemma { frame, cube, .. } => {
-                    if source.frame == 0 || *frame as usize != source.frame {
+                    if source.frame == 0
+                        || (*frame as usize) < source.frame
+                        || *frame as usize > self.level()
+                    {
                         return Err("resident UNSAT lemma frame mismatch".to_string());
                     }
                     let cube = decode(cube)?;
@@ -2417,19 +2420,22 @@ impl IC3 {
                     // zero oracle disagreements over repeated matrices.
                     if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_ORACLE").is_some() {
                         let solver = &self.solvers[*frame as usize - 1];
-                        let source_query = solver.incremental_inductive_query(
+                        // Q_block was solved at the source frame. Only the
+                        // final relative-induction certificate uses the pushed frame.
+                        let source_solver = &self.solvers[source.frame - 1];
+                        let source_query = source_solver.incremental_inductive_query(
                             source.state.as_litvec(),
                             false,
                             vec![],
                         );
-                        let mut source_checker = solver.dcs.clone();
+                        let mut source_checker = source_solver.dcs.clone();
                         if !matches!(
                             source_checker.classify_incremental_exact(&source_query),
                             IncrementalResult::Unsat { .. }
                         ) {
                             return Err(format!(
                                 "resident Q_block UNSAT failed exact CPU oracle at frame {} (source {} literals, lemma {} literals, CPU assumptions {:?})",
-                                frame,
+                                source.frame,
                                 source.state.len(),
                                 cube.len(),
                                 source_query

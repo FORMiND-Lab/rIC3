@@ -1469,6 +1469,14 @@ impl HardwareCdcl {
         if predecessor_lift {
             request[5] |= crate::accel::cdcl::BLOCK_PREDECESSOR_LIFT;
         }
+        if max_frame < u32::MAX
+            && std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_EXACT_MAX_FRAME").is_none()
+            && std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_PUSH_LEMMA")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        {
+            request[5] |= crate::accel::cdcl::BLOCK_PUSH_LEMMA;
+        }
         if std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_SKIP_MIC")
             .ok()
             .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))

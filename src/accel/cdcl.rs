@@ -40,6 +40,7 @@ pub const BANK_ALIGNED_DOMAIN: u32 = 1 << 8;
 pub const PACKED_SAT_MODEL: u32 = 1 << 9;
 /// Full-root control only; stripped before ordinary CDCL inquiries.
 pub const BLOCK_PREDECESSOR_LIFT: u32 = 1 << 10;
+pub const BLOCK_PUSH_LEMMA: u32 = 1 << 11;
 pub const MIC_PROTECTED_INDEX_SHIFT: u32 = 16;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
