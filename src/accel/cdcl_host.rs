@@ -1464,7 +1464,13 @@ impl HardwareCdcl {
                 domain_header.conflict_budget,
             );
         }
-        let request = request.ok_or(HardwareError::InvalidContext)?;
+        let mut request = request.ok_or(HardwareError::InvalidContext)?;
+        if std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_SKIP_MIC")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        {
+            request[11] |= crate::accel::cdcl::BLOCK_FULL_ROOT_SKIP_MIC;
+        }
         let response_capacity = block_full_root_required_response_capacity(
             step_limit,
             latch_variables.len(),
