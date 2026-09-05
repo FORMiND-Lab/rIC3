@@ -1361,6 +1361,7 @@ impl HardwareCdcl {
         input_variables: &[u32],
         query_template: &IncrementalQuery,
         compacted_retry: bool,
+        predecessor_lift: bool,
     ) -> Result<BlockFullRootResponse, HardwareError> {
         if next_var_by_current.len() != self.n_var as usize
             || init_value_by_current.len() != next_var_by_current.len()
@@ -1465,6 +1466,9 @@ impl HardwareCdcl {
             );
         }
         let mut request = request.ok_or(HardwareError::InvalidContext)?;
+        if predecessor_lift {
+            request[5] |= crate::accel::cdcl::BLOCK_PREDECESSOR_LIFT;
+        }
         if std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_SKIP_MIC")
             .ok()
             .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
@@ -4638,6 +4642,7 @@ pub fn run_resident_block_full_root(
     input_variables: &[u32],
     query_template: &IncrementalQuery,
     compacted_retry: bool,
+    allow_predecessor_lift: bool,
 ) -> ResidentBlockFullRoot {
     if !block_full_root_enabled()
         || !block_controller_owns_queue()
@@ -4684,6 +4689,15 @@ pub fn run_resident_block_full_root(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(crate::accel::cdcl::BLOCK_ROOT_MAX_WORK)
         .clamp(1, crate::accel::cdcl::BLOCK_ROOT_MAX_WORK);
+    // The reserved view must contain T alone, never Init or frame lemmas.
+    // Constrained systems need constraints in the implication target too;
+    // their caller deliberately keeps complete predecessors for now.
+    let predecessor_lift = allow_predecessor_lift
+        && context.scope == ShadowContextScope::FrameRanged
+        && max_frame < u32::MAX as usize
+        && std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_PREDECESSOR_LIFT")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"));
     let state = active_state().lock();
     let result = state
         .map_err(|_| "active hardware lock poisoned".to_string())
@@ -4743,6 +4757,7 @@ pub fn run_resident_block_full_root(
                         input_variables,
                         query_template,
                         compacted_retry,
+                        predecessor_lift,
                     )
                 });
             if let Ok(wave) = &result

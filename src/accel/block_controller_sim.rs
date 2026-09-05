@@ -637,6 +637,7 @@ impl ResidentBlockMirror {
         input_variables: &[u32],
         query_template: &IncrementalQuery,
         compacted_retry: bool,
+        predecessor_lift: bool,
     ) -> Result<OwnedBlockFullRootWave, String> {
         if !self.initialized {
             return Err("resident BLOCK mirror was not rebased".to_string());
@@ -656,6 +657,7 @@ impl ResidentBlockMirror {
                 input_variables,
                 query_template,
                 compacted_retry,
+                predecessor_lift,
             )
             .map_err(|error| format!("resident BLOCK full-root command failed: {error}"))?;
         let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -1573,6 +1575,7 @@ pub(super) fn run_owned_full_root(
     input_variables: &[u32],
     query_template: &IncrementalQuery,
     compacted_retry: bool,
+    predecessor_lift: bool,
 ) -> Result<OwnedBlockFullRootWave, String> {
     MIRROR
         .get_or_init(Default::default)
@@ -1589,6 +1592,7 @@ pub(super) fn run_owned_full_root(
             input_variables,
             query_template,
             compacted_retry,
+            predecessor_lift,
         )
 }
 

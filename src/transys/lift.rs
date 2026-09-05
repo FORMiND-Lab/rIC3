@@ -27,6 +27,19 @@ impl TsLift {
         self.complex_lift(satif, self.uts.latch.clone(), target, order)
     }
 
+    /// Simulation-only caller: certify an already reduced device premise.
+    /// Unlike lift_model this does not require assignments for omitted latches.
+    pub fn premise_implies(&mut self, state: &[Lit], input: &[Lit], target: &[Lit]) -> bool {
+        if target.is_empty() {
+            return true;
+        }
+        let clause: LitVec = target.iter().map(|literal| !*literal).collect();
+        self.slv.set_domain(clause.iter().copied());
+        let valid = self.slv.minimal_premise(input, state, &clause).is_some();
+        self.slv.unset_domain();
+        valid
+    }
+
     /// Lift a clause-valid external model without importing it into GipSAT's
     /// trail. The external assignment supplies only candidate state/input
     /// values; `minimal_premise` independently proves that the returned state,
@@ -194,6 +207,10 @@ mod tests {
         assert_eq!(state.as_slice(), &[relevant.lit()]);
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].as_slice(), &[input.lit()]);
+        assert!(lift.premise_implies(&state, &inputs[0], &[next]));
+        assert!(!lift.premise_implies(&[], &inputs[0], &[next]));
+        assert!(!lift.premise_implies(&state, &[!input.lit()], &[next]));
+        assert!(lift.premise_implies(&[], &[!input.lit()], &[!next]));
 
         let missing_input: Vec<Lit> = model
             .iter()

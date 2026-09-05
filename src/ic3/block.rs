@@ -2363,6 +2363,19 @@ impl IC3 {
                     }
                     let state = decode(state)?;
                     let input = decode(input)?;
+                    if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_ORACLE").is_some() {
+                        let query = self.solvers[source.frame - 1].incremental_inductive_query(
+                            source.state.as_litvec(), false, vec![],
+                        );
+                        let mut target = query.assumptions;
+                        target.extend(self.ts.constraint.iter().copied());
+                        if !self.lift.premise_implies(&state, &input, &target) {
+                            return Err(format!(
+                                "resident SAT predecessor implication failed at frame {} ({} state literals)",
+                                frame, state.len(),
+                            ));
+                        }
+                    }
                     let predecessor = ProofObligation::new(
                         *frame as usize,
                         LitOrdVec::new(state.clone()),
@@ -2827,6 +2840,7 @@ impl IC3 {
                             &inputs,
                             &query_template,
                             full_root_compacted_retry,
+                            self.ts.constraint.is_empty(),
                         )
                     },
                 );
