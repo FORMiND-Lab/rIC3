@@ -2120,6 +2120,8 @@ impl IC3 {
                         let (init, latches, inputs) = solver.resident_block_projection_metadata();
                         let mut query_template =
                             solver.incremental_inductive_query(&[], false, vec![]);
+                        query_template.budget.decisions =
+                            crate::accel::cdcl_host::block_full_root_decision_budget();
                         query_template.budget.conflicts =
                             crate::accel::cdcl_host::block_full_root_conflict_budget();
                         let resident_solvers = self

@@ -314,6 +314,7 @@ pub enum HardwareError {
     InvalidPath,
     InvalidContext,
     Capacity,
+    Timeout,
     Open(i32),
     Command(i32),
     Decode(BatchDecodeError),
@@ -1489,7 +1490,11 @@ impl HardwareCdcl {
             if rc != 0 {
                 record_full_root_transaction(&request, &[], rc);
                 self.full_root_projection = None;
-                return Err(HardwareError::Command(rc));
+                return Err(if rc == -27 {
+                    HardwareError::Timeout
+                } else {
+                    HardwareError::Command(rc)
+                });
             }
             let out_words = usize::try_from(out_words).map_err(|_| HardwareError::Capacity)?;
             if out_words > response.len() {
@@ -2887,6 +2892,7 @@ const DEFAULT_FULL_ROOT_MAX_RESPONSE_WORDS: usize = 1 << 16;
 const DEFAULT_SHADOW_CONFLICT_BUDGET: u32 = 3;
 const DEFAULT_ACTIVE_CONFLICT_BUDGET: u32 = 16;
 const DEFAULT_BLOCK_FULL_ROOT_CONFLICT_BUDGET: u32 = 128;
+const DEFAULT_BLOCK_FULL_ROOT_DECISION_BUDGET: u32 = 4096;
 
 fn configured_conflict_budget(mode_variable: &str, default: u32) -> u32 {
     std::env::var(mode_variable)
@@ -2932,6 +2938,19 @@ pub fn block_full_root_conflict_budget() -> u32 {
             "INDUCTOR_CDCL_BLOCK_FULL_ROOT_CONFLICT_BUDGET",
             DEFAULT_BLOCK_FULL_ROOT_CONFLICT_BUDGET,
         )
+    })
+}
+
+/// Conflict-only limits do not bound low-conflict SAT walks. Keep one root
+/// inquiry finite so a resident actor can hand an unsuitable tail back to
+/// GipSAT instead of monopolizing the synchronous FPGA service.
+pub fn block_full_root_decision_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_DECISION_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_BLOCK_FULL_ROOT_DECISION_BUDGET)
     })
 }
 
@@ -4733,6 +4752,16 @@ pub fn run_resident_block_full_root(
             source_keys: wave.source_keys,
         },
         Err(error) => {
+            if error.ends_with("incremental CDCL hardware error: Timeout") {
+                BLOCK_CONTROLLER_SIM_FAILED.store(true, Ordering::Relaxed);
+                if !ACTIVE_HARDWARE_DISABLED.swap(true, Ordering::Relaxed) {
+                    ACTIVE_HARDWARE_DISABLES.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "inductor-cdcl: full-root service timed out; closing its resident lease and continuing this solver on CPU"
+                    );
+                }
+                return ResidentBlockFullRoot::Disabled;
+            }
             finish_block_controller_sim(Err(error));
             ResidentBlockFullRoot::Disabled
         }
