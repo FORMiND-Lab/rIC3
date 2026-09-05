@@ -1471,6 +1471,16 @@ impl HardwareCdcl {
         {
             request[11] |= crate::accel::cdcl::BLOCK_FULL_ROOT_SKIP_MIC;
         }
+        if std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_CPU_MIC")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        {
+            request[11] |= crate::accel::cdcl::BLOCK_FULL_ROOT_CPU_MIC;
+            // Only the head is popped/owned at the hybrid boundary. Keep one
+            // temporal resident stream instead of producing non-head results
+            // whose MIC work cannot be committed transactionally.
+            request[10] = 1;
+        }
         let response_capacity = block_full_root_required_response_capacity(
             step_limit,
             latch_variables.len(),
@@ -4363,7 +4373,9 @@ pub fn finish_block_root_timeline(
 }
 
 fn block_controller_sim_requested() -> bool {
-    std::env::var_os("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM").is_some()
+    std::env::var("INDUCTOR_CDCL_BLOCK_CONTROLLER_SIM")
+        .ok()
+        .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
 }
 
 fn block_controller_sim_enabled() -> bool {

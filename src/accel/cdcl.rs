@@ -133,6 +133,7 @@ pub const BLOCK_FULL_ROOT_EVENT_HEADER_WORDS: usize = 2;
 pub const BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS: usize = 7;
 pub const BLOCK_FULL_ROOT_SAT_HEADER_WORDS: usize = 11;
 pub const BLOCK_FULL_ROOT_MAX_STEPS: usize = 256;
+pub const BLOCK_FULL_ROOT_CPU_MIC: u32 = 1 << 28;
 pub const BLOCK_FULL_ROOT_SKIP_MIC: u32 = 1 << 29;
 pub const BLOCK_FULL_ROOT_REUSE_PROJECTION: u32 = 1 << 30;
 pub const BLOCK_FULL_ROOT_COMPACTED_RETRY: u32 = 1 << 31;
@@ -297,6 +298,7 @@ pub enum BlockFullRootStatus {
     Error = 5,
     CompactionRequired = 6,
     Proved = 7,
+    CpuMic = 8,
 }
 
 impl BlockFullRootStatus {
@@ -310,6 +312,7 @@ impl BlockFullRootStatus {
             5 => Self::Error,
             6 => Self::CompactionRequired,
             7 => Self::Proved,
+            8 => Self::CpuMic,
             _ => return None,
         })
     }
@@ -342,6 +345,10 @@ pub enum BlockFullRootEvent {
 pub struct BlockFullRootResponse {
     pub status: BlockFullRootStatus,
     pub handoff: Option<BlockRootWork>,
+    /// Reconstructed current-state failed-assumption core for `CpuMic`.
+    /// CPU consumes this trusted Q_block result as MIC input without solving
+    /// the original inquiry again.
+    pub handoff_core: Option<Vec<u32>>,
     pub events: Vec<BlockFullRootEvent>,
     pub cdcl_waves: u32,
     pub cdcl_inquiries: u32,
@@ -509,10 +516,23 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
     } else {
         None
     };
+    let handoff_core = if status == BlockFullRootStatus::CpuMic {
+        let core_words = usize::try_from(*words.get(at)?).ok()?;
+        at = at.checked_add(1)?;
+        if core_words == 0 {
+            return None;
+        }
+        let core = words.get(at..at.checked_add(core_words)?)?.to_vec();
+        at += core_words;
+        Some(core)
+    } else {
+        None
+    };
     if matches!(
         status,
         BlockFullRootStatus::CpuResult
             | BlockFullRootStatus::CpuHandoff
+            | BlockFullRootStatus::CpuMic
             | BlockFullRootStatus::Fallback
     ) != handoff.is_some()
         || matches!(
@@ -598,6 +618,7 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
     Some(BlockFullRootResponse {
         status,
         handoff,
+        handoff_core,
         events,
         cdcl_waves: header[4],
         cdcl_inquiries: header[9],
@@ -1390,5 +1411,33 @@ mod tests {
         .unwrap();
         assert_eq!(proved.status, BlockFullRootStatus::Proved);
         assert!(proved.handoff.is_none() && proved.events.is_empty());
+
+        let cpu_mic = decode_block_full_root_response(&[
+            BLOCK_FULL_ROOT_PROTOCOL_VERSION,
+            BlockFullRootStatus::CpuMic as u32,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            (BLOCK_FULL_ROOT_WORK_WORDS + 3) as u32,
+            1,
+            3,
+            7,
+            0,
+            11,
+            0x44,
+            0,
+            5,
+            2,
+            0,
+            2,
+        ])
+        .unwrap();
+        assert_eq!(cpu_mic.status, BlockFullRootStatus::CpuMic);
+        assert_eq!(cpu_mic.handoff.unwrap().user_tag(), 0x44);
+        assert_eq!(cpu_mic.handoff_core.as_deref(), Some(&[0, 2][..]));
+        assert!(cpu_mic.events.is_empty());
     }
 }

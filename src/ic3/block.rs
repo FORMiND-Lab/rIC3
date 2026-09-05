@@ -9,7 +9,15 @@ use giputils::TerminateCtrl;
 use log::{debug, info};
 use logicrs::{Lit, LitOrdVec, LitVec, Var, satif::Satif};
 use rand::seq::SliceRandom;
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    time::Instant,
+};
 
 use crate::{
     accel::{
@@ -42,24 +50,36 @@ struct CachedBlockInquiry {
 struct PendingBlockBatch {
     inquiries: Vec<CachedBlockInquiry>,
     hardware_indices: Vec<usize>,
-    handle: Option<std::thread::JoinHandle<Vec<IncrementalResult>>>,
+    receiver: Option<Receiver<Vec<IncrementalResult>>>,
+    ready: Option<Vec<IncrementalResult>>,
     launched_at: Instant,
 }
 
 impl PendingBlockBatch {
-    fn is_finished(&self) -> bool {
-        self.handle
-            .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
+    fn is_finished(&mut self) -> bool {
+        if self.ready.is_some() || self.receiver.is_none() {
+            return true;
+        }
+        match self.receiver.as_ref().unwrap().try_recv() {
+            Ok(results) => {
+                self.ready = Some(results);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.receiver = None;
+                true
+            }
+        }
     }
 
     fn finish(&mut self) -> Vec<CachedBlockInquiry> {
         let wait_start = Instant::now();
         let n_hardware = self.hardware_indices.len();
-        let results = self
-            .handle
-            .take()
-            .and_then(|handle| handle.join().ok())
+        let ready = self.ready.take();
+        let receiver = self.receiver.take();
+        let results = ready
+            .or_else(|| receiver.and_then(|receiver| receiver.recv().ok()))
             .unwrap_or_else(|| {
                 vec![
                     IncrementalResult::Unknown(crate::accel::cdcl::UnknownReason::BackendError,);
@@ -79,10 +99,72 @@ impl PendingBlockBatch {
 
 impl Drop for PendingBlockBatch {
     fn drop(&mut self) {
-        if self.handle.is_some() {
+        if self.receiver.is_some() || self.ready.is_some() {
             let _ = self.finish();
         }
     }
+}
+
+struct AsyncBlockJob {
+    solvers: Vec<crate::gipsat::DagCnfSolver>,
+    requests: Vec<(usize, IncrementalQuery)>,
+    result: Sender<Vec<IncrementalResult>>,
+}
+
+struct AsyncBlockExecutor {
+    workers: Vec<Sender<AsyncBlockJob>>,
+    next: AtomicUsize,
+}
+
+impl AsyncBlockExecutor {
+    fn new(depth: usize) -> Self {
+        let mut workers = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            let (sender, receiver) = mpsc::channel::<AsyncBlockJob>();
+            std::thread::spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let requests = job
+                        .requests
+                        .iter()
+                        .map(|(solver, query)| (&job.solvers[*solver], query.clone()))
+                        .collect();
+                    let _ = job
+                        .result
+                        .send(crate::accel::cdcl_host::solve_active_batch(requests));
+                }
+            });
+            workers.push(sender);
+        }
+        Self {
+            workers,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn launch(
+        &self,
+        solvers: Vec<crate::gipsat::DagCnfSolver>,
+        requests: Vec<(usize, IncrementalQuery)>,
+    ) -> Receiver<Vec<IncrementalResult>> {
+        let (result, receiver) = mpsc::channel();
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        let _ = self.workers[index].send(AsyncBlockJob {
+            solvers,
+            requests,
+            result,
+        });
+        receiver
+    }
+}
+
+fn launch_async_block_batch(
+    solvers: Vec<crate::gipsat::DagCnfSolver>,
+    requests: Vec<(usize, IncrementalQuery)>,
+) -> Receiver<Vec<IncrementalResult>> {
+    static EXECUTOR: OnceLock<AsyncBlockExecutor> = OnceLock::new();
+    EXECUTOR
+        .get_or_init(|| AsyncBlockExecutor::new(BlockBatchCache::async_depth()))
+        .launch(solvers, requests)
 }
 
 #[derive(Default)]
@@ -946,7 +1028,7 @@ mod block_accel_policy_tests {
     use super::{
         BatchRouteDecision, BlockAccelPolicy, BlockBatchCache, BlockFullRootAdmission,
         BlockFullRootRoute, CachedBlockInquiry, DEFAULT_BLOCK_ASYNC, DEFAULT_BLOCK_WAVEFRONT,
-        block_fpga_routes, block_full_root_worker_allowed,
+        PendingBlockBatch, block_fpga_routes, block_full_root_worker_allowed,
     };
     use crate::{
         accel::cdcl::UnknownReason,
@@ -954,7 +1036,7 @@ mod block_accel_policy_tests {
         ic3::proofoblig::ProofObligation,
     };
     use logicrs::{Lit, LitOrdVec, LitVec, Var};
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, sync::mpsc, time::Instant};
 
     #[test]
     fn full_root_admission_uses_one_distinct_sample_per_route() {
@@ -1334,6 +1416,33 @@ mod block_accel_policy_tests {
         assert!(DEFAULT_BLOCK_WAVEFRONT);
         assert!(!DEFAULT_BLOCK_ASYNC);
     }
+
+    #[test]
+    fn asynchronous_speculation_has_a_bounded_command_tail() {
+        assert_eq!(BlockBatchCache::async_max_batches_setting(None), 256);
+        assert_eq!(BlockBatchCache::async_max_batches_setting(Some("0")), 1);
+        assert_eq!(
+            BlockBatchCache::async_max_batches_setting(Some("1000000")),
+            65_536
+        );
+    }
+
+    #[test]
+    fn ready_asynchronous_result_is_consumed_only_once() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Vec::new()).unwrap();
+        let mut pending = PendingBlockBatch {
+            inquiries: Vec::new(),
+            hardware_indices: Vec::new(),
+            receiver: Some(receiver),
+            ready: None,
+            launched_at: Instant::now(),
+        };
+        assert!(pending.is_finished());
+        assert!(pending.finish().is_empty());
+        assert!(pending.receiver.is_none());
+        assert!(pending.ready.is_none());
+    }
 }
 
 impl BlockBatchCache {
@@ -1509,8 +1618,31 @@ impl BlockBatchCache {
         })
     }
 
-    fn can_launch(&self) -> bool {
-        !Self::async_enabled() || self.pending.len() < Self::async_depth()
+    fn async_max_batches_setting(value: Option<&str>) -> usize {
+        value
+            .and_then(|value| value.parse().ok())
+            // A background batch is speculative: the CPU keeps advancing the
+            // current obligation while the device works on queued siblings.
+            // Bound that speculation so a proof cannot finish by waiting for
+            // thousands of already-stale PCIe commands.  The switch is only
+            // consulted when explicit asynchronous mode is enabled.
+            .unwrap_or(256)
+            .clamp(1, 65_536)
+    }
+
+    fn async_max_batches() -> usize {
+        use std::sync::OnceLock;
+        static BATCHES: OnceLock<usize> = OnceLock::new();
+        *BATCHES.get_or_init(|| {
+            let setting = std::env::var("INDUCTOR_CDCL_BLOCK_ASYNC_MAX_BATCHES").ok();
+            Self::async_max_batches_setting(setting.as_deref())
+        })
+    }
+
+    fn can_launch(&self, async_batches_launched: usize) -> bool {
+        !Self::async_enabled()
+            || self.pending.len() < Self::async_depth()
+                && async_batches_launched < Self::async_max_batches()
     }
 
     fn contains(&self, frame: usize, state: &LitOrdVec) -> bool {
@@ -1894,14 +2026,16 @@ impl IC3 {
         (self.level() + 1, cube)
     }
 
-    fn generalize(
+    fn generalize_from_proven_core(
         &mut self,
         mut po: ProofObligation,
         mic_type: MicType,
         semantic_ops: &mut ExactBlockSemanticOps,
+        proven_core: Option<LitVec>,
     ) -> bool {
         begin_block_lemma_journal(semantic_ops.is_some());
-        let Some(mut mic) = self.solvers[po.frame - 1].inductive_core() else {
+        let Some(mut mic) = proven_core.or_else(|| self.solvers[po.frame - 1].inductive_core())
+        else {
             po.frame += 1;
             self.add_obligation(po.clone());
             note_exact_obligation_op(semantic_ops, BLOCK_SEMANTIC_INSERT_OBLIGATION, &po);
@@ -2096,6 +2230,7 @@ impl IC3 {
             let mut resident_root_attempted = false;
             let mut full_root_pop = None;
             let mut full_root_sync_event = None;
+            let mut full_root_cpu_mic = None;
             if next.is_none() && full_root_fpga_enabled {
                 // A StepBudget response is normally followed immediately by
                 // another resident root command.  Without checking the global
@@ -2227,6 +2362,28 @@ impl IC3 {
                             let handoff = response
                                 .handoff
                                 .expect("resident full-root status requires handoff");
+                            full_root_pop =
+                                Some(crate::accel::cdcl_host::ResidentBlockPop::Selected {
+                                    user_tag: handoff.user_tag(),
+                                });
+                        }
+                        BlockFullRootStatus::CpuMic => {
+                            let event = if response.unsat_commits != 0 {
+                                BLOCK_STEP_GENERALIZED
+                            } else {
+                                BLOCK_STEP_PREDECESSOR
+                            };
+                            semantic_ops = resident_ops;
+                            full_root_sync_event = Some(event);
+                            let handoff = response
+                                .handoff
+                                .expect("resident full-root CPU MIC status requires handoff");
+                            full_root_cpu_mic = Some(
+                                response
+                                    .handoff_core
+                                    .clone()
+                                    .expect("resident full-root CPU MIC status requires a core"),
+                            );
                             full_root_pop =
                                 Some(crate::accel::cdcl_host::ResidentBlockPop::Selected {
                                     user_tag: handoff.user_tag(),
@@ -2394,6 +2551,42 @@ impl IC3 {
             // is discarded by one of the cheap guards below. Otherwise stale
             // entries would prevent the cache from naturally draining.
             let mut cached_block = block_batch.take(&po, true);
+            let full_root_proven_core = full_root_cpu_mic.take().map(|words| {
+                let n_var = self.tsctx.num_var();
+                let hardware_core = words
+                    .into_iter()
+                    .map(|word| {
+                        let variable = Var::from(word >> 1);
+                        (usize::from(variable) < n_var)
+                            .then(|| Lit::new(variable, word & 1 == 0))
+                            .unwrap_or_else(|| {
+                                panic!("resident CPU MIC literal out of range: {word}")
+                            })
+                    })
+                    .collect::<LitVec>();
+                if hardware_core.is_empty()
+                    || hardware_core
+                        .iter()
+                        .any(|literal| !po.state.contains(literal))
+                    || self.tsctx.cube_subsume_init(&hardware_core)
+                {
+                    panic!("resident CPU MIC core violates the proof-obligation boundary");
+                }
+                // A smaller failed-assumption core is a stronger blocking
+                // clause, but it can be substantially harder to push and can
+                // explode the later obligation frontier. Keep the core on the
+                // wire for measured experiments; use the original, already
+                // proven cube by default until the multi-AIGER gate shows the
+                // core route is beneficial.
+                if std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_CPU_MIC_USE_CORE")
+                    .ok()
+                    .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+                {
+                    hardware_core
+                } else {
+                    po.state.as_litvec().clone()
+                }
+            });
             let mut materialized_current_sat = false;
             self.render_progress();
             if po.removed {
@@ -2511,7 +2704,7 @@ impl IC3 {
             }
             if cached_block.is_none()
                 && !resident_root_attempted
-                && block_batch.can_launch()
+                && block_batch.can_launch(self.block_async_batches_launched)
                 && po.frame > 0
                 && leaf_fpga_enabled
                 && crate::accel::cdcl_host::block_batch_enabled()
@@ -2740,22 +2933,19 @@ impl IC3 {
                         prepare_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     crate::accel::cdcl_host::note_active_block_async_launch(prepare_ns);
                     let launched_at = Instant::now();
-                    let handle = std::thread::spawn(move || {
-                        let hardware_requests = owned_requests
-                            .into_iter()
-                            .map(|(solver_index, query)| (&owned_solvers[solver_index], query))
-                            .collect();
-                        crate::accel::cdcl_host::solve_active_batch(hardware_requests)
-                    });
+                    let receiver = launch_async_block_batch(owned_solvers, owned_requests);
                     if trusted_cpu.first() == Some(&true) {
                         cached_block = inquiries.first().cloned();
                     }
                     block_batch.start(PendingBlockBatch {
                         inquiries,
                         hardware_indices,
-                        handle: Some(handle),
+                        receiver: Some(receiver),
+                        ready: None,
                         launched_at,
                     });
+                    self.block_async_batches_launched =
+                        self.block_async_batches_launched.saturating_add(1);
                 } else {
                     let service_before = crate::accel::cdcl_host::active_batch_service_snapshot();
                     let hardware_results =
@@ -3072,22 +3262,29 @@ impl IC3 {
                     }
                 }
             });
-            let blocked = match speculative {
-                Some(blocked) => {
-                    if !speculative_trusted_cpu {
-                        self.block_accel_policy.note_hardware();
+            let blocked = if full_root_proven_core.is_some() {
+                // Q_block was already conclusively UNSAT in the resident
+                // solver.  CPU starts at MIC from this exact original cube;
+                // this is useful algorithm work, not a verification solve.
+                true
+            } else {
+                match speculative {
+                    Some(blocked) => {
+                        if !speculative_trusted_cpu {
+                            self.block_accel_policy.note_hardware();
+                        }
+                        blocked
                     }
-                    blocked
-                }
-                None => {
-                    let cpu_start = crate::inductor::ThreadCpuTimer::start();
-                    let blocked = self
-                        .blocked(po.frame, &po.state)
-                        .in_phase(inductor_trace::Phase::Block)
-                        .with_act_order(false)
-                        .check();
-                    self.block_accel_policy.note_cpu(cpu_start.ns());
-                    blocked
+                    None => {
+                        let cpu_start = crate::inductor::ThreadCpuTimer::start();
+                        let blocked = self
+                            .blocked(po.frame, &po.state)
+                            .in_phase(inductor_trace::Phase::Block)
+                            .with_act_order(false)
+                            .check();
+                        self.block_accel_policy.note_cpu(cpu_start.ns());
+                        blocked
+                    }
                 }
             };
             self.statistic.block.blocked_time += blocked_start.elapsed();
@@ -3120,7 +3317,12 @@ impl IC3 {
                 } else {
                     MicType::from_config(&self.cfg)
                 };
-                if self.generalize(po, mic_type, &mut semantic_ops) {
+                if self.generalize_from_proven_core(
+                    po,
+                    mic_type,
+                    &mut semantic_ops,
+                    full_root_proven_core,
+                ) {
                     self.note_exact_block_step(progress, BLOCK_STEP_PROVED, semantic_ops);
                     return BlockResult::Proved;
                 }
