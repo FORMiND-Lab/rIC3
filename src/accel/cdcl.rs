@@ -42,6 +42,7 @@ pub const PACKED_SAT_MODEL: u32 = 1 << 9;
 pub const BLOCK_PREDECESSOR_LIFT: u32 = 1 << 10;
 pub const BLOCK_PUSH_LEMMA: u32 = 1 << 11;
 pub const BLOCK_REQUEUE: u32 = 1 << 12;
+pub const BLOCK_COVERED: u32 = 1 << 13;
 pub const MIC_PROTECTED_INDEX_SHIFT: u32 = 16;
 
 pub const STAGE_PROFILE_MAGIC: u32 = 0x4344_5031; // "CDP1"
@@ -144,6 +145,7 @@ pub const BLOCK_FULL_ROOT_COMPACTED_RETRY: u32 = 1 << 31;
 pub const BLOCK_FULL_ROOT_EVENT_SAT_PREDECESSOR: u32 = 1;
 pub const BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA: u32 = 2;
 pub const BLOCK_FULL_ROOT_EVENT_UNSAT_REQUEUE: u32 = 3;
+pub const BLOCK_FULL_ROOT_EVENT_COVERED: u32 = 4;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,6 +327,12 @@ impl BlockFullRootStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockFullRootEvent {
+    CoveredObligation {
+        frame: u32,
+        proof_tag: u64,
+        requeued_descriptor: u32,
+        cube: Vec<u32>,
+    },
     SatPredecessor {
         child_tag: u64,
         parent_tag: u64,
@@ -563,6 +571,19 @@ pub fn decode_block_full_root_response(words: &[u32]) -> Option<BlockFullRootRes
         let end = at.checked_add(record_words)?;
         let record = words.get(at..end)?;
         let event = match kind {
+            BLOCK_FULL_ROOT_EVENT_COVERED => {
+                if record.len() < 8 || record[1] != 0
+                    || (record[0] == u32::MAX && record[7] != u32::MAX)
+                    || record.len() != 8usize.checked_add(record[6] as usize)? {
+                    return None;
+                }
+                BlockFullRootEvent::CoveredObligation {
+                    frame: record[0],
+                    proof_tag: u64::from(record[2]) | (u64::from(record[3]) << 32),
+                    requeued_descriptor: record[7],
+                    cube: record[8..].to_vec(),
+                }
+            }
             BLOCK_FULL_ROOT_EVENT_UNSAT_LEMMA | BLOCK_FULL_ROOT_EVENT_UNSAT_REQUEUE => {
                 if record.len() < BLOCK_FULL_ROOT_LEMMA_HEADER_WORDS {
                     return None;
@@ -1261,6 +1282,26 @@ mod tests {
             .status,
             BlockRootExecutionStatus::Empty,
         );
+    }
+
+    #[test]
+    fn covered_root_response_has_queue_events_but_no_sat_inquiries() {
+        let mut words = vec![5, 0, 0, 1, 0, 0, 0, 0, 11, 0,
+            4, 9, 3, 0, 99, 0, 7, 8, 1, 12, 2];
+        let response = decode_block_full_root_response(&words).unwrap();
+        assert_eq!((response.cdcl_inquiries, response.unsat_commits), (0, 0));
+        assert!(matches!(&response.events[0], BlockFullRootEvent::CoveredObligation {
+            frame: 3, proof_tag: 99, requeued_descriptor: 12, cube
+        } if cube == &vec![2]));
+        words[12] = u32::MAX;
+        assert!(decode_block_full_root_response(&words).is_none());
+        words[19] = u32::MAX;
+        assert!(decode_block_full_root_response(&words).is_some());
+        words[13] = 1;
+        assert!(decode_block_full_root_response(&words).is_none());
+        words[13] = 0;
+        words.pop();
+        assert!(decode_block_full_root_response(&words).is_none());
     }
 
     #[test]

@@ -1467,6 +1467,13 @@ impl HardwareCdcl {
         }
         let mut request = request.ok_or(HardwareError::InvalidContext)?;
         if max_frame < u32::MAX
+            && std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_COVERED")
+                .ok()
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        {
+            request[5] |= crate::accel::cdcl::BLOCK_COVERED;
+        }
+        if max_frame < u32::MAX
             && std::env::var("INDUCTOR_CDCL_BLOCK_FULL_ROOT_REQUEUE")
                 .ok()
                 .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))

@@ -65,6 +65,7 @@ static ROOT_WORK: AtomicU64 = AtomicU64::new(0);
 static ROOT_OK: AtomicU64 = AtomicU64::new(0);
 static ROOT_CPU_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 static ROOT_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
+static ROOT_COVERED: AtomicU64 = AtomicU64::new(0);
 // Current persistent/native BLOCK descriptor ABI has 1024 queue entries.
 // Live entries cannot be reclaimed by copying GC. Suspend only the queue
 // controller at an authoritative CPU-image boundary, not the CDCL transport.
@@ -746,6 +747,33 @@ impl ResidentBlockMirror {
         let mut source_keys = Vec::with_capacity(response.events.len());
         for (event_index, event) in response.events.iter().enumerate() {
             match event {
+                BlockFullRootEvent::CoveredObligation { frame, proof_tag, requeued_descriptor, .. } => {
+                    let (source_key, _) = self.remove_obligation_descriptor_for_tag(*proof_tag)?;
+                    if source_key[0] == 0 || *frame < source_key[0] {
+                        return Err("resident covered obligation frame mismatch".to_string());
+                    }
+                    source_keys.push(source_key.clone());
+                    if *frame != u32::MAX {
+                        let count = source_key[3] as usize;
+                        let target = frame + 1;
+                        let duplicate = self.has_equivalent_obligation(
+                            target, source_key[1], source_key[2], &source_key[4..4 + count],
+                        ).is_some();
+                        if (*requeued_descriptor == u32::MAX) != duplicate {
+                            return Err("resident covered obligation dedup mismatch".to_string());
+                        }
+                        if !duplicate {
+                            let mut promoted = source_key;
+                            promoted[0] = target;
+                            self.obligation_descriptors.entry(promoted).or_default().push(
+                                ResidentObligationDescriptor { handle: *requeued_descriptor, user_tag: *proof_tag }
+                            );
+                        }
+                    } else if *requeued_descriptor != u32::MAX {
+                        return Err("resident infinite coverage requeued an obligation".to_string());
+                    }
+                    ROOT_COVERED.fetch_add(1, Ordering::Relaxed);
+                }
                 BlockFullRootEvent::SatPredecessor {
                     child_tag,
                     parent_tag,
@@ -1664,6 +1692,7 @@ pub(super) fn take_owned_key(user_tag: u64) -> Result<Vec<u32>, String> {
 }
 
 pub(super) fn report() {
+    eprintln!("inductor-cdcl: resident covered-obligation operations {} (not CDCL inquiries)", ROOT_COVERED.load(Ordering::Relaxed));
     eprintln!(
         "inductor-cdcl: resident queue capacity pauses {}, resumes {}, CPU-only boundaries {}, paused {}",
         QUEUE_CAPACITY_PAUSES.load(Ordering::Relaxed),

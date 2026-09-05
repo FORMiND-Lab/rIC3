@@ -2347,6 +2347,37 @@ impl IC3 {
                 .take_resident_key(source_key, self.level())
                 .ok_or_else(|| "resident full-root consumed unknown CPU obligation".to_string())?;
             match event {
+                BlockFullRootEvent::CoveredObligation { frame, cube, requeued_descriptor, .. } => {
+                    if source.frame == 0 || (*frame as usize) < source.frame {
+                        return Err("resident coverage source frame mismatch".to_string());
+                    }
+                    if std::env::var_os("INDUCTOR_CDCL_BLOCK_FULL_ROOT_ORACLE").is_some() {
+                        let cube = decode(cube)?;
+                        if !cube.iter().all(|lit| source.state.contains(lit)) {
+                            return Err("resident coverage cube does not subsume source".to_string());
+                        }
+                        let expected = self.frame.trivial_contained(Some(source.frame), &source.state)
+                            .map(|(frame, _)| frame.map_or(u32::MAX, |frame| frame as u32));
+                        let present = if *frame == u32::MAX {
+                            self.frame.inf.iter().any(|lemma| lemma.as_litvec() == &cube)
+                        } else {
+                            (*frame as usize) < self.frame.len()
+                                && self.frame[*frame as usize].iter().any(|lemma| lemma.as_litvec() == &cube)
+                        };
+                        if expected != Some(*frame) || !present {
+                            return Err("resident coverage disagrees with CPU frame oracle".to_string());
+                        }
+                    }
+                    if *frame != u32::MAX {
+                        let mut source = source;
+                        source.push_to(*frame as usize + 1);
+                        if self.add_obligation_if_new(source) != (*requeued_descriptor != u32::MAX) {
+                            return Err("resident covered obligation CPU dedup mismatch".to_string());
+                        }
+                    } else if *requeued_descriptor != u32::MAX {
+                        return Err("resident infinite coverage has a queue descriptor".to_string());
+                    }
+                }
                 BlockFullRootEvent::SatPredecessor {
                     parent_descriptor_handle,
                     child_descriptor_handle,
