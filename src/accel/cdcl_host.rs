@@ -911,6 +911,8 @@ struct ArenaLaneView {
     bitmap: Vec<u32>,
     key: u64,
     valid: bool,
+    /// MIC can overwrite the physical lane without updating this cached base.
+    needs_bitmap: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -958,6 +960,13 @@ impl ResidentArena {
             n_var,
             ..Self::default()
         };
+    }
+
+    fn mark_mic_lane_clone(&mut self) {
+        // Arena MIC may clone lane zero's view into lane one. Its cached key
+        // and bitmap then describe neither a reusable view nor a toggle base.
+        // Do not infer whether a particular MIC profile actually cloned it.
+        self.lanes[1].needs_bitmap = true;
     }
 
     fn normalize_clause(n_var: u32, literals: &LitVec) -> Result<Option<Vec<u32>>, HardwareError> {
@@ -1037,7 +1046,7 @@ impl ResidentArena {
             target[(clause >> 5) as usize] |= 1 << (clause & 31);
         }
         lane.bitmap.resize(bitmap_words, 0);
-        let changed = !lane.valid || lane.bitmap != target;
+        let changed = lane.needs_bitmap || !lane.valid || lane.bitmap != target;
         let (mode, key, update) = if changed {
             self.next_view_key = self
                 .next_view_key
@@ -1051,7 +1060,7 @@ impl ResidentArena {
                     toggles.push(clause);
                 }
             }
-            if toggles.len() <= bitmap_words {
+            if !lane.needs_bitmap && toggles.len() <= bitmap_words {
                 (ARENA_VIEW_TOGGLE, self.next_view_key, toggles)
             } else {
                 (ARENA_VIEW_BITMAP, self.next_view_key, target.clone())
@@ -1072,6 +1081,7 @@ impl ResidentArena {
         lane.bitmap = target;
         lane.key = key;
         lane.valid = true;
+        lane.needs_bitmap = false;
         Ok(ArenaViewUpdate { words })
     }
 }
@@ -1934,6 +1944,7 @@ impl HardwareCdcl {
                 return Err(HardwareError::InvalidResponse);
             }
             self.arena = candidate;
+            self.arena.mark_mic_lane_clone();
             self.materialized_frame = None;
             Ok(result)
         }
@@ -9171,6 +9182,89 @@ mod tests {
         assert_eq!(growth.words[3], 34);
         assert_eq!(growth.words[4], 0);
         assert_eq!(growth_key, before_growth_key);
+    }
+
+    #[test]
+    fn arena_views_after_mic_force_bitmap_for_same_and_sparse_changed_targets() {
+        // Both targets used to choose unsafe updates after a physical MIC
+        // clone: REUSE for [1], TOGGLE for [1, 32]. Exercise the same helper
+        // called only after solve_arena_mic_chain validates its full response.
+        for active in [vec![1], vec![1, 32]] {
+            let mut arena = ResidentArena {
+                n_var: 1,
+                n_clause: 65,
+                ..ResidentArena::default()
+            };
+            arena.plan_view(0, &[0]).unwrap();
+            arena.plan_view(1, &[1]).unwrap();
+            let lane_zero = arena.lanes[0].clone();
+            let old_key = arena.lanes[1].key;
+            arena.mark_mic_lane_clone();
+            assert_eq!(arena.lanes[0], lane_zero);
+            assert!(arena.lanes[1].needs_bitmap);
+            // A failed plan must not acknowledge a physical resynchronization.
+            assert!(arena.plan_view(1, &[65]).is_err());
+            assert!(arena.lanes[1].needs_bitmap);
+
+            let update = arena.plan_view(1, &active).unwrap();
+            assert_eq!(update.words[0], ARENA_VIEW_BITMAP);
+            assert_eq!(update.words[3], 65);
+            assert_eq!(update.words[4], 3);
+            let expected = if active.len() == 1 {
+                vec![2, 0, 0]
+            } else {
+                vec![2, 1, 0]
+            };
+            assert_eq!(&update.words[ARENA_VIEW_PREFIX_WORDS..], &expected);
+            let new_key = u64::from(update.words[1]) | (u64::from(update.words[2]) << 32);
+            assert!(new_key > old_key);
+            assert!(!arena.lanes[1].needs_bitmap);
+            assert_eq!(arena.lanes[0], lane_zero);
+            let reuse = arena.plan_view(1, &active).unwrap();
+            assert_eq!(
+                reuse.words,
+                vec![ARENA_VIEW_REUSE, new_key as u32, (new_key >> 32) as u32, 65, 0]
+            );
+            assert_eq!(
+                arena.plan_view(0, &[0]).unwrap().words[0],
+                ARENA_VIEW_REUSE
+            );
+            assert_eq!(arena.lanes[0], lane_zero);
+        }
+    }
+
+    #[test]
+    fn arena_views_after_mic_reset_and_failed_candidates_keep_coherence() {
+        let mut arena = ResidentArena {
+            n_var: 1,
+            n_clause: 33,
+            ..ResidentArena::default()
+        };
+        assert!(!arena.lanes[1].needs_bitmap);
+        arena.plan_view(0, &[0]).unwrap();
+        arena.plan_view(1, &[1]).unwrap();
+        arena.mark_mic_lane_clone();
+        let mut candidate = arena.clone();
+        assert_eq!(
+            candidate.plan_view(1, &[1]).unwrap().words[0],
+            ARENA_VIEW_BITMAP
+        );
+        assert!(!candidate.lanes[1].needs_bitmap);
+        assert!(arena.lanes[1].needs_bitmap);
+        // A discarded transport candidate must still force BITMAP next time.
+        assert_eq!(
+            arena.clone().plan_view(1, &[1]).unwrap().words[0],
+            ARENA_VIEW_BITMAP
+        );
+        arena.next_view_key = u64::MAX;
+        assert!(arena.plan_view(1, &[1]).is_err());
+        assert!(arena.lanes[1].needs_bitmap);
+        arena.reset(2);
+        assert_eq!(
+            arena.lanes,
+            [ArenaLaneView::default(), ArenaLaneView::default()]
+        );
+        assert_eq!(arena.next_view_key, 0);
     }
 
     #[test]
