@@ -863,6 +863,161 @@ mod tests {
         }
     }
 
+    // Independent tiny-CNF oracle. A sparse SAT trail must certify every
+    // completion, not merely admit one completion selected by another solver.
+    // For UNSAT, only constraints explicitly retained by the certificate may
+    // be used to establish sufficiency of the returned assumption core.
+    fn check_sequence_answer_by_enumeration(
+        nvar: usize,
+        resident: &[LitVec],
+        query: &IncrementalQuery,
+        result: &IncrementalResult,
+    ) {
+        assert!(nvar <= 8);
+        let literal_true = |mask: usize, literal: logicrs::Lit| {
+            let raw = u32::from(literal) as usize;
+            assert!(raw / 2 < nvar);
+            ((mask >> (raw / 2)) & 1 != 0) == (raw & 1 == 0)
+        };
+        let satisfies = |mask: usize, clauses: &[LitVec], assumptions: &[logicrs::Lit]| {
+            clauses
+                .iter()
+                .all(|clause| clause.iter().any(|&lit| literal_true(mask, lit)))
+                && assumptions.iter().all(|&lit| literal_true(mask, lit))
+        };
+        let mut full = resident.to_vec();
+        full.extend(query.constraints.iter().cloned());
+        let expected_sat =
+            (0..1usize << nvar).any(|mask| satisfies(mask, &full, &query.assumptions));
+        match result {
+            IncrementalResult::Sat { model } => {
+                assert!(expected_sat, "SAT disagrees with exhaustive formula");
+                let mut present = vec![false; nvar];
+                for &literal in model {
+                    let var = (u32::from(literal) / 2) as usize;
+                    assert!(var < nvar && !present[var], "foreign or repeated model variable");
+                    present[var] = true;
+                }
+                let mut completions = 0;
+                for mask in 0..1usize << nvar {
+                    if model.iter().all(|&lit| literal_true(mask, lit)) {
+                        completions += 1;
+                        assert!(
+                            satisfies(mask, &full, &query.assumptions),
+                            "sparse model has a completion violating the queried CNF"
+                        );
+                    }
+                }
+                assert!(completions > 0);
+            }
+            IncrementalResult::Unsat { core, used_constraints } => {
+                assert!(!expected_sat, "UNSAT disagrees with exhaustive formula");
+                for (index, literal) in core.iter().enumerate() {
+                    assert!(query.assumptions.contains(literal));
+                    assert!(!core[..index].contains(literal), "duplicate core literal");
+                }
+                let mut certificate = resident.to_vec();
+                if *used_constraints {
+                    certificate.extend(query.constraints.iter().cloned());
+                }
+                assert!(
+                    !(0..1usize << nvar).any(|mask| satisfies(mask, &certificate, core)),
+                    "reported core/constraint dependency is insufficient"
+                );
+            }
+            IncrementalResult::Unknown(reason) => panic!("unlimited tiny query: {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_temporary_install_failure_cleans_prefix_and_activation() {
+        let mut dc = DagCnf::new();
+        let a = dc.new_var().lit();
+        let b = dc.new_var().lit();
+        let c = dc.new_var().lit();
+        let mut solver = DagCnfSolver::new(&dc);
+        let resident = vec![LitVec::from([!Var(0).lit()]), LitVec::from([a])];
+        for clause in &resident {
+            solver.add_clause(clause);
+        }
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = (0..4).map(Var).collect();
+        // The final root-false clause rejects this round only after two
+        // activation-guarded clauses have already been installed.
+        query.constraints = vec![
+            LitVec::from([b, c]),
+            LitVec::from([!b, c]),
+            LitVec::from([!a]),
+        ];
+        let first = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(4, &resident, &query, &first);
+        assert!(matches!(first, IncrementalResult::Unsat { ref core, used_constraints: true } if core.is_empty()));
+
+        query.constraints.clear();
+        query.assumptions = LitVec::from([!c]);
+        let second = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(4, &resident, &query, &second);
+        assert!(matches!(second, IncrementalResult::Sat { .. }));
+
+        query.assumptions.clear();
+        query.constraints = vec![LitVec::from([b, !c]), LitVec::from([!b, !c])];
+        let third = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(4, &resident, &query, &third);
+        assert!(matches!(third, IncrementalResult::Sat { .. }));
+
+        query.constraints.clear();
+        query.assumptions = LitVec::from([c]);
+        let fourth = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(4, &resident, &query, &fourth);
+        assert!(matches!(fourth, IncrementalResult::Sat { .. }));
+    }
+
+    #[test]
+    fn temporary_solve_then_permanent_append_resets_before_strengthening() {
+        let mut dc = DagCnf::new();
+        let x = dc.new_var().lit();
+        let y = dc.new_var().lit();
+        let z = dc.new_var().lit();
+        let w = dc.new_var().lit();
+        let mut solver = DagCnfSolver::new(&dc);
+        let mut resident = vec![
+            LitVec::from([!Var(0).lit()]),
+            LitVec::from([x, y]),
+            LitVec::from([!x, y]),
+        ];
+        for clause in &resident {
+            solver.add_clause(clause);
+        }
+        let temporary = vec![LitVec::from([z, w]), LitVec::from([!z, w])];
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = (0..5).map(Var).collect();
+        query.constraints = temporary.clone();
+        let first = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(5, &resident, &query, &first);
+        assert!(matches!(first, IncrementalResult::Sat { .. }));
+
+        // No intervening solve/reset: public add_clause must remove the
+        // previous temporary query's assignments before installing !w.
+        let revision = solver.incremental_context_revision();
+        solver.add_clause(&[!w]);
+        resident.push(LitVec::from([!w]));
+        assert_eq!(solver.incremental_context_revision(), revision + 1);
+        query.constraints.clear();
+        let second = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(5, &resident, &query, &second);
+        assert!(matches!(second, IncrementalResult::Sat { .. }));
+
+        query.constraints = temporary;
+        let third = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(5, &resident, &query, &third);
+        assert!(matches!(third, IncrementalResult::Unsat { ref core, used_constraints: true } if core.is_empty()));
+
+        query.constraints.clear();
+        let fourth = solver.solve_incremental(&query);
+        check_sequence_answer_by_enumeration(5, &resident, &query, &fourth);
+        assert!(matches!(fourth, IncrementalResult::Sat { .. }));
+    }
+
     #[test]
     fn cpu_preflight_stops_at_the_conflict_limit() {
         let mut dc = DagCnf::new();
