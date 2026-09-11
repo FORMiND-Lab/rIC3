@@ -525,10 +525,53 @@ fn sum_hardware_work(records: &[HardwareWork]) -> HardwareWork {
         })
 }
 
+/// Validate the trusted scheduled-domain ABI before packing or changing the
+/// resident device context. Do not normalize domains: their order is a search
+/// priority, while duplicate assumptions/opposite polarities remain legal.
+fn validate_query_for_context(n_var: u32, query: &IncrementalQuery) -> Result<(), HardwareError> {
+    if n_var == 0 || n_var > QUALIFIED_ARENA_MAX_VARS
+        || query.domain.len() > n_var as usize
+    {
+        return Err(HardwareError::InvalidContext);
+    }
+    if query.assumptions.iter().any(|literal| u32::from(*literal) >> 1 >= n_var) {
+        return Err(HardwareError::InvalidContext);
+    }
+    u32::try_from(query.assumptions.len()).map_err(|_| HardwareError::Capacity)?;
+    let mut constraint_words = 0usize;
+    for clause in &query.constraints {
+        if clause.is_empty() || clause.iter().any(|literal| u32::from(*literal) >> 1 >= n_var) {
+            return Err(HardwareError::InvalidContext);
+        }
+        constraint_words = constraint_words.checked_add(clause.len())
+            .and_then(|words| words.checked_add(1)).ok_or(HardwareError::Capacity)?;
+    }
+    u32::try_from(constraint_words).map_err(|_| HardwareError::Capacity)?;
+    // Fixed 4 KiB bitset: no hash allocation and no extra hardware loop.
+    let mut seen = [0u64; QUALIFIED_ARENA_MAX_VARS as usize / 64];
+    for variable in &query.domain {
+        let variable = u32::from(*variable);
+        if variable >= n_var {
+            return Err(HardwareError::InvalidContext);
+        }
+        let slot = variable as usize / 64;
+        let bit = 1u64 << (variable % 64);
+        if seen[slot] & bit != 0 {
+            return Err(HardwareError::InvalidContext);
+        }
+        seen[slot] |= bit;
+    }
+    Ok(())
+}
+
 fn pack_batch_request(
+    n_var: u32,
     queries: &[IncrementalQuery],
     want_stage_profile: bool,
 ) -> Result<(Vec<u32>, usize), HardwareError> {
+    for query in queries {
+        validate_query_for_context(n_var, query)?;
+    }
     let result_words = queries
         .iter()
         .try_fold(0usize, |total, query| {
@@ -586,6 +629,7 @@ const QUALIFIED_ARENA_MAX_CLAUSES: usize = 75_000;
 /// each complete query record. The ordinary batch packer remains the single
 /// source of truth for query flags and response capacity.
 fn pack_arena_batch_request(
+    n_var: u32,
     queries: &[IncrementalQuery],
     views: &[ArenaViewUpdate],
     want_stage_profile: bool,
@@ -593,7 +637,7 @@ fn pack_arena_batch_request(
     if queries.is_empty() || queries.len() != views.len() {
         return Err(HardwareError::InvalidContext);
     }
-    let (plain, response_capacity) = pack_batch_request(queries, want_stage_profile)?;
+    let (plain, response_capacity) = pack_batch_request(n_var, queries, want_stage_profile)?;
     let mut payload_words = 0usize;
     for (query, view) in queries.iter().zip(views) {
         let query_words = query_request_words(query).ok_or(HardwareError::Capacity)?;
@@ -651,7 +695,7 @@ fn pack_load_context_and_batch_request(
     let n_clause = u32::try_from(clauses.len()).map_err(|_| HardwareError::Capacity)?;
     let context = pack_clauses(&[n_var, n_clause], n_var, clauses)?;
     let context_words = u32::try_from(context.len()).map_err(|_| HardwareError::Capacity)?;
-    let (batch, response_capacity) = pack_batch_request(queries, want_stage_profile)?;
+    let (batch, response_capacity) = pack_batch_request(n_var, queries, want_stage_profile)?;
     let capacity = 1usize
         .checked_add(context.len())
         .and_then(|words| words.checked_add(batch.len()))
@@ -1286,6 +1330,7 @@ impl HardwareCdcl {
         domain_query.frame = 0;
         domain_query.assumptions.clear();
         domain_query.constraints.clear();
+        validate_query_for_context(self.n_var, &domain_query)?;
         let (domain_header, domain_words) = domain_query.pack();
         if domain_header.n_assumptions != 0
             || domain_header.n_constraint_words != 0
@@ -1397,6 +1442,7 @@ impl HardwareCdcl {
         domain_query.frame = 0;
         domain_query.assumptions.clear();
         domain_query.constraints.clear();
+        validate_query_for_context(self.n_var, &domain_query)?;
         let (domain_header, domain_words) = domain_query.pack();
         if domain_header.n_assumptions != 0
             || domain_header.n_constraint_words != 0
@@ -1703,7 +1749,7 @@ impl HardwareCdcl {
         if self.n_var == 0 {
             return Err(HardwareError::InvalidContext);
         }
-        let (request, response_capacity) = pack_batch_request(queries, self.stage_profile)?;
+        let (request, response_capacity) = pack_batch_request(self.n_var, queries, self.stage_profile)?;
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
         #[cfg(has_cdcl_accel)]
@@ -1790,6 +1836,11 @@ impl HardwareCdcl {
         if queries.is_empty() || contexts.len() != queries.len() {
             return Err(HardwareError::InvalidContext);
         }
+        // Check every logical view before the first LOAD/APPEND. A larger
+        // physical union arena must not make an invalid logical query valid.
+        for (context, query) in contexts.iter().zip(queries) {
+            validate_query_for_context(context.n_var, query)?;
+        }
         let required_n_var = contexts
             .iter()
             .map(|context| context.n_var)
@@ -1835,7 +1886,7 @@ impl HardwareCdcl {
             views.push(candidate.plan_view(index & 1, &active)?);
         }
         let (request, response_capacity) =
-            pack_arena_batch_request(queries, &views, self.stage_profile)?;
+            pack_arena_batch_request(arena_n_var, queries, &views, self.stage_profile)?;
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
         #[cfg(has_cdcl_accel)]
@@ -9031,6 +9082,129 @@ mod tests {
         );
     }
 
+    fn query_admission_hardware(n_var: u32) -> HardwareCdcl {
+        HardwareCdcl {
+            n_var,
+            materialized_frame: Some(7),
+            last_batch_work: HardwareWork::default(),
+            last_batch_records: Vec::new(),
+            stage_profile: false,
+            arena: ResidentArena::default(),
+            full_root_projection: None,
+            next_full_root_projection_handle: 1,
+        }
+    }
+
+    #[test]
+    fn query_admission_preserves_valid_wire_order_and_sat_semantics() {
+        let a = Lit::new(Var::from(0), true);
+        let mut query = IncrementalQuery::new(7, LitVec::from([a, a, !a]));
+        query.domain = vec![Var::from(2), Var::from(0)];
+        query.constraints = vec![LitVec::from([a, a, !a])];
+        query.keep_learnts = false;
+        // Repeated/opposite assumptions and tautological/duplicate clause
+        // literals are legal. Do not silently normalize the input or domain.
+        let (_, before) = query.pack();
+        assert_eq!(validate_query_for_context(4, &query), Ok(()));
+        let (request, _) = pack_batch_request(4, std::slice::from_ref(&query), false).unwrap();
+        let (header, after) = query.pack();
+        assert_eq!(before, after);
+        assert_eq!(&request[4..12], header.as_words().as_slice());
+        assert_eq!(&request[12..], after.as_slice());
+        query.domain.clear();
+        assert_eq!(validate_query_for_context(4, &query), Ok(()));
+    }
+
+    #[test]
+    fn query_admission_checks_exact_schedule_boundaries() {
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = vec![Var::from(32767)];
+        assert_eq!(validate_query_for_context(32768, &query), Ok(()));
+        assert!(pack_batch_request(32768, std::slice::from_ref(&query), false).is_ok());
+        assert_eq!(validate_query_for_context(32767, &query), Err(HardwareError::InvalidContext));
+        query.domain.push(Var::from(32767));
+        assert_eq!(validate_query_for_context(32768, &query), Err(HardwareError::InvalidContext));
+        query.domain = vec![Var::from(32768)];
+        assert_eq!(validate_query_for_context(32768, &query), Err(HardwareError::InvalidContext));
+        assert_eq!(validate_query_for_context(32769, &query), Err(HardwareError::InvalidContext));
+        query.domain.clear();
+        assert_eq!(validate_query_for_context(0, &query), Err(HardwareError::InvalidContext));
+    }
+
+    #[test]
+    fn query_admission_rejects_domain_and_literal_errors_before_batch_dispatch() {
+        let mut valid = IncrementalQuery::new(0, LitVec::new());
+        valid.domain = vec![Var::from(0), Var::from(1)];
+        let mut cases = Vec::new();
+        let mut duplicate = valid.clone();
+        duplicate.domain.push(Var::from(0));
+        cases.push(duplicate);
+        let mut outside = valid.clone();
+        outside.domain.push(Var::from(4));
+        cases.push(outside);
+        let mut assumption = valid.clone();
+        assumption.assumptions.push(Lit::new(Var::from(4), true));
+        cases.push(assumption);
+        let mut constraint = valid.clone();
+        constraint.constraints.push(LitVec::from([Lit::new(Var::from(4), false)]));
+        cases.push(constraint);
+        let mut empty_constraint = valid.clone();
+        empty_constraint.constraints.push(LitVec::new());
+        cases.push(empty_constraint);
+        for bad in cases {
+            let mut hardware = query_admission_hardware(4);
+            assert!(matches!(hardware.solve_batch(&[valid.clone(), bad]), Err(HardwareError::InvalidContext)));
+            assert_eq!(hardware.n_var, 4);
+            assert_eq!(hardware.materialized_frame, Some(7));
+        }
+    }
+
+    #[test]
+    fn query_admission_combined_uses_new_context_before_dispatch() {
+        let mut hardware = query_admission_hardware(8);
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = vec![Var::from(3)];
+        assert!(matches!(hardware.load_context_and_solve_batch(2, &[], &[query]), Err(HardwareError::InvalidContext)));
+        assert_eq!(hardware.n_var, 8);
+        assert_eq!(hardware.materialized_frame, Some(7));
+    }
+
+    #[test]
+    fn query_admission_arena_checks_all_logical_contexts_before_prepare() {
+        let context = ShadowContext {
+            n_var: 2,
+            scope: ShadowContextScope::ExactFrame(0),
+            clauses: vec![],
+        };
+        let mut first = IncrementalQuery::new(0, LitVec::new());
+        first.domain = vec![Var::from(0)];
+        let mut second = first.clone();
+        // Valid in an existing physical arena, invalid in this logical view.
+        second.domain.push(Var::from(3));
+        for arena_n_var in [0, 8] {
+            let mut hardware = query_admission_hardware(8);
+            if arena_n_var != 0 {
+                hardware.arena.reset(arena_n_var);
+            }
+            assert!(matches!(hardware.solve_arena_batch_contexts(
+                &[context.clone(), context.clone()], &[first.clone(), second.clone()]),
+                Err(HardwareError::InvalidContext)));
+            assert_eq!(hardware.n_var, 8);
+            assert_eq!(hardware.materialized_frame, Some(7));
+            assert_eq!(hardware.arena.n_var, arena_n_var);
+        }
+    }
+
+    #[test]
+    fn query_admission_block_templates_reject_duplicate_domain_before_dispatch() {
+        let mut hardware = query_admission_hardware(2);
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = vec![Var::from(0), Var::from(0)];
+        assert!(matches!(hardware.run_block_root(1, 1, &[0, 1], &query), Err(HardwareError::InvalidContext)));
+        assert!(matches!(hardware.run_block_full_root(1, 1, 1, &[0, 1], &[0, 0], &[0], &[1], &query, false, false), Err(HardwareError::InvalidContext)));
+        assert_eq!(hardware.materialized_frame, Some(7));
+    }
+
     #[test]
     fn combined_request_has_exact_context_and_batch_boundaries() {
         let a = Lit::new(Var::from(0), true);
@@ -9039,8 +9213,8 @@ mod tests {
         query.domain = vec![Var::from(0)];
         let queries = [query];
         let context = pack_clauses(&[1, 1], 1, &clauses).unwrap();
-        let (batch, response_capacity) = pack_batch_request(&queries, false).unwrap();
-        let (profile_batch, profile_capacity) = pack_batch_request(&queries, true).unwrap();
+        let (batch, response_capacity) = pack_batch_request(1, &queries, false).unwrap();
+        let (profile_batch, profile_capacity) = pack_batch_request(1, &queries, true).unwrap();
         let (combined, combined_capacity) =
             pack_load_context_and_batch_request(1, &clauses, &queries, false).unwrap();
 
@@ -9282,8 +9456,8 @@ mod tests {
                 words: vec![ARENA_VIEW_REUSE, 7, 0, 3, 0],
             },
         ];
-        let (plain, plain_capacity) = pack_batch_request(&queries, false).unwrap();
-        let (arena, arena_capacity) = pack_arena_batch_request(&queries, &views, false).unwrap();
+        let (plain, plain_capacity) = pack_batch_request(1, &queries, false).unwrap();
+        let (arena, arena_capacity) = pack_arena_batch_request(1, &queries, &views, false).unwrap();
         let first_words = query_request_words(&queries[0]).unwrap();
         let second_words = query_request_words(&queries[1]).unwrap();
 
