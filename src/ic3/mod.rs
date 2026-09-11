@@ -26,6 +26,7 @@ use utils::Statistic;
 mod activity;
 mod auxv;
 mod block;
+mod ctg_native;
 mod frame;
 mod localabs;
 mod mab;

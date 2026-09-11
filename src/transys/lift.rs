@@ -12,6 +12,11 @@ pub struct TsLift {
 }
 
 impl TsLift {
+    /// Read-only native CTG input capture; no domain, watcher or solver mutation.
+    pub(crate) fn capture_transition_snapshot(&self) -> (u32, u32, Vec<LitVec>, Vec<LitVec>) {
+        self.slv.incremental_resident_partition()
+    }
+
     pub fn new(uts: TransysUnroll<Transys>) -> Self {
         let ts = Box::new(uts.compile());
         let slv = DagCnfSolver::new(&ts.rel);

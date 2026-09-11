@@ -1216,6 +1216,25 @@ impl IC3 {
             let parent = GHashSet::from_iter(parent);
             cube.sort_by_key(|x| parent.contains(x));
         }
+        // Opt-in architecture validation: a complete CTG root is executed by
+        // the fixed native resident backend, not by the ordinary CPU drop loop.
+        // Its process-private context cannot contaminate a live device lease.
+        // All records were structurally validated before ANY CPU mutation.
+        let native_ctg = self.try_native_ctg_root(
+            frame, &cube, constraint, parameter.level, parameter.max, parameter.limit,
+        );
+        let mut native_mutations = Vec::new();
+        if let Some(result) = &native_ctg {
+            for lemma in &result.journal {
+                // Exactly once, through the real mutation path: preserves the
+                // already-open outer BLOCK journal and handles subsumption.
+                // This is an internal CTG lemma, not the root proof obligation.
+                self.add_lemma_with_mutations(
+                    lemma.hi, lemma.cube.clone(), false, None, Some(&mut native_mutations),
+                );
+            }
+            cube = result.cube.clone();
+        }
         // Capture the exact formula and the already-ordered CPU traversal.
         // This is a simulation oracle only: it neither enables the hardware
         // MIC path nor changes the cube consumed by the live proof.
@@ -1245,8 +1264,8 @@ impl IC3 {
         // unbudgeted live GipSAT solve proves the complete returned cube before
         // IC3 may adopt it.
         let mic_chain_input_len = cube.len();
-        let mut mic_chain_answered = false;
-        let mut mic_chain_finished = false;
+        let mut mic_chain_answered = native_ctg.is_some();
+        let mut mic_chain_finished = native_ctg.as_ref().is_some_and(|result| result.complete);
         let mut mic_chain_adopted = false;
         let mut mic_chain_cpu_sample = None;
         if parameter.level == 0
@@ -1420,7 +1439,8 @@ impl IC3 {
         // One call for the whole loop. The assumptions and the constraint are
         // both derived from the cube and both change every time it shrinks,
         // which is why this could not be a batch of queries prepared here.
-        if crate::accel::mic_offload() && crate::accel::ready() && crate::accel::have_mic() {
+        if native_ctg.is_none()
+            && crate::accel::mic_offload() && crate::accel::ready() && crate::accel::have_mic() {
             crate::accel::sync_index();
             let mut pairs: Vec<u32> = Vec::with_capacity(cube.len() * 2);
             for l in cube.iter() {
@@ -1459,7 +1479,9 @@ impl IC3 {
 
         let cpu_loop_started = mic_chain_cpu_sample.map(|sample| (sample, Instant::now()));
         let mut i = 0;
+        let mut native_resume_iterations = 0usize;
         while !mic_chain_finished && i < cube.len() {
+            if native_ctg.is_some() { native_resume_iterations += 1; }
             if keep.contains(&cube[i]) {
                 i += 1;
                 continue;
@@ -1534,6 +1556,30 @@ impl IC3 {
             self.solvers[frame - 1].unset_domain();
         }
         crate::accel::cdcl_host::finish_exact_mic_replay(exact_mic_replay, &cube);
+        if let Some(result) = native_ctg {
+            // Diagnostic receipt after real CPU continuation. Not a checker
+            // oracle and never supplied to the native candidate. Audit failure
+            // aborts this opt-in experiment rather than hiding applied effects.
+            let adoption = serde_json::json!({
+                "schema": "inductor.live-ctg-adoption.v1",
+                "hardware": false,
+                "native_complete": result.complete,
+                "journal_applied": result.journal.len(),
+                "native_cube": result.cube.iter().map(|l|u32::from(*l)).collect::<Vec<_>>(),
+                "returned_cube": cube.iter().map(|l|u32::from(*l)).collect::<Vec<_>>(),
+                "cpu_resume_iterations": native_resume_iterations,
+                "mutations": native_mutations.iter().map(|m|serde_json::json!({
+                    "insert":m.insert,"frame":m.frame,
+                    "cube":m.lemma.iter().map(|l|u32::from(*l)).collect::<Vec<_>>()
+                })).collect::<Vec<_>>(),
+                "cpu_validation_solve": false,
+                "resume_may_repeat_queries": !result.complete,
+                "physical_context_reused": false
+            });
+            let file = std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(result.job_dir.join("adoption.json")).expect("native CTG adoption receipt");
+            serde_json::to_writer_pretty(file, &adoption).expect("write native CTG adoption receipt");
+        }
         self.activity.bump_cube_activity(&cube);
         self.statistic.block.mic_time += start.elapsed();
         cube
