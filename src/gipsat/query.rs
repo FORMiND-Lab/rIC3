@@ -802,6 +802,68 @@ mod tests {
     }
 
     #[test]
+    fn root_false_constraints_keep_dependency_in_cpu_certificates() {
+        for preflight in [false, true] {
+            for preceding_queries in [false, true] {
+                let mut dc = DagCnf::new();
+                let a = dc.new_var().lit();
+                let b = dc.new_var().lit();
+                let mut solver = DagCnfSolver::new(&dc);
+                if preceding_queries {
+                    solver.add_clause(&[a, b]);
+                    solver.add_clause(&[!a, b]);
+                    solver.add_clause(&[a, !b]);
+                } else {
+                    solver.add_clause(&[a]);
+                }
+                let solve = |s: &mut DagCnfSolver, q: &IncrementalQuery| {
+                    if preflight {
+                        s.solve_incremental_preflight(q, 100)
+                    } else {
+                        s.solve_incremental(q)
+                    }
+                };
+                let mut query = IncrementalQuery::new(0, LitVec::new());
+                query.domain = (0..solver.num_var()).map(Var::from).collect();
+                if preceding_queries {
+                    query.assumptions = LitVec::from([a]);
+                    assert!(matches!(
+                        solve(&mut solver, &query),
+                        IncrementalResult::Sat { .. }
+                    ));
+                    query.assumptions = LitVec::from([!a]);
+                    assert!(matches!(
+                        solve(&mut solver, &query),
+                        IncrementalResult::Unsat { .. }
+                    ));
+                    query.assumptions.clear();
+                }
+                query.constraints.push(LitVec::from([!a]));
+                let IncrementalResult::Unsat {
+                    core,
+                    used_constraints,
+                } = solve(&mut solver, &query)
+                else {
+                    panic!("root-false temporary constraint must be UNSAT");
+                };
+                assert!(core.is_empty());
+                assert!(
+                    used_constraints,
+                    "empty assumption core still depends on temporary constraints"
+                );
+                assert!(solver.unsat_has(solver.constrain_act.lit()));
+                // The same base formula is SAT without that constraint. The
+                // failed round must not poison the next inquiry or its core.
+                query.constraints.clear();
+                assert!(matches!(
+                    solve(&mut solver, &query),
+                    IncrementalResult::Sat { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn cpu_preflight_stops_at_the_conflict_limit() {
         let mut dc = DagCnf::new();
         let a = dc.new_var().lit();

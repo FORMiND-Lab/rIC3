@@ -394,6 +394,12 @@ impl DagCnfSolver {
                 .fetch_add(probe_dom.ns() as u64, std::sync::atomic::Ordering::Relaxed);
             if !nr_ok {
                 self.unsat_core.clear();
+                // A root-false temporary clause can end new_round before
+                // conflict analysis records its activation dependency. The
+                // base formula alone need not be UNSAT: retain the activation
+                // literal so exported cores cannot claim independence from
+                // the constraints that caused this early contradiction.
+                self.unsat_core.insert(self.constrain_act.lit());
                 self.record_solve_time(start, cpu_start);
                 self.probe.t_setup_ns = probe_setup.ns();
                 self.probe.t_total_ns = probe_total.ns();
