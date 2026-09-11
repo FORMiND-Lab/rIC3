@@ -180,6 +180,11 @@ impl DagCnfSolver {
                         }
                     }
                 }
+                // Empty assumptions skip the loop that initializes the
+                // decision frontier. Do not mistake that empty queue for SAT.
+                if assumption.is_empty() {
+                    self.prepare_vsids();
+                }
                 let probe_de = crate::inductor::Timer::start();
                 let decided = self.decide();
                 crate::inductor::DECIDE_NS
@@ -205,4 +210,86 @@ fn luby(y: f64, mut x: u32) -> f64 {
         x %= size;
     }
     y.powi(seq)
+}
+
+#[cfg(test)]
+mod empty_assumption_tests {
+    use super::DagCnfSolver;
+    use logicrs::satif::Satif;
+    use logicrs::{DagCnf, Lit, Var};
+
+    // DagCnfSolver retains a non-owning pointer. Keep the boxed owner alive
+    // through every query, including after moving this tuple to the caller.
+    fn flat_solver(unsat: bool) -> (Box<DagCnf>, DagCnfSolver, Vec<[Lit; 2]>) {
+        let mut dc = Box::new(DagCnf::new());
+        dc.new_var_to(Var(2));
+        let a = Var(1).lit();
+        let b = Var(2).lit();
+        let mut clauses = vec![[a, b], [a, !b], [!a, b]];
+        if unsat {
+            clauses.push([!a, !b]);
+        }
+        let mut solver = DagCnfSolver::new(&dc);
+        // Match the flat-CNF adapter: variable zero is the explicit false
+        // constant, not a third unconstrained Boolean input.
+        solver.add_clause(&[!Var(0).lit()]);
+        for clause in &clauses {
+            solver.add_clause(clause);
+        }
+        (dc, solver, clauses)
+    }
+
+    fn assert_model(solver: &DagCnfSolver, clauses: &[[Lit; 2]]) {
+        let model: Vec<_> = solver.sat_value_iter().copied().collect();
+        assert!(model.contains(&!Var(0).lit()), "missing explicit false constant");
+        for var in [Var(1), Var(2)] {
+            let positive = model.contains(&var.lit());
+            let negative = model.contains(&!var.lit());
+            assert_ne!(positive, negative, "missing or contradictory model variable {var:?}");
+        }
+        for clause in clauses {
+            assert!(clause.iter().any(|literal| model.contains(literal)),
+                    "SAT witness violates original clause {clause:?}: {model:?}");
+        }
+    }
+
+    #[test]
+    fn empty_assumption_full_domain_nonunit_unsat() {
+        for start in [1, 0] {
+            let (_dc, mut solver, _clauses) = flat_solver(true);
+            assert_eq!(solver.solve_with_param(&[], vec![], (start..=2).map(Var), None),
+                       Some(false), "four nonunit clauses require search, domain start={start}");
+        }
+    }
+
+    #[test]
+    fn empty_assumption_full_domain_nonunit_sat_has_model() {
+        for start in [1, 0] {
+            let (_dc, mut solver, clauses) = flat_solver(false);
+            assert_eq!(solver.solve_with_param(&[], vec![], (start..=2).map(Var), None),
+                       Some(true));
+            // A bare SAT status with an empty decision frontier is insufficient.
+            assert_model(&solver, &clauses);
+        }
+    }
+
+    #[test]
+    fn empty_assumption_same_solver_reinitializes_frontier() {
+        let (_dc, mut solver, clauses) = flat_solver(false);
+        assert_eq!(solver.solve_with_param(&[Var(1).lit()], vec![], (0..=2).map(Var), None),
+                   Some(true));
+        assert_model(&solver, &clauses);
+        // Interleave both full-domain spellings without cloning/reconstructing
+        // the solver: new_round clears the previous query's decision frontier.
+        for start in [1, 0, 1, 0] {
+            assert_eq!(solver.solve_with_param(&[], vec![], (start..=2).map(Var), None),
+                       Some(true));
+            assert_model(&solver, &clauses);
+        }
+        solver.add_clause(&[!Var(1).lit(), !Var(2).lit()]);
+        for start in [1, 0] {
+            assert_eq!(solver.solve_with_param(&[], vec![], (start..=2).map(Var), None),
+                       Some(false), "same solver must see the newly installed fourth clause");
+        }
+    }
 }
