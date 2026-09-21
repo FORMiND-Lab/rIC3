@@ -27,6 +27,7 @@ mod activity;
 mod auxv;
 mod block;
 mod ctg_native;
+mod ctg_hardware;
 mod frame;
 mod localabs;
 mod mab;

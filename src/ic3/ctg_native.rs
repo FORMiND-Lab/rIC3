@@ -52,6 +52,7 @@ fn settings() -> Option<&'static Settings> {
                 // Library search/build paths are not activation switches. All known
                 // hardware/query/root offload entry points must be absent, even =0.
                 for key in [
+                    "INDUCTOR_CTG_HARDWARE_SOCKET",
                     "INDUCTOR_ACCEL",
                 "INDUCTOR_ACTIVE_CDCL",
                 "INDUCTOR_CDCL_ACTIVE",
@@ -154,14 +155,14 @@ fn array<'a>(v: &'a Value, key: &str) -> Result<&'a Vec<Value>> {
         .and_then(Value::as_array)
         .with_context(|| format!("array {key}"))
 }
-fn words(v: &Value) -> Result<Vec<u32>> {
+pub(super) fn words(v: &Value) -> Result<Vec<u32>> {
     let a = v.as_array().context("word array")?;
     ensure!(a.len() <= MAX_LITS, "word array capacity");
     a.iter()
         .map(|x| u32::try_from(x.as_u64().context("word")?).context("u32 word"))
         .collect()
 }
-fn state_cube(v: &Value, input: &Value) -> Result<Vec<u32>> {
+pub(super) fn state_cube(v: &Value, input: &Value) -> Result<Vec<u32>> {
     let c = words(v)?;
     let nv = number(input, "n_var")?;
     let latches = words(&input["latch_variables"])?;
@@ -185,7 +186,7 @@ fn state_cube(v: &Value, input: &Value) -> Result<Vec<u32>> {
     );
     Ok(c)
 }
-fn ordered_subset(cube: &[u32], source: &[u32]) -> bool {
+pub(super) fn ordered_subset(cube: &[u32], source: &[u32]) -> bool {
     let mut next = 0;
     for lit in source {
         if next < cube.len() && cube[next] == *lit {
@@ -194,14 +195,14 @@ fn ordered_subset(cube: &[u32], source: &[u32]) -> bool {
     }
     next == cube.len()
 }
-fn to_litvec(cube: &[u32]) -> LitVec {
+pub(super) fn to_litvec(cube: &[u32]) -> LitVec {
     cube.iter()
         .map(|lit| Lit::new(Var::from((lit >> 1) as usize), lit & 1 == 0))
         .collect()
 }
 
 impl IC3 {
-    fn native_ctg_snapshot(
+    pub(super) fn native_ctg_snapshot(
         &self,
         frame: usize,
         cube: &LitVec,
@@ -466,7 +467,7 @@ impl IC3 {
     }
 }
 
-fn serialize(input: &Value) -> Result<Vec<u8>> {
+pub(super) fn serialize(input: &Value) -> Result<Vec<u8>> {
     let mut out = vec![
         0x43544731u32,
         number(input, "n_var")? as u32,

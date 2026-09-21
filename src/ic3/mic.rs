@@ -1223,12 +1223,26 @@ impl IC3 {
         let native_ctg = self.try_native_ctg_root(
             frame, &cube, constraint, parameter.level, parameter.max, parameter.limit,
         );
+        let hardware_ctg = self.try_hardware_ctg_root(
+            frame, &cube, constraint, parameter.level, parameter.max, parameter.limit,
+        );
+        let ctg_adopted = native_ctg.is_some() || hardware_ctg.is_some();
+        let ctg_complete = native_ctg.as_ref().is_some_and(|r| r.complete)
+            || hardware_ctg.as_ref().is_some_and(|r| r.complete);
         let mut native_mutations = Vec::new();
         if let Some(result) = &native_ctg {
             for lemma in &result.journal {
                 // Exactly once, through the real mutation path: preserves the
                 // already-open outer BLOCK journal and handles subsumption.
                 // This is an internal CTG lemma, not the root proof obligation.
+                self.add_lemma_with_mutations(
+                    lemma.hi, lemma.cube.clone(), false, None, Some(&mut native_mutations),
+                );
+            }
+            cube = result.cube.clone();
+        }
+        if let Some(result) = &hardware_ctg {
+            for lemma in &result.journal {
                 self.add_lemma_with_mutations(
                     lemma.hi, lemma.cube.clone(), false, None, Some(&mut native_mutations),
                 );
@@ -1264,8 +1278,8 @@ impl IC3 {
         // unbudgeted live GipSAT solve proves the complete returned cube before
         // IC3 may adopt it.
         let mic_chain_input_len = cube.len();
-        let mut mic_chain_answered = native_ctg.is_some();
-        let mut mic_chain_finished = native_ctg.as_ref().is_some_and(|result| result.complete);
+        let mut mic_chain_answered = ctg_adopted;
+        let mut mic_chain_finished = ctg_complete;
         let mut mic_chain_adopted = false;
         let mut mic_chain_cpu_sample = None;
         if parameter.level == 0
@@ -1439,7 +1453,7 @@ impl IC3 {
         // One call for the whole loop. The assumptions and the constraint are
         // both derived from the cube and both change every time it shrinks,
         // which is why this could not be a batch of queries prepared here.
-        if native_ctg.is_none()
+        if !ctg_adopted
             && crate::accel::mic_offload() && crate::accel::ready() && crate::accel::have_mic() {
             crate::accel::sync_index();
             let mut pairs: Vec<u32> = Vec::with_capacity(cube.len() * 2);
@@ -1481,7 +1495,7 @@ impl IC3 {
         let mut i = 0;
         let mut native_resume_iterations = 0usize;
         while !mic_chain_finished && i < cube.len() {
-            if native_ctg.is_some() { native_resume_iterations += 1; }
+            if ctg_adopted { native_resume_iterations += 1; }
             if keep.contains(&cube[i]) {
                 i += 1;
                 continue;
@@ -1556,6 +1570,10 @@ impl IC3 {
             self.solvers[frame - 1].unset_domain();
         }
         crate::accel::cdcl_host::finish_exact_mic_replay(exact_mic_replay, &cube);
+        if let Some(result) = hardware_ctg {
+            eprintln!("hardware CTG adoption complete={} journal_applied={} cpu_resume_iterations={} cpu_validation_solve=false",
+                result.complete, result.journal.len(), native_resume_iterations);
+        }
         if let Some(result) = native_ctg {
             // Diagnostic receipt after real CPU continuation. Not a checker
             // oracle and never supplied to the native candidate. Audit failure
