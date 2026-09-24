@@ -1150,6 +1150,82 @@ impl ResidentArena {
         lane.needs_bitmap = false;
         Ok(ArenaViewUpdate { words })
     }
+
+    /// Form the production opcode-8 common-view seed contract. Every command
+    /// re-installs one complete, byte-identical bitmap in q0/q1; only later
+    /// records may reuse that freshly installed key. This is deliberately
+    /// independent of the cached lane state because the persistent dynamic
+    /// kernel releases its per-command view capability at the batch boundary.
+    fn plan_dynamic_batch_views(
+        &mut self,
+        active_by_query: &[Vec<u32>],
+    ) -> Result<Vec<ArenaViewUpdate>, HardwareError> {
+        if active_by_query.is_empty() || self.n_clause == 0 {
+            return Err(HardwareError::InvalidContext);
+        }
+        let bitmap_words =
+            usize::try_from((self.n_clause + 31) / 32).map_err(|_| HardwareError::Capacity)?;
+        let bitmap_for = |active: &[u32]| -> Result<Vec<u32>, HardwareError> {
+            let mut bitmap = vec![0u32; bitmap_words];
+            for &clause in active {
+                if clause >= self.n_clause {
+                    return Err(HardwareError::InvalidContext);
+                }
+                bitmap[(clause >> 5) as usize] |= 1 << (clause & 31);
+            }
+            Ok(bitmap)
+        };
+        let bitmap = bitmap_for(&active_by_query[0])?;
+        for active in &active_by_query[1..] {
+            if bitmap_for(active)? != bitmap {
+                // The qualified production image has one common immutable
+                // clause view per opcode-8 command. Never make distinct IC3
+                // snapshots appear compatible by seeding the wrong bitmap.
+                return Err(HardwareError::InvalidContext);
+            }
+        }
+
+        self.next_view_key = self
+            .next_view_key
+            .checked_add(1)
+            .ok_or(HardwareError::Capacity)?;
+        let key = self.next_view_key;
+        let bitmap_word_count =
+            u32::try_from(bitmap.len()).map_err(|_| HardwareError::Capacity)?;
+        let mut bitmap_words = Vec::with_capacity(ARENA_VIEW_PREFIX_WORDS + bitmap.len());
+        bitmap_words.extend([
+            ARENA_VIEW_BITMAP,
+            key as u32,
+            (key >> 32) as u32,
+            self.n_clause,
+            bitmap_word_count,
+        ]);
+        bitmap_words.extend_from_slice(&bitmap);
+        let reuse_words = vec![
+            ARENA_VIEW_REUSE,
+            key as u32,
+            (key >> 32) as u32,
+            self.n_clause,
+            0,
+        ];
+        let views = (0..active_by_query.len())
+            .map(|index| ArenaViewUpdate {
+                words: if index < 2 {
+                    bitmap_words.clone()
+                } else {
+                    reuse_words.clone()
+                },
+            })
+            .collect();
+
+        for lane in self.lanes.iter_mut().take(active_by_query.len().min(2)) {
+            lane.bitmap = bitmap.clone();
+            lane.key = key;
+            lane.valid = true;
+            lane.needs_bitmap = false;
+        }
+        Ok(views)
+    }
 }
 
 pub struct HardwareCdcl {
@@ -1894,19 +1970,18 @@ impl HardwareCdcl {
             mappings.push(self.prepare_arena_context(context)?);
         }
         let mut candidate = self.arena.clone();
-        let mut views = Vec::with_capacity(queries.len());
-        for (index, ((context, mapping), query)) in normalized_contexts
+        let mut active_by_query = Vec::with_capacity(queries.len());
+        for ((context, mapping), query) in normalized_contexts
             .iter()
             .zip(mappings.iter())
             .zip(queries.iter())
-            .enumerate()
         {
-            let active = mapping.active(
+            active_by_query.push(mapping.active(
                 query.frame,
                 context.scope == ShadowContextScope::FrameRanged,
-            );
-            views.push(candidate.plan_view(index & 1, &active)?);
+            ));
         }
+        let views = candidate.plan_dynamic_batch_views(&active_by_query)?;
         let (request, response_capacity) =
             pack_arena_batch_request(arena_n_var, queries, &views, self.stage_profile)?;
         let response_capacity_u32 =
@@ -9381,6 +9456,117 @@ mod tests {
         assert_eq!(growth.words[3], 34);
         assert_eq!(growth.words[4], 0);
         assert_eq!(growth_key, before_growth_key);
+    }
+
+    #[test]
+    fn consecutive_dynamic_batches_reseed_both_lanes_for_production_builder() {
+        fn production_builder_status(
+            request: &[u32],
+            queries: &[IncrementalQuery],
+            n_clause: u32,
+        ) -> i32 {
+            const PERSISTENT_UNSUPPORTED: i32 = -40;
+            let bitmap_words = n_clause.div_ceil(32) as usize;
+            let mut at = 4usize;
+            let mut seed: Option<&[u32]> = None;
+            for (index, query) in queries.iter().enumerate() {
+                let Some(prefix) = request.get(at..at + ARENA_VIEW_PREFIX_WORDS) else {
+                    return PERSISTENT_UNSUPPORTED;
+                };
+                let update_words = prefix[4] as usize;
+                let Some(update) = request.get(
+                    at + ARENA_VIEW_PREFIX_WORDS
+                        ..at + ARENA_VIEW_PREFIX_WORDS + update_words,
+                ) else {
+                    return PERSISTENT_UNSUPPORTED;
+                };
+                if index < 2 {
+                    if prefix[0] != ARENA_VIEW_BITMAP
+                        || prefix[3] != n_clause
+                        || update_words != bitmap_words
+                    {
+                        return PERSISTENT_UNSUPPORTED;
+                    }
+                    if let Some(first) = seed {
+                        if prefix[1..] != request[4 + 1..4 + ARENA_VIEW_PREFIX_WORDS]
+                            || update != first
+                        {
+                            return PERSISTENT_UNSUPPORTED;
+                        }
+                    } else {
+                        seed = Some(update);
+                    }
+                } else if prefix[0] != ARENA_VIEW_REUSE
+                    || prefix[1] != request[5]
+                    || prefix[2] != request[6]
+                    || prefix[3] != n_clause
+                    || update_words != 0
+                {
+                    return PERSISTENT_UNSUPPORTED;
+                }
+                let Some(query_words) = query_request_words(query) else {
+                    return PERSISTENT_UNSUPPORTED;
+                };
+                at += ARENA_VIEW_PREFIX_WORDS + update_words + query_words;
+            }
+            if at == request.len() { 0 } else { PERSISTENT_UNSUPPORTED }
+        }
+
+        let mut arena = ResidentArena {
+            n_var: 2,
+            n_clause: 33,
+            ..ResidentArena::default()
+        };
+        let mut query = IncrementalQuery::new(0, LitVec::new());
+        query.domain = vec![Var::from(0)];
+        let queries = vec![query; 4];
+        let active = vec![vec![0, 32]; queries.len()];
+
+        let first_views = arena.plan_dynamic_batch_views(&active).unwrap();
+        let (first_request, _) =
+            pack_arena_batch_request(arena.n_var, &queries, &first_views, false).unwrap();
+        assert_eq!(production_builder_status(&first_request, &queries, arena.n_clause), 0);
+        assert_eq!(first_views[0].words, first_views[1].words);
+        assert!(first_views[..2]
+            .iter()
+            .all(|view| view.words[0] == ARENA_VIEW_BITMAP));
+        assert!(first_views[2..]
+            .iter()
+            .all(|view| view.words[0] == ARENA_VIEW_REUSE));
+
+        let first_key = u64::from(first_views[0].words[1])
+            | (u64::from(first_views[0].words[2]) << 32);
+        let second_views = arena.plan_dynamic_batch_views(&active).unwrap();
+        let (second_request, _) =
+            pack_arena_batch_request(arena.n_var, &queries, &second_views, false).unwrap();
+        assert_eq!(production_builder_status(&second_request, &queries, arena.n_clause), 0);
+        assert_eq!(second_views[0].words, second_views[1].words);
+        assert!(second_views[..2]
+            .iter()
+            .all(|view| view.words[0] == ARENA_VIEW_BITMAP));
+        assert!(second_views[2..]
+            .iter()
+            .all(|view| view.words[0] == ARENA_VIEW_REUSE));
+        let second_key = u64::from(second_views[0].words[1])
+            | (u64::from(second_views[0].words[2]) << 32);
+        assert!(second_key > first_key);
+        assert_eq!(arena.lanes[0], arena.lanes[1]);
+    }
+
+    #[test]
+    fn dynamic_common_view_rejects_distinct_query_bitmaps_without_mutation() {
+        let mut arena = ResidentArena {
+            n_var: 2,
+            n_clause: 2,
+            ..ResidentArena::default()
+        };
+        let before = arena.clone();
+        assert!(matches!(
+            arena.plan_dynamic_batch_views(&[vec![0], vec![1]]),
+            Err(HardwareError::InvalidContext)
+        ));
+        assert_eq!(arena.lanes, before.lanes);
+        assert_eq!(arena.next_view_key, before.next_view_key);
     }
 
     #[test]
