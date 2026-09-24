@@ -3112,6 +3112,11 @@ static PROFILE_MAX_CONTEXT_CLAUSES: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MAX_CONTEXT_LITS: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_SHADOW_BATCH_SIZE: usize = 64;
+// The production opcode-8 dual-lane engine has eight physical response slots.
+// Larger logical frontiers must be split before they reach the persistent
+// dynamic-only host: its preflight correctly returns -40 (unsupported) rather
+// than leaking the request into the absent legacy datapath.
+const PERSISTENT_DYNAMIC_MAX_BATCH_SIZE: usize = 8;
 const KERNEL_MAX_REQUEST_WORDS: usize = 1 << 15;
 const DEFAULT_FULL_ROOT_MAX_RESPONSE_WORDS: usize = 1 << 16;
 const DEFAULT_SHADOW_CONFLICT_BUDGET: u32 = 3;
@@ -3366,14 +3371,23 @@ fn shadow_batch_size() -> usize {
     })
 }
 
+fn active_batch_size_for_mode(requested: usize, arena_views: bool) -> usize {
+    if arena_views {
+        requested.min(PERSISTENT_DYNAMIC_MAX_BATCH_SIZE)
+    } else {
+        requested
+    }
+}
+
 fn active_batch_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        std::env::var("INDUCTOR_CDCL_ACTIVE_BATCH")
+        let requested = std::env::var("INDUCTOR_CDCL_ACTIVE_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .map(|value| value.clamp(1, DEFAULT_SHADOW_BATCH_SIZE))
-            .unwrap_or(DEFAULT_SHADOW_BATCH_SIZE)
+            .unwrap_or(DEFAULT_SHADOW_BATCH_SIZE);
+        active_batch_size_for_mode(requested, active_arena_views_enabled())
     })
 }
 
@@ -9121,6 +9135,25 @@ mod tests {
         let capped = plan_full_batch_ranges(&vec![10; 12], 4, 8, 54);
         assert_eq!(capped, vec![0..4, 4..8, 8..12]);
         assert!(capped.iter().all(|range| range.len() >= 4));
+    }
+
+    #[test]
+    fn production_dynamic_mode_caps_frontiers_at_physical_slot_count() {
+        assert_eq!(active_batch_size_for_mode(64, true), 8);
+        assert_eq!(active_batch_size_for_mode(8, true), 8);
+        assert_eq!(active_batch_size_for_mode(7, true), 7);
+        assert_eq!(active_batch_size_for_mode(64, false), 64);
+
+        let ranges = plan_full_batch_ranges(
+            &vec![1; 29],
+            1,
+            active_batch_size_for_mode(64, true),
+            32_768,
+        );
+        assert_eq!(ranges, vec![0..8, 8..16, 16..24, 24..29]);
+        assert!(ranges
+            .iter()
+            .all(|range| range.len() <= PERSISTENT_DYNAMIC_MAX_BATCH_SIZE));
     }
 
     #[test]
