@@ -115,6 +115,28 @@ unsafe extern "C" {
         out_response_words: *mut u32,
     ) -> i32;
     fn ind_cdcl_total_kernel_ns() -> u64;
+    fn ind_cdcl_get_service_stats(out: *mut ServiceStats) -> i32;
+}
+
+#[cfg(has_cdcl_accel)]
+#[repr(C)]
+#[derive(Default)]
+struct ServiceStats {
+    version: u32,
+    client_service_ns: u64,
+    device_service_ns: u64,
+}
+
+#[cfg(has_cdcl_accel)]
+fn rpc_service_ns() -> Option<u64> {
+    let mut stats = ServiceStats::default();
+    (unsafe { ind_cdcl_get_service_stats(&mut stats) } == 0 && stats.version == 1)
+        .then_some(stats.client_service_ns)
+}
+
+#[cfg(not(has_cdcl_accel))]
+fn rpc_service_ns() -> Option<u64> {
+    None
 }
 
 #[cfg(has_cdcl_accel)]
@@ -8217,8 +8239,9 @@ pub fn flush_and_report() {
         // record. The matrix runner aggregates one compact line per selected
         // FPGA worker.
         let (root_waves, root_work, root_service_ns) = super::block_controller_sim::root_metrics();
+        let rpc_service_ns = rpc_service_ns();
         let qualification = format!(
-            "inductor-cdcl: qualification worker={} transport_attempted={} transport_unavailable={} hardware_disabled={} disable_count={} candidates={} batches={} hw_sat={} hw_unsat={} hw_unknown={} hw_errors={} batch_service_ms={:.3} mic_service_ms={:.3} root_waves={} root_work={} root_service_ms={:.3} block_conclusive={} block_used={} push_conclusive={} push_used={} cpu_fallback={} trusted_sat={} trusted_unsat={} trusted_rejected={} stale_sat={}\n",
+            "inductor-cdcl: qualification worker={} transport_attempted={} transport_unavailable={} hardware_disabled={} disable_count={} candidates={} batches={} hw_sat={} hw_unsat={} hw_unknown={} hw_errors={} batch_service_ms={:.3} mic_service_ms={:.3} root_waves={} root_work={} root_service_ms={:.3} device_service_available={} device_service_ms={:.3} block_conclusive={} block_used={} push_conclusive={} push_used={} cpu_fallback={} trusted_sat={} trusted_unsat={} trusted_rejected={} stale_sat={}\n",
             std::env::var("INDUCTOR_CDCL_PORTFOLIO_WORKER")
                 .unwrap_or_else(|_| "standalone".to_string()),
             ACTIVE_INIT_NS.load(Ordering::Relaxed) != 0,
@@ -8236,6 +8259,8 @@ pub fn flush_and_report() {
             root_waves,
             root_work,
             root_service_ns as f64 / 1_000_000.0,
+            rpc_service_ns.is_some(),
+            rpc_service_ns.unwrap_or(0) as f64 / 1_000_000.0,
             block_conclusive,
             block_used,
             push_conclusive,
