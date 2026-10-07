@@ -11,6 +11,9 @@
 
 /// Increment when a header or payload changes incompatibly.
 pub const ABI_VERSION: u32 = 2;
+/// RUN_BATCH request version carrying one bank-aligned decision domain before
+/// query-private records. Query and response records remain ABI v2.
+pub const SHARED_DOMAIN_BATCH_VERSION: u32 = 3;
 
 /// Return a sparse model over the variables assigned by the search.
 pub const WANT_MODEL: u32 = 1 << 0;

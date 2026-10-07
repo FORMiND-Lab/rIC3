@@ -27,6 +27,7 @@ pub use query::{
     bank_aligned_domain_enabled, decode_batch_results, encoded_domain_words, pack_batch,
     solve_on_cpu_after_hardware_unknown, solve_with_cpu_fallback,
 };
+pub(crate) use query::pack_batch_with_domain_mode;
 use rand::RngExt;
 use rand::{SeedableRng, rngs::SmallRng};
 use simplify::Simplify;

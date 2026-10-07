@@ -15,7 +15,8 @@ use super::cdcl::{
     PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
     PROFILE_OCCURRENCE_UPDATES, PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
     PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
-    RESPONSE_HEADER_WORDS, STAGE_PROFILE_COUNTERS, STAGE_PROFILE_MAGIC,
+    QUERY_HEADER_WORDS, QueryHeader, RESPONSE_HEADER_WORDS, SHARED_DOMAIN_BATCH_VERSION,
+    STAGE_PROFILE_COUNTERS, STAGE_PROFILE_MAGIC,
     STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
     UnknownReason, WANT_STAGE_PROFILE, block_full_root_required_response_capacity,
     decode_block_full_root_response, decode_block_root_response,
@@ -26,7 +27,7 @@ use super::cdcl::{
 use crate::gipsat::decode_batch_results;
 use crate::gipsat::{
     BatchDecodeError, DagCnfSolver, IncrementalCdcl, IncrementalQuery, IncrementalResult,
-    QueryBudget, bank_aligned_domain_enabled, encoded_domain_words, pack_batch,
+    QueryBudget, bank_aligned_domain_enabled, encoded_domain_words, pack_batch_with_domain_mode,
     solve_on_cpu_after_hardware_unknown,
 };
 use logicrs::{Lit, LitVec, Var};
@@ -591,14 +592,33 @@ fn pack_batch_request(
     queries: &[IncrementalQuery],
     want_stage_profile: bool,
 ) -> Result<(Vec<u32>, usize), HardwareError> {
+    pack_batch_request_with_domain_mode(
+        n_var,
+        queries,
+        want_stage_profile,
+        bank_aligned_domain_enabled(),
+    )
+}
+
+fn pack_batch_request_with_domain_mode(
+    n_var: u32,
+    queries: &[IncrementalQuery],
+    want_stage_profile: bool,
+    bank_aligned: bool,
+) -> Result<(Vec<u32>, usize), HardwareError> {
     for query in queries {
         validate_query_for_context(n_var, query)?;
     }
     let result_words = queries
         .iter()
         .try_fold(0usize, |total, query| {
+            let domain_words = if bank_aligned {
+                query.pack_with_domain_mode(true).0.n_domain as usize
+            } else {
+                query.domain.len()
+            };
             let record = RESPONSE_HEADER_WORDS
-                .checked_add(encoded_domain_words(&query.domain).max(query.assumptions.len()))?
+                .checked_add(domain_words.max(query.assumptions.len()))?
                 .checked_add(if want_stage_profile {
                     STAGE_PROFILE_WORDS
                 } else {
@@ -608,13 +628,17 @@ fn pack_batch_request(
         })
         .ok_or(HardwareError::Capacity)?;
     let result_words_u32 = u32::try_from(result_words).map_err(|_| HardwareError::Capacity)?;
-    let (batch, mut payload) = pack_batch(queries, result_words_u32);
+    let (batch, mut payload) =
+        pack_batch_with_domain_mode(queries, result_words_u32, bank_aligned);
     if want_stage_profile {
         let mut offset = 0usize;
         for query in queries {
             payload[offset + 2] |= WANT_STAGE_PROFILE;
+            let query_words = QUERY_HEADER_WORDS
+                .checked_add(query.pack_with_domain_mode(bank_aligned).1.len())
+                .ok_or(HardwareError::Capacity)?;
             offset = offset
-                .checked_add(query_request_words(query).ok_or(HardwareError::Capacity)?)
+                .checked_add(query_words)
                 .ok_or(HardwareError::Capacity)?;
         }
         if offset != payload.len() {
@@ -634,6 +658,175 @@ fn pack_batch_request(
     let response_capacity = result_words.checked_add(4).ok_or(HardwareError::Capacity)?;
     u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
     Ok((request, response_capacity))
+}
+
+/// Pack ABI-v3 RUN_BATCH with one bank-aligned domain shared by every query.
+/// `Ok(None)` means that the exact same query vector must use ABI-v2 instead.
+fn pack_shared_domain_batch_request(
+    n_var: u32,
+    queries: &[IncrementalQuery],
+    want_stage_profile: bool,
+    bank_aligned: bool,
+) -> Result<Option<(Vec<u32>, usize)>, HardwareError> {
+    if !bank_aligned
+        || !(2..=PERSISTENT_DYNAMIC_MAX_BATCH_SIZE).contains(&queries.len())
+        || queries[0].domain.is_empty()
+        || queries[1..]
+            .iter()
+            .any(|query| query.domain != queries[0].domain)
+    {
+        return Ok(None);
+    }
+    for query in queries {
+        validate_query_for_context(n_var, query)?;
+    }
+
+    let packed: Vec<_> = queries
+        .iter()
+        .map(|query| query.pack_with_domain_mode(true))
+        .collect();
+    let shared_domain_words = packed[0].0.n_domain as usize;
+    if shared_domain_words == 0 || shared_domain_words & 3 != 0 {
+        return Ok(None);
+    }
+    let first_private_words = packed[0].0.n_assumptions as usize
+        + packed[0].0.n_constraint_words as usize;
+    let Some(shared_domain) = packed[0].1.get(first_private_words..) else {
+        return Err(HardwareError::InvalidContext);
+    };
+    if shared_domain.len() != shared_domain_words {
+        return Err(HardwareError::InvalidContext);
+    }
+
+    let mut result_words = 0usize;
+    let mut body_words = 1usize
+        .checked_add(shared_domain_words)
+        .ok_or(HardwareError::Capacity)?;
+    for (query, (header, payload)) in queries.iter().zip(&packed) {
+        if header.version != ABI_VERSION
+            || header.flags & BANK_ALIGNED_DOMAIN == 0
+            || header.n_domain as usize != shared_domain_words
+        {
+            return Ok(None);
+        }
+        let private_words = header.n_assumptions as usize
+            + header.n_constraint_words as usize;
+        if payload.len() != private_words + shared_domain_words
+            || payload.get(private_words..) != Some(shared_domain)
+        {
+            return Ok(None);
+        }
+        body_words = body_words
+            .checked_add(QUERY_HEADER_WORDS)
+            .and_then(|words| words.checked_add(private_words))
+            .ok_or(HardwareError::Capacity)?;
+        result_words = result_words
+            .checked_add(RESPONSE_HEADER_WORDS)
+            .and_then(|words| {
+                words.checked_add(shared_domain_words.max(query.assumptions.len()))
+            })
+            .and_then(|words| {
+                words.checked_add(if want_stage_profile {
+                    STAGE_PROFILE_WORDS
+                } else {
+                    0
+                })
+            })
+            .ok_or(HardwareError::Capacity)?;
+    }
+    let total_words = 4usize
+        .checked_add(body_words)
+        .ok_or(HardwareError::Capacity)?;
+    if total_words > KERNEL_MAX_REQUEST_WORDS
+        || body_words > u32::MAX as usize
+        || result_words > u32::MAX as usize
+    {
+        return Ok(None);
+    }
+
+    let mut request = Vec::with_capacity(total_words);
+    request.extend([
+        SHARED_DOMAIN_BATCH_VERSION,
+        queries.len() as u32,
+        body_words as u32,
+        result_words as u32,
+    ]);
+    request.push(shared_domain_words as u32);
+    request.extend_from_slice(shared_domain);
+    for (header, payload) in &packed {
+        let mut header = *header;
+        if want_stage_profile {
+            header.flags |= WANT_STAGE_PROFILE;
+        }
+        request.extend(header.as_words());
+        let private_words = header.n_assumptions as usize
+            + header.n_constraint_words as usize;
+        request.extend_from_slice(&payload[..private_words]);
+    }
+    debug_assert_eq!(request.len(), total_words);
+    let response_capacity = result_words.checked_add(4).ok_or(HardwareError::Capacity)?;
+    Ok(Some((request, response_capacity)))
+}
+
+fn pack_run_batch_request_with_mode(
+    n_var: u32,
+    queries: &[IncrementalQuery],
+    want_stage_profile: bool,
+    shared_domain: bool,
+    bank_aligned: bool,
+) -> Result<(Vec<u32>, usize), HardwareError> {
+    if shared_domain
+        && let Some(packed) = pack_shared_domain_batch_request(
+            n_var,
+            queries,
+            want_stage_profile,
+            bank_aligned,
+        )?
+    {
+        return Ok(packed);
+    }
+    pack_batch_request_with_domain_mode(
+        n_var,
+        queries,
+        want_stage_profile,
+        bank_aligned,
+    )
+}
+
+fn pack_run_batch_request(
+    n_var: u32,
+    queries: &[IncrementalQuery],
+    want_stage_profile: bool,
+) -> Result<(Vec<u32>, usize), HardwareError> {
+    pack_run_batch_request_with_mode(
+        n_var,
+        queries,
+        want_stage_profile,
+        shared_domain_projection_enabled(),
+        bank_aligned_domain_enabled(),
+    )
+}
+
+/// Whether `solve_batch` will place this exact query vector on ABI v3.  A
+/// combined LOAD_CONTEXT_AND_RUN_BATCH command deliberately embeds ABI v2,
+/// so callers must split LOAD from RUN whenever this returns true.
+fn run_batch_uses_shared_domain_wire_with_mode(
+    n_var: u32,
+    queries: &[IncrementalQuery],
+    want_stage_profile: bool,
+    shared_domain: bool,
+    bank_aligned: bool,
+) -> Result<bool, HardwareError> {
+    if !shared_domain {
+        return Ok(false);
+    }
+    Ok(pack_shared_domain_batch_request(
+        n_var,
+        queries,
+        want_stage_profile,
+        bank_aligned,
+    )?
+    .is_some())
 }
 
 const ARENA_VIEW_PREFIX_WORDS: usize = 5;
@@ -1847,7 +2040,8 @@ impl HardwareCdcl {
         if self.n_var == 0 {
             return Err(HardwareError::InvalidContext);
         }
-        let (request, response_capacity) = pack_batch_request(self.n_var, queries, self.stage_profile)?;
+        let (request, response_capacity) =
+            pack_run_batch_request(self.n_var, queries, self.stage_profile)?;
         let response_capacity_u32 =
             u32::try_from(response_capacity).map_err(|_| HardwareError::Capacity)?;
         #[cfg(has_cdcl_accel)]
@@ -4017,10 +4211,9 @@ fn plan_full_batch_ranges(
     ranges
 }
 
-/// Architecture-only planner for an ABI where one identical decision domain
-/// is carried once per batch instead of once per query. It does not alter the
-/// production request. Live native/board telemetry uses it to decide whether
-/// implementing the new wire command is worth an HLS iteration.
+/// Plan ABI-v3 batches where one identical decision domain is carried once
+/// before all query-private records. The same routine also drives projection
+/// telemetry for arena-view experiments.
 fn plan_shared_domain_batch_ranges(
     domains: &[&[Var]],
     query_words: &[usize],
@@ -4028,11 +4221,12 @@ fn plan_shared_domain_batch_ranges(
     max_batch: usize,
     max_words: usize,
 ) -> Vec<std::ops::Range<usize>> {
+    let min_batch = min_batch.max(2);
     if domains.len() != query_words.len()
         || domains.is_empty()
         || min_batch == 0
         || min_batch > max_batch
-        || max_words < 4
+        || max_words < 5
     {
         return Vec::new();
     }
@@ -4044,7 +4238,9 @@ fn plan_shared_domain_batch_ranges(
         covered[start] = covered[start + 1];
         batches[start] = batches[start + 1];
         let shared_domain_words = encoded_domain_words(domains[start]);
-        let Some(mut words) = 4usize.checked_add(shared_domain_words) else {
+        // Four-word batch header, one shared-domain extent word, then the
+        // bank-aligned domain and query-private records.
+        let Some(mut words) = 5usize.checked_add(shared_domain_words) else {
             continue;
         };
         let limit = n_query.min(start.saturating_add(max_batch));
@@ -4090,6 +4286,48 @@ fn plan_shared_domain_batch_ranges(
             start += count;
         }
     }
+    ranges
+}
+
+/// Keep ABI-v2 planning intact for every gap that cannot use ABI v3. Shared
+/// ranges are already sorted and disjoint because both planners preserve
+/// caller order.
+fn plan_batch_ranges_with_shared_domain_fallback(
+    shared_ranges: &[std::ops::Range<usize>],
+    query_words: &[usize],
+    min_batch: usize,
+    max_batch: usize,
+    max_words: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    for shared in shared_ranges {
+        if shared.start < cursor || shared.end > query_words.len() || shared.start >= shared.end {
+            return plan_full_batch_ranges(query_words, min_batch, max_batch, max_words);
+        }
+        ranges.extend(
+            plan_full_batch_ranges(
+                &query_words[cursor..shared.start],
+                min_batch,
+                max_batch,
+                max_words,
+            )
+            .into_iter()
+            .map(|range| cursor + range.start..cursor + range.end),
+        );
+        ranges.push(shared.clone());
+        cursor = shared.end;
+    }
+    ranges.extend(
+        plan_full_batch_ranges(
+            &query_words[cursor..],
+            min_batch,
+            max_batch,
+            max_words,
+        )
+        .into_iter()
+        .map(|range| cursor + range.start..cursor + range.end),
+    );
     ranges
 }
 
@@ -7156,9 +7394,9 @@ fn solve_active_batch_reporting(
     // those diagnostic streams on their original grouping even if the arena
     // flag is present; production active mode can carry one context per query.
     let arena_views = active_arena_views_enabled() && !trace_only;
-    // Keep the measured production path unchanged until the shared-domain ABI
-    // closes the queue-economics gate. The projection flag opts into the
-    // prerequisite cross-snapshot merge automatically for native simulation.
+    // Arena views carry query-local contexts and therefore keep their existing
+    // cross-snapshot grouping. Ordinary active batches may use ABI v3 when the
+    // projection feature and bank-aligned domain encoding are both enabled.
     let merge_contexts = arena_views && cross_context_batch_enabled();
     for (index, (solver, query)) in requests.iter().enumerate() {
         if !selected[index] {
@@ -7221,7 +7459,12 @@ fn solve_active_batch_reporting(
                 }
             })
             .collect();
-        if merge_contexts && shared_domain_projection_enabled() {
+        let shared_domain_wire = !arena_views
+            && shared_domain_projection_enabled()
+            && bank_aligned_domain_enabled();
+        let projected = if shared_domain_wire
+            || merge_contexts && shared_domain_projection_enabled()
+        {
             let domains: Vec<&[Var]> = group
                 .pending
                 .iter()
@@ -7231,7 +7474,7 @@ fn solve_active_batch_reporting(
                 &domains,
                 &query_words,
                 min_batch_size,
-                active_batch_size(),
+                active_batch_size().min(PERSISTENT_DYNAMIC_MAX_BATCH_SIZE),
                 KERNEL_MAX_REQUEST_WORDS,
             );
             let projected_queries = projected.iter().map(|range| range.len()).sum::<usize>();
@@ -7247,13 +7490,26 @@ fn solve_active_batch_reporting(
                 .fetch_add(projected.len() as u64, Ordering::Relaxed);
             ACTIVE_SHARED_DOMAIN_PROJECTED_SAVED_WORDS
                 .fetch_add(saved_words as u64, Ordering::Relaxed);
-        }
-        group.batches = plan_full_batch_ranges(
-            &query_words,
-            min_batch_size,
-            active_batch_size(),
-            KERNEL_MAX_REQUEST_WORDS,
-        );
+            Some(projected)
+        } else {
+            None
+        };
+        group.batches = if shared_domain_wire {
+            plan_batch_ranges_with_shared_domain_fallback(
+                projected.as_deref().unwrap_or_default(),
+                &query_words,
+                min_batch_size,
+                active_batch_size(),
+                KERNEL_MAX_REQUEST_WORDS,
+            )
+        } else {
+            plan_full_batch_ranges(
+                &query_words,
+                min_batch_size,
+                active_batch_size(),
+                KERNEL_MAX_REQUEST_WORDS,
+            )
+        };
         let group_planned: usize = group.batches.iter().map(|range| range.len()).sum();
         ACTIVE_SKIPPED_SMALL_BATCH.fetch_add(
             group.pending.len().saturating_sub(group_planned) as u64,
@@ -7445,6 +7701,69 @@ fn execute_prepared_active_batch(
                         state.loaded_context = None;
                     }
                 }
+            }
+            // LOAD_CONTEXT_AND_RUN_BATCH has an intentionally frozen ABI-v2
+            // inner payload.  A large common domain can make a planned batch
+            // fit only after ABI-v3 compression; attempting the combined
+            // command first would then report Capacity and permanently
+            // disable this otherwise supported hardware path.  Load the
+            // context separately so the following solve_batch emits v3.
+            let split_shared_domain_load = if !context_ready && !arena_views {
+                state
+                    .hardware
+                    .as_ref()
+                    .ok_or(HardwareError::Unavailable)
+                    .and_then(|hardware| {
+                        run_batch_uses_shared_domain_wire_with_mode(
+                            group.context.n_var,
+                            &queries,
+                            hardware.stage_profile,
+                            shared_domain_projection_enabled(),
+                            bank_aligned_domain_enabled(),
+                        )
+                    })
+            } else {
+                Ok(false)
+            };
+            if !context_ready && matches!(split_shared_domain_load, Ok(true)) {
+                let load_start = std::time::Instant::now();
+                let kernel_before = direct_kernel_ns();
+                let loaded = state
+                    .hardware
+                    .as_mut()
+                    .ok_or(HardwareError::Unavailable)
+                    .and_then(|hardware| {
+                        hardware.load_context(group.context.n_var, &group.context.clauses)
+                    });
+                ACTIVE_CONTEXT_LOAD_KERNEL_NS.fetch_add(
+                    direct_kernel_ns().saturating_sub(kernel_before),
+                    Ordering::Relaxed,
+                );
+                context_load_ns =
+                    load_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                ACTIVE_CONTEXT_LOAD_NS.fetch_add(context_load_ns, Ordering::Relaxed);
+                match loaded {
+                    Ok(()) => {
+                        ACTIVE_CONTEXT_LOADS.fetch_add(1, Ordering::Relaxed);
+                        context_ready = true;
+                        state.loaded_context = Some(LoadedContext::from(&group.context));
+                    }
+                    Err(error) => {
+                        eprintln!("inductor-cdcl: shared-domain context load failed: {error}");
+                        ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                        state.loaded_context = None;
+                        disable_active_hardware(&error);
+                        break 'groups;
+                    }
+                }
+            } else if let Err(error) = split_shared_domain_load {
+                eprintln!("inductor-cdcl: shared-domain batch validation failed: {error}");
+                ACTIVE_ERROR.fetch_add((end - start) as u64, Ordering::Relaxed);
+                state.loaded_context = None;
+                if deterministic_active_failure(&error) {
+                    disable_active_hardware(&error);
+                }
+                break 'groups;
             }
             if !context_ready {
                 let combined_start = std::time::Instant::now();
@@ -8562,7 +8881,7 @@ pub fn flush_and_report() {
             let projected_queries = ACTIVE_SHARED_DOMAIN_PROJECTED_QUERIES.load(Ordering::Relaxed);
             let projected_batches = ACTIVE_SHARED_DOMAIN_PROJECTED_BATCHES.load(Ordering::Relaxed);
             eprintln!(
-                "inductor-cdcl: shared-domain ABI projection queries/batches/fill {}/{}/{:.3}, repeated request words removed {} (planning only; production wire unchanged)",
+                "inductor-cdcl: shared-domain ABI v3 eligible queries/batches/fill {}/{}/{:.3}, repeated request words removed {}",
                 projected_queries,
                 projected_batches,
                 projected_queries as f64 / projected_batches.max(1) as f64,
@@ -9216,6 +9535,192 @@ mod tests {
             ),
             vec![0..2, 2..4]
         );
+
+        let third = vec![Var::from(3)];
+        let fourth = vec![Var::from(4)];
+        let mixed_domains = [
+            domain.as_slice(),
+            domain.as_slice(),
+            third.as_slice(),
+            fourth.as_slice(),
+        ];
+        let mixed_words = [16_426, 16_426, 102, 102];
+        let shared = plan_shared_domain_batch_ranges(
+            &mixed_domains,
+            &mixed_words,
+            2,
+            8,
+            32_768,
+        );
+        assert_eq!(shared, vec![0..2]);
+        assert_eq!(
+            plan_batch_ranges_with_shared_domain_fallback(
+                &shared,
+                &mixed_words,
+                2,
+                8,
+                32_768,
+            ),
+            vec![0..2, 2..4]
+        );
+    }
+
+    fn shared_domain_test_query(frame: u32, domain: &[u32]) -> IncrementalQuery {
+        let mut query = IncrementalQuery::new(
+            frame,
+            LitVec::from([Lit::new(Var::from(frame % 4), true)]),
+        );
+        query.constraints = vec![LitVec::from([
+            Lit::new(Var::from(0), true),
+            Lit::new(Var::from(1), false),
+        ])];
+        query.domain = domain.iter().copied().map(Var::from).collect();
+        query
+    }
+
+    fn assert_shared_domain_wire(queries: &[IncrementalQuery]) {
+        let (request, response_capacity) = pack_run_batch_request_with_mode(
+            64,
+            queries,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(request[0], SHARED_DOMAIN_BATCH_VERSION);
+        assert_eq!(request[1] as usize, queries.len());
+        assert_eq!(request[2] as usize, request.len() - 4);
+        assert_eq!(response_capacity, request[3] as usize + 4);
+
+        let shared_words = request[4] as usize;
+        assert_ne!(shared_words, 0);
+        assert_eq!(shared_words & 3, 0);
+        let shared = &request[5..5 + shared_words];
+        let (_, first_payload) = queries[0].pack_with_domain_mode(true);
+        assert_eq!(shared, &first_payload[first_payload.len() - shared_words..]);
+
+        let mut at = 5 + shared_words;
+        for query in queries {
+            let header = QueryHeader::from_words(&request[at..at + QUERY_HEADER_WORDS]).unwrap();
+            assert_eq!(header.version, ABI_VERSION);
+            assert_ne!(header.flags & BANK_ALIGNED_DOMAIN, 0);
+            assert_eq!(header.n_domain as usize, shared_words);
+            at += QUERY_HEADER_WORDS;
+            let private_words = header.n_assumptions as usize
+                + header.n_constraint_words as usize;
+            let (_, payload) = query.pack_with_domain_mode(true);
+            assert_eq!(&request[at..at + private_words], &payload[..private_words]);
+            at += private_words;
+        }
+        assert_eq!(at, request.len());
+    }
+
+    #[test]
+    fn shared_domain_v3_packs_two_three_and_eight_queries() {
+        let domain: Vec<_> = (0..13).collect();
+        for count in [2usize, 3, 8] {
+            let queries: Vec<_> = (0..count)
+                .map(|index| shared_domain_test_query(index as u32, &domain))
+                .collect();
+            assert_shared_domain_wire(&queries);
+        }
+    }
+
+    #[test]
+    fn shared_domain_v3_single_mismatch_and_unaligned_fall_back_byte_exact() {
+        let domain: Vec<_> = (0..13).collect();
+        let one = vec![shared_domain_test_query(0, &domain)];
+        let selected = pack_run_batch_request_with_mode(64, &one, false, true, true).unwrap();
+        let ordinary = pack_batch_request_with_domain_mode(64, &one, false, true).unwrap();
+        assert_eq!(selected, ordinary);
+        assert_eq!(selected.0[0], ABI_VERSION);
+
+        let empty = vec![
+            shared_domain_test_query(0, &[]),
+            shared_domain_test_query(1, &[]),
+        ];
+        let selected =
+            pack_run_batch_request_with_mode(64, &empty, false, true, true).unwrap();
+        let ordinary =
+            pack_batch_request_with_domain_mode(64, &empty, false, true).unwrap();
+        assert_eq!(selected, ordinary);
+        assert_eq!(selected.0[0], ABI_VERSION);
+
+        let mut mismatch = vec![
+            shared_domain_test_query(0, &domain),
+            shared_domain_test_query(1, &domain),
+        ];
+        mismatch[1].domain.swap(0, 1);
+        let selected =
+            pack_run_batch_request_with_mode(64, &mismatch, true, true, true).unwrap();
+        let ordinary =
+            pack_batch_request_with_domain_mode(64, &mismatch, true, true).unwrap();
+        assert_eq!(selected, ordinary);
+        assert_eq!(selected.0[0], ABI_VERSION);
+
+        let aligned = vec![
+            shared_domain_test_query(0, &domain),
+            shared_domain_test_query(1, &domain),
+        ];
+        let selected =
+            pack_run_batch_request_with_mode(64, &aligned, false, true, false).unwrap();
+        let ordinary =
+            pack_batch_request_with_domain_mode(64, &aligned, false, false).unwrap();
+        assert_eq!(selected, ordinary);
+        assert_eq!(selected.0[0], ABI_VERSION);
+    }
+
+    #[test]
+    fn shared_domain_v3_overflow_falls_back_to_v2() {
+        let domain: Vec<_> = (0..4).collect();
+        let repeated = Lit::new(Var::from(0), true);
+        let mut queries = vec![
+            shared_domain_test_query(0, &domain),
+            shared_domain_test_query(1, &domain),
+        ];
+        for query in &mut queries {
+            query.assumptions = std::iter::repeat_n(repeated, 16_380).collect();
+        }
+        assert!(pack_shared_domain_batch_request(64, &queries, false, true)
+            .unwrap()
+            .is_none());
+        let selected =
+            pack_run_batch_request_with_mode(64, &queries, false, true, true).unwrap();
+        let ordinary =
+            pack_batch_request_with_domain_mode(64, &queries, false, true).unwrap();
+        assert_eq!(selected, ordinary);
+        assert_eq!(selected.0[0], ABI_VERSION);
+        assert!(selected.0.len() > KERNEL_MAX_REQUEST_WORDS);
+    }
+
+    #[test]
+    fn combined_load_and_run_keeps_v2_batch_header() {
+        let domain: Vec<_> = (0..13).collect();
+        let queries = vec![
+            shared_domain_test_query(0, &domain),
+            shared_domain_test_query(1, &domain),
+        ];
+        let (request, _) =
+            pack_load_context_and_batch_request(64, &[], &queries, false).unwrap();
+        let batch_at = 1 + request[0] as usize;
+        assert_eq!(request[batch_at], ABI_VERSION);
+    }
+
+    #[test]
+    fn shared_domain_v3_requires_split_initial_context_load() {
+        let domain: Vec<_> = (0..13).collect();
+        let queries = vec![
+            shared_domain_test_query(0, &domain),
+            shared_domain_test_query(1, &domain),
+        ];
+        assert!(run_batch_uses_shared_domain_wire_with_mode(
+            64, &queries, false, true, true,
+        )
+        .unwrap());
+        assert!(!run_batch_uses_shared_domain_wire_with_mode(
+            64, &queries, false, false, true,
+        )
+        .unwrap());
     }
 
     #[test]

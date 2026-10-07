@@ -79,12 +79,26 @@ impl IncrementalQuery {
 
     /// Encode the query exactly as the future XRT/HLS backend will receive it.
     pub fn pack(&self) -> (QueryHeader, Vec<u32>) {
+        self.pack_with_domain_mode(bank_aligned_domain_enabled())
+    }
+
+    pub(crate) fn pack_with_domain_mode(
+        &self,
+        bank_aligned: bool,
+    ) -> (QueryHeader, Vec<u32>) {
         let constraint_words = self.constraints.iter().fold(0usize, |n, c| {
             n.checked_add(1 + c.len())
                 .expect("incremental CDCL constraint payload overflow")
         });
-        let bank_aligned = bank_aligned_domain_enabled();
-        let domain_words = encoded_domain_words(&self.domain);
+        let domain_words = if bank_aligned {
+            let mut banks = [0usize; 4];
+            for variable in &self.domain {
+                banks[(u32::from(*variable) & 3) as usize] += 1;
+            }
+            4 * banks.into_iter().max().unwrap_or(0)
+        } else {
+            self.domain.len()
+        };
         let mut payload =
             Vec::with_capacity(self.assumptions.len() + constraint_words + domain_words);
         payload.extend(self.assumptions.iter().map(|l| Into::<u32>::into(*l)));
@@ -149,9 +163,21 @@ pub fn pack_batch(
     queries: &[IncrementalQuery],
     result_capacity_words: u32,
 ) -> (BatchHeader, Vec<u32>) {
+    pack_batch_with_domain_mode(
+        queries,
+        result_capacity_words,
+        bank_aligned_domain_enabled(),
+    )
+}
+
+pub(crate) fn pack_batch_with_domain_mode(
+    queries: &[IncrementalQuery],
+    result_capacity_words: u32,
+    bank_aligned: bool,
+) -> (BatchHeader, Vec<u32>) {
     let mut words = Vec::new();
     for query in queries {
-        let (header, payload) = query.pack();
+        let (header, payload) = query.pack_with_domain_mode(bank_aligned);
         words.extend(header.as_words());
         words.extend(payload);
     }
