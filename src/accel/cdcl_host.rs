@@ -15,7 +15,7 @@ use super::cdcl::{
     PROFILE_LEARNT_LITERALS, PROFILE_OCCURRENCE_PAIRS, PROFILE_OCCURRENCE_ROUNDS,
     PROFILE_OCCURRENCE_UPDATES, PROFILE_PARTIAL_OCCURRENCE_SCANS, PROFILE_PROPAGATE, PROFILE_ROOT,
     PROFILE_SETUP, PROFILE_UNDO_ASSIGNMENTS, PROFILE_UNDO_OCCURRENCES, PROFILE_UNIT_CANDIDATES,
-    QUERY_HEADER_WORDS, QueryHeader, RESPONSE_HEADER_WORDS, SHARED_DOMAIN_BATCH_VERSION,
+    QUERY_HEADER_WORDS, RESPONSE_HEADER_WORDS, SHARED_DOMAIN_BATCH_VERSION,
     STAGE_PROFILE_COUNTERS, STAGE_PROFILE_MAGIC,
     STAGE_PROFILE_STAGE_COUNTERS, STAGE_PROFILE_VERSION, STAGE_PROFILE_WORDS, Status,
     UnknownReason, WANT_STAGE_PROFILE, block_full_root_required_response_capacity,
@@ -23,6 +23,8 @@ use super::cdcl::{
     decode_block_semantic_batch_response, pack_block_full_root_continuation,
     pack_block_full_root_request, pack_block_root_request, pack_block_semantic_batch,
 };
+#[cfg(test)]
+use super::cdcl::QueryHeader;
 #[cfg(has_cdcl_accel)]
 use crate::gipsat::decode_batch_results;
 use crate::gipsat::{
