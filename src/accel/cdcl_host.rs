@@ -201,11 +201,18 @@ fn frame_range_registry() -> &'static std::sync::Mutex<FrameRangeRegistry> {
     FRAME_RANGE_REGISTRY.get_or_init(|| std::sync::Mutex::new(FrameRangeRegistry::default()))
 }
 
+fn permanent_resident_clauses(lemmas: Vec<LitVec>) -> Vec<ResidentClause> {
+    lemmas
+        .into_iter()
+        .map(|literals| ResidentClause::new(0, u32::MAX, literals))
+        .collect()
+}
+
 /// Start one IC3 run's append-only, frame-ranged resident formula. The
 /// transition relation is permanent; subsequent calls record the exact frame
 /// intervals into which IC3 inserts each lemma.
 pub fn reset_frame_resident_context(solver: &DagCnfSolver) {
-    let (n_var, _, transition, _) = solver.incremental_resident_partition();
+    let (n_var, _, transition, initial_lemmas) = solver.incremental_resident_partition();
     if let Ok(mut registry) = block_root_range_registry().lock() {
         registry.n_var = n_var;
         registry.transition = transition.clone();
@@ -218,7 +225,12 @@ pub fn reset_frame_resident_context(solver: &DagCnfSolver) {
     if let Ok(mut registry) = frame_range_registry().lock() {
         registry.n_var = n_var;
         registry.transition = transition;
-        registry.clauses.clear();
+        // IC3 may seed the infinity solver before `check()` starts (property
+        // constraints are one real example). Every subsequently created frame
+        // solver clones these clauses, so omitting them here makes every
+        // ranged snapshot look weaker and forces an exact context reload for
+        // every inquiry. They are permanent by construction.
+        registry.clauses = permanent_resident_clauses(initial_lemmas);
     }
 }
 
@@ -285,12 +297,27 @@ fn ranged_snapshot_matches(
     frame: u32,
     exact_lemmas: &[LitVec],
 ) -> bool {
-    canonical_clause_set(
+    let ranged = canonical_clause_set(
         clauses
             .iter()
             .filter(|clause| clause.lo <= frame && frame <= clause.hi)
             .map(|clause| &clause.literals),
-    ) == canonical_clause_set(exact_lemmas.iter())
+    );
+    let exact = canonical_clause_set(exact_lemmas.iter());
+    if ranged == exact {
+        return true;
+    }
+    let missing = exact
+        .iter()
+        .filter(|clause| ranged.binary_search(clause).is_err())
+        .count() as u64;
+    let extra = ranged
+        .iter()
+        .filter(|clause| exact.binary_search(clause).is_err())
+        .count() as u64;
+    FRAME_RANGE_SNAPSHOT_MISSING_CLAUSES.fetch_add(missing, Ordering::Relaxed);
+    FRAME_RANGE_SNAPSHOT_EXTRA_CLAUSES.fetch_add(extra, Ordering::Relaxed);
+    false
 }
 
 fn frame_ranged_context(
@@ -3238,6 +3265,8 @@ static ACTIVE_CONTEXT_APPEND_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_LOAD_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONTEXT_APPEND_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static FRAME_RANGE_SNAPSHOT_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static FRAME_RANGE_SNAPSHOT_MISSING_CLAUSES: AtomicU64 = AtomicU64::new(0);
+static FRAME_RANGE_SNAPSHOT_EXTRA_CLAUSES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_COMBINED_FALLBACK_NS: AtomicU64 = AtomicU64::new(0);
@@ -8919,6 +8948,12 @@ pub fn flush_and_report() {
             hw_used.saturating_sub(block_used),
             hw_rejected.saturating_sub(block_rejected),
         );
+        eprintln!(
+            "inductor-cdcl: active resident frame-ranged snapshot fallbacks {}, cumulative missing/extra clauses {}/{}",
+            FRAME_RANGE_SNAPSHOT_MISMATCH.load(Ordering::Relaxed),
+            FRAME_RANGE_SNAPSHOT_MISSING_CLAUSES.load(Ordering::Relaxed),
+            FRAME_RANGE_SNAPSHOT_EXTRA_CLAUSES.load(Ordering::Relaxed),
+        );
         if shared_domain_projection_enabled() {
             let projected_queries = ACTIVE_SHARED_DOMAIN_PROJECTED_QUERIES.load(Ordering::Relaxed);
             let projected_batches = ACTIVE_SHARED_DOMAIN_PROJECTED_BATCHES.load(Ordering::Relaxed);
@@ -10855,5 +10890,20 @@ mod tests {
             4,
             &[LitVec::from([a, b])],
         ));
+    }
+
+    #[test]
+    fn initial_solver_lemmas_seed_every_resident_frame() {
+        let a = Lit::new(Var::from(1), true);
+        let b = Lit::new(Var::from(2), false);
+        let lemmas = vec![LitVec::from([a]), LitVec::from([!a, b])];
+        let clauses = permanent_resident_clauses(lemmas.clone());
+
+        assert_eq!(clauses.len(), lemmas.len());
+        assert!(clauses.iter().all(|clause| {
+            clause.lo == 0 && clause.hi == u32::MAX
+        }));
+        assert!(ranged_snapshot_matches(&clauses, 0, &lemmas));
+        assert!(ranged_snapshot_matches(&clauses, 37, &lemmas));
     }
 }

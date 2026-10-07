@@ -601,13 +601,17 @@ impl IC3 {
         assert_eq!(lastf.len() + 1, olen);
         note_frame_lemma_move(last_frame, usize::MAX, &lemma);
         let clause = !lemma.as_litvec();
-        crate::accel::cdcl_host::register_frame_resident_clause(&clause, 0, u32::MAX);
-        // Mirror at every frame. An infinity lemma holds unconditionally, and
-        // every frame solver is a clone of `inf_solver`, so a card that never
-        // saw these holds strictly less than the solver it is shadowing. That
-        // showed up as the card completing a search and answering satisfiable
-        // on ~6800 queries the solver found unsat: not unsound, since only its
-        // conflicts are relied on, but it is the reason it finds so few.
+        // Existing frame solvers are not rebuilt when a lemma moves to the
+        // infinity solver. Their already-recorded intervals remain exact;
+        // only later solvers clone this new permanent clause. Backfilling
+        // 0..=last_frame made the resident ranged formula stronger than those
+        // live solver snapshots and forced the exact-reload safety fallback.
+        crate::accel::cdcl_host::register_frame_resident_clause(
+            &clause,
+            (last_frame as u32).saturating_add(1),
+            u32::MAX,
+        );
+        // Mirror into the infinity solver so every future frame clone sees it.
         if crate::accel::ready() {
             let raw: Vec<u32> = clause.iter().map(|l| Into::<u32>::into(*l)).collect();
             if !crate::accel::add_lemma(&raw, 0, 0xffff) {
