@@ -3375,8 +3375,8 @@ const DEFAULT_FULL_ROOT_MAX_RESPONSE_WORDS: usize = 1 << 16;
 const DEFAULT_SHADOW_CONFLICT_BUDGET: u32 = 3;
 const DEFAULT_ACTIVE_DECISION_BUDGET: u32 = 0;
 const DEFAULT_ACTIVE_CONFLICT_BUDGET: u32 = 16;
-const DEFAULT_BLOCK_FULL_ROOT_CONFLICT_BUDGET: u32 = 128;
-const DEFAULT_BLOCK_FULL_ROOT_DECISION_BUDGET: u32 = 4096;
+const DEFAULT_BLOCK_FULL_ROOT_CONFLICT_BUDGET: u32 = 256;
+const DEFAULT_BLOCK_FULL_ROOT_DECISION_BUDGET: u32 = 65_536;
 
 fn configured_conflict_budget(mode_variable: &str, default: u32) -> u32 {
     std::env::var(mode_variable)
@@ -3435,11 +3435,10 @@ pub fn active_keep_learnts() -> bool {
     })
 }
 
-/// A resident root amortizes one slightly deeper short inquiry across an
-/// entire on-device BLOCK traversal.  Keep this budget independent from the
-/// leaf-batch cap: native multi-AIGER sweeps show that 16/32 conflicts cause
-/// repeated CPU handoffs, 64 still misses the mod3/token tail, while 128 keeps
-/// handoff below the simulation gate without paying the 256-conflict cap.
+/// A resident root amortizes a deeper inquiry across an entire on-device
+/// BLOCK traversal. Keep this budget independent from the leaf-batch cap:
+/// the six-AIGER full-root sweep needs 256 conflicts to avoid the mod3 tail,
+/// while the decision cap below handles low-conflict token-ring walks.
 pub fn block_full_root_conflict_budget() -> u32 {
     static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -3450,9 +3449,11 @@ pub fn block_full_root_conflict_budget() -> u32 {
     })
 }
 
-/// Conflict-only limits do not bound low-conflict SAT walks. Keep one root
-/// inquiry finite so a resident actor can hand an unsuitable tail back to
-/// GipSAT instead of monopolizing the synchronous FPGA service.
+/// Conflict-only limits do not bound low-conflict SAT walks. The six-AIGER
+/// transaction sweep reduced CPU handoff from 28.454% at 4K decisions to
+/// 6.618% at 64K, with zero wire errors and a bounded 12-second process guard.
+/// Keep the override so board calibration can lower this cap if the added
+/// device service does not amortize the avoided root handoffs.
 pub fn block_full_root_decision_budget() -> u32 {
     static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
