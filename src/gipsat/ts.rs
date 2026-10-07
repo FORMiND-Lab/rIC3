@@ -95,10 +95,11 @@ impl TransysSolver {
             constraints: constraint,
             domain,
             budget: QueryBudget {
+                decisions: crate::accel::cdcl_host::active_decision_budget(),
                 conflicts: crate::accel::cdcl_host::active_conflict_budget(),
-                ..QueryBudget::default()
+                restarts: None,
             },
-            keep_learnts: false,
+            keep_learnts: crate::accel::cdcl_host::active_keep_learnts(),
         }
     }
 

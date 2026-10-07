@@ -3120,6 +3120,7 @@ const PERSISTENT_DYNAMIC_MAX_BATCH_SIZE: usize = 8;
 const KERNEL_MAX_REQUEST_WORDS: usize = 1 << 15;
 const DEFAULT_FULL_ROOT_MAX_RESPONSE_WORDS: usize = 1 << 16;
 const DEFAULT_SHADOW_CONFLICT_BUDGET: u32 = 3;
+const DEFAULT_ACTIVE_DECISION_BUDGET: u32 = 0;
 const DEFAULT_ACTIVE_CONFLICT_BUDGET: u32 = 16;
 const DEFAULT_BLOCK_FULL_ROOT_CONFLICT_BUDGET: u32 = 128;
 const DEFAULT_BLOCK_FULL_ROOT_DECISION_BUDGET: u32 = 4096;
@@ -3153,6 +3154,31 @@ pub fn active_conflict_budget() -> u32 {
             "INDUCTOR_CDCL_ACTIVE_CONFLICT_BUDGET",
             DEFAULT_ACTIVE_CONFLICT_BUDGET,
         )
+    })
+}
+
+/// Conflict-only limits do not bound low-conflict SAT walks.  Keep the
+/// production default unlimited for reproducibility, but expose an independent
+/// decision cap for short-inquiry scheduling experiments.
+pub fn active_decision_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_DECISION_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_ACTIVE_DECISION_BUDGET)
+    })
+}
+
+/// Retain only learnt clauses the hardware engine declares independent of
+/// query-local temporary constraints.  Disabled by default until the bounded
+/// search A/B demonstrates a net benefit on the board matrix.
+pub fn active_keep_learnts() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_ACTIVE_KEEP_LEARNTS")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "off"))
     })
 }
 
