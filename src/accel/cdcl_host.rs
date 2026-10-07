@@ -1988,6 +1988,20 @@ impl HardwareCdcl {
         {
             let rc = unsafe { ind_cdcl_add_frame_clauses(words.as_ptr(), words.len() as u32) };
             if rc != 0 {
+                let literal_words = clauses
+                    .iter()
+                    .map(|clause| clause.literals.len())
+                    .sum::<usize>();
+                let max_clause_words = clauses
+                    .iter()
+                    .map(|clause| clause.literals.len())
+                    .max()
+                    .unwrap_or(0);
+                eprintln!(
+                    "inductor-cdcl: resident append command failed: rc={rc} clauses={} literals={literal_words} max_clause={max_clause_words} request_words={}",
+                    clauses.len(),
+                    words.len(),
+                );
                 self.materialized_frame = None;
                 return Err(HardwareError::Command(rc));
             }
