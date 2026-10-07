@@ -2114,13 +2114,27 @@ impl HardwareCdcl {
         if context.n_var == 0 {
             return Err(HardwareError::InvalidContext);
         }
-        if self.arena.n_var != context.n_var || self.n_var != context.n_var {
-            self.load_context(context.n_var, &[])?;
-            self.arena.reset(context.n_var);
-        }
-        let mut candidate = self.arena.clone();
+        let reset = self.arena.n_var != context.n_var || self.n_var != context.n_var;
+        let mut candidate = if reset {
+            let mut arena = ResidentArena::default();
+            arena.reset(context.n_var);
+            arena
+        } else {
+            self.arena.clone()
+        };
         let (mapping, appended) = candidate.intern_context(context)?;
-        if !appended.is_empty()
+        if reset {
+            // Clause IDs are allocated by `intern_context` in exactly the
+            // order emitted in `appended`.  Bootstrap the physical arena with
+            // that complete image in one LOAD instead of loading an empty
+            // formula and immediately APPENDing every clause.  Resident-SIDE
+            // cannot start its occurrence island from an empty formula, and
+            // the single command also removes one host/device round trip.
+            if appended.is_empty() {
+                return Err(HardwareError::InvalidContext);
+            }
+            self.load_context(context.n_var, &appended)?;
+        } else if !appended.is_empty()
             && let Err(error) = self.add_frame_clauses(&appended)
         {
             self.invalidate_arena_context();
@@ -6662,6 +6676,19 @@ fn mic_chain_experimental_reorder() -> bool {
     })
 }
 
+/// The production resident-SIDE image exposes append and dependent MIC as two
+/// individually transactional commands. Command 8 remains available for
+/// non-SIDE images, but sending it to the SIDE top would bypass the qualified
+/// append-overlay handshake and be rejected before any useful MIC work.
+fn resident_side_split_append_mic() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_RESIDENT_SIDE_APPEND_OVERLAY")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+    })
+}
+
 fn mic_chain_conflict_budget() -> u32 {
     static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -6967,13 +6994,12 @@ pub fn solve_active_mic_chain(
         state.loaded_context = None;
     }
     if let ContextUpdate::Append(clauses) = update {
-        // The production traversal is one order-dependent chain. Fuse its
-        // monotonic resident append with the immediately following MIC so the
-        // hundreds of tiny lemma updates do not each pay an XRT submission.
-        // Explicit reordered multi-chain experiments retain the standalone
-        // append path because command 8 deliberately preserves one chain's
-        // exact caller order.
-        if !mic_chain_experimental_reorder() {
+        // The production traversal is one order-dependent chain. Non-SIDE
+        // images may fuse its monotonic append with the immediately following
+        // MIC to avoid another XRT submission. Resident-SIDE uses its already
+        // qualified transactional append overlay and then issues plain MIC;
+        // reordered multi-chain experiments likewise keep the commands split.
+        if !mic_chain_experimental_reorder() && !resident_side_split_append_mic() {
             ready = true;
             fused_append_clauses = Some(clauses);
         } else {
