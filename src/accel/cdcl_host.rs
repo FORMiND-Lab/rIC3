@@ -133,8 +133,8 @@ struct ServiceStats {
 #[cfg(has_cdcl_accel)]
 fn rpc_service_ns() -> Option<u64> {
     let mut stats = ServiceStats::default();
-    (unsafe { ind_cdcl_get_service_stats(&mut stats) } == 0 && stats.version == 1)
-        .then_some(stats.client_service_ns)
+    (unsafe { ind_cdcl_get_service_stats(&mut stats) } == 0 && stats.version == 2)
+        .then_some(stats.device_service_ns)
 }
 
 #[cfg(not(has_cdcl_accel))]
