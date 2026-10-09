@@ -3336,6 +3336,7 @@ static FULL_ROOT_TRANSCRIPT_RESPONSE_WORDS: AtomicU64 = AtomicU64::new(0);
 static FULL_ROOT_WIRE_REJECTS: AtomicU64 = AtomicU64::new(0);
 static FULL_ROOT_STEP_CAPS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_BATCHES: AtomicU64 = AtomicU64::new(0);
+static EXACT_REPLAY_SEEN_BATCHES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_QUERIES: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_MICS: AtomicU64 = AtomicU64::new(0);
 static EXACT_REPLAY_BLOCK_PROGRESS: AtomicU64 = AtomicU64::new(0);
@@ -5485,6 +5486,16 @@ fn exact_replay_limit() -> u64 {
     })
 }
 
+fn exact_replay_skip_batches() -> u64 {
+    static SKIP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("INDUCTOR_CDCL_EXACT_REPLAY_SKIP_BATCHES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn exact_mic_replay_limit() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -5668,6 +5679,12 @@ fn record_exact_replay_batch(
     cpu: &[PairedCpuWork],
     end_of_pass: bool,
 ) {
+    // Keep the serialized batch id aligned with the architecture trace even
+    // when a compact late-window capture skips early batches.
+    let batch_id = EXACT_REPLAY_SEEN_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if batch_id <= exact_replay_skip_batches() {
+        return;
+    }
     let limit = exact_replay_limit();
     if limit == 0 {
         return;
@@ -5684,7 +5701,7 @@ fn record_exact_replay_batch(
         return;
     };
 
-    let batch_id = EXACT_REPLAY_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    EXACT_REPLAY_BATCHES.fetch_add(1, Ordering::Relaxed);
     let mut words = Vec::new();
     // Filled after the record has been assembled; length excludes itself.
     words.push(0);
