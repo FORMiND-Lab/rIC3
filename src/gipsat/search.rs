@@ -86,7 +86,7 @@ impl DagCnfSolver {
             match self.search(assumption, Some(search_conflicts), retain_learnts) {
                 None => {
                     if conflict_limit.is_some_and(|limit| self.probe.n_conflict >= limit)
-                        || crate::fastlane::race_stop()
+                        || crate::fastlane::race_tick()
                     {
                         return None;
                     }
@@ -146,7 +146,7 @@ impl DagCnfSolver {
                 }
                 self.vsids.decay();
                 self.cdb.decay();
-                if crate::fastlane::race_stop() {
+                if crate::fastlane::race_tick() {
                     self.backtrack(assumption.len(), true);
                     return None;
                 }
@@ -190,6 +190,10 @@ impl DagCnfSolver {
                 // decision frontier. Do not mistake that empty queue for SAT.
                 if assumption.is_empty() {
                     self.prepare_vsids();
+                }
+                if crate::fastlane::race_tick() {
+                    self.backtrack(assumption.len(), true);
+                    return None;
                 }
                 let probe_de = crate::inductor::Timer::start();
                 let decided = self.decide();

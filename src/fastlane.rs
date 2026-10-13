@@ -60,6 +60,7 @@ mod ffi {
         pub fn fl_board_ready() -> i32;
         pub fn fl_board_shutdown();
         pub fn fl_board_abort();
+        pub fn fl_board_reset();
         pub fn fl_solve_frame_submit(
             lane: *mut FlLane,
             assumptions: *const u32,
@@ -152,6 +153,11 @@ pub fn shadow() -> bool {
 }
 
 pub static SHADOW_MISMATCH: AtomicU64 = AtomicU64::new(0);
+/// Shadow mode, queries both solvers answer UNSAT: count and the summed
+/// core sizes (assumptions in the core) of GipSAT and of the lane.
+pub static SHADOW_UNSAT: AtomicU64 = AtomicU64::new(0);
+pub static SHADOW_CORE_CPU: AtomicU64 = AtomicU64::new(0);
+pub static SHADOW_CORE_LANE: AtomicU64 = AtomicU64::new(0);
 
 /// Validate every lane SAT model against the exact CPU formula before use.
 pub fn check_models() -> bool {
@@ -441,6 +447,87 @@ pub fn replica_count() -> usize {
 pub struct Pool {
     pub replicas: Vec<LaneHandle>,
     pub n_var: u32,
+    init: PoolInit,
+}
+
+/// What the pool was created from (transition, constraints, dependency
+/// graph), kept to rebuild it on a reload.
+struct PoolInit {
+    n_var: u32,
+    dep_offsets: Vec<u32>,
+    deps: Vec<u32>,
+    trans: Vec<Vec<u32>>,
+    base: Vec<Vec<u32>>,
+}
+
+impl PoolInit {
+    fn build(&self) -> Option<Vec<LaneHandle>> {
+        let mut replicas = Vec::new();
+        for _ in 0..replica_count() {
+            let mut lane = LaneHandle::new(self.n_var, &self.dep_offsets, &self.deps)?;
+            lane.add_fixed_domain(0);
+            for c in &self.trans {
+                lane.add_clause(c);
+            }
+            for c in &self.base {
+                lane.add_clause(c);
+                for l in c {
+                    lane.add_fixed_domain(l >> 1);
+                }
+            }
+            replicas.push(lane);
+        }
+        Some(replicas)
+    }
+}
+
+/// The card's lane ran out of capacity (it answers UNKNOWN from then on):
+/// stop routing to it until IC3 rebuilds the pool from its live frames.
+static RELOAD_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static RELOADS: AtomicU64 = AtomicU64::new(0);
+
+pub fn request_reload() {
+    if pool_mode() {
+        RELOAD_WANTED.store(true, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn reload_pending() -> bool {
+    RELOAD_WANTED.load(Ordering::Relaxed)
+}
+
+/// Rebuild the pool (card lane included) from the creation-time clauses and
+/// the live frame lemmas `(clause, lo, hi)`.  Every dropped clause is a
+/// subsumed or moved lemma copy implied by the live ones.
+pub fn pool_reload(lemmas: &[(Vec<u32>, u32, u32)]) {
+    POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let Some(old) = pool.take() else {
+            return;
+        };
+        let init = old.init;
+        drop(old.replicas);
+        #[cfg(has_fastlane)]
+        unsafe {
+            ffi::fl_board_reset()
+        }
+        let Some(mut replicas) = init.build() else {
+            return;
+        };
+        for (c, lo, hi) in lemmas {
+            for lane in replicas.iter_mut() {
+                lane.add_clause_ranged(c, *lo, *hi);
+            }
+        }
+        *pool = Some(Pool {
+            replicas,
+            n_var: init.n_var,
+            init,
+        });
+    });
+    RELOAD_WANTED.store(false, Ordering::Relaxed);
+    RELOADS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Speculative parallel MIC (`INDUCTOR_FASTLANE_PMIC=1`, pool mode, CTG off).
@@ -573,6 +660,110 @@ pub fn card_busy() -> bool {
     return unsafe { ffi::fl_board_busy() } != 0;
     #[allow(unreachable_code)]
     false
+}
+
+/// Time-triggered race (`INDUCTOR_FASTLANE_RACE_US=<T>`): every routed query
+/// starts on the CPU; once it has run T us (and the card is free) the search
+/// itself submits it to the card and keeps going, and the first answer wins.
+/// On HWMCC designs the queries the card wins are slow on the CPU but have
+/// few conflicts, which a conflict budget never sends.
+pub fn race_us() -> Option<u64> {
+    static T: OnceLock<Option<u64>> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_RACE_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+#[inline]
+fn tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return core::arch::x86_64::_rdtsc();
+    }
+    #[allow(unreachable_code)]
+    {
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+/// Timestamp-counter ticks per microsecond (measured once).
+fn tsc_per_us() -> u64 {
+    static R: OnceLock<u64> = OnceLock::new();
+    *R.get_or_init(|| {
+        let (t0, c0) = (std::time::Instant::now(), tsc());
+        while t0.elapsed() < std::time::Duration::from_millis(5) {}
+        ((tsc() - c0) as f64 / t0.elapsed().as_secs_f64() / 1e6).max(1.0) as u64
+    })
+}
+
+struct Armed {
+    assump: Vec<u32>,
+    temps: Vec<Vec<u32>>,
+    frame: u32,
+    deadline: u64,
+}
+
+thread_local! {
+    static ARMED: std::cell::RefCell<Option<Armed>> = const { std::cell::RefCell::new(None) };
+}
+static ARMED_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static TIMED_SUBMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Arm the time trigger for the query about to run on the CPU.
+pub fn race_arm(assump: Vec<u32>, temps: Vec<Vec<u32>>, frame: u32, us: u64) {
+    let deadline = tsc() + us * tsc_per_us();
+    ARMED.with(|a| {
+        *a.borrow_mut() = Some(Armed {
+            assump,
+            temps,
+            frame,
+            deadline,
+        })
+    });
+    ARMED_ON.store(true, Ordering::Relaxed);
+}
+
+/// Disarm after the CPU search returned; true if the query was submitted.
+pub fn race_disarm() -> bool {
+    ARMED_ON.store(false, Ordering::Relaxed);
+    ARMED.with(|a| *a.borrow_mut() = None);
+    RACING.swap(false, Ordering::Relaxed)
+}
+
+/// Called by the CPU search at every conflict and decision: submits an
+/// armed query once its deadline passes, and says whether the card has
+/// answered a submitted one (the search then stops).
+#[inline]
+pub fn race_tick() -> bool {
+    if RACING.load(Ordering::Relaxed) {
+        return race_stop();
+    }
+    if ARMED_ON.load(Ordering::Relaxed) {
+        race_tick_armed();
+    }
+    false
+}
+
+#[cold]
+fn race_tick_armed() {
+    let due = ARMED.with(|a| a.borrow().as_ref().is_some_and(|a| tsc() >= a.deadline));
+    if !due || card_busy() {
+        return;
+    }
+    let Some(armed) = ARMED.with(|a| a.borrow_mut().take()) else {
+        return;
+    };
+    ARMED_ON.store(false, Ordering::Relaxed);
+    let ok =
+        with_pool(|pool| pool.replicas[0].submit_frame(&armed.assump, &armed.temps, armed.frame))
+            .unwrap_or(false);
+    if ok {
+        TIMED_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        RACING.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Should the racing CPU search stop (the card has answered)?
@@ -809,24 +1000,21 @@ pub fn pool_init(
         if pool.is_some() {
             return;
         }
-        let mut replicas = Vec::new();
-        for _ in 0..replica_count() {
-            let Some(mut lane) = LaneHandle::new(n_var, dep_offsets, deps) else {
-                return;
-            };
-            lane.add_fixed_domain(0);
-            for c in trans {
-                lane.add_clause(c);
-            }
-            for c in base {
-                lane.add_clause(c);
-                for l in c {
-                    lane.add_fixed_domain(l >> 1);
-                }
-            }
-            replicas.push(lane);
-        }
-        *pool = Some(Pool { replicas, n_var });
+        let init = PoolInit {
+            n_var,
+            dep_offsets: dep_offsets.to_vec(),
+            deps: deps.to_vec(),
+            trans: trans.to_vec(),
+            base: base.to_vec(),
+        };
+        let Some(replicas) = init.build() else {
+            return;
+        };
+        *pool = Some(Pool {
+            replicas,
+            n_var,
+            init,
+        });
     });
 }
 
@@ -899,12 +1087,14 @@ pub fn report() {
         PMIC_QUERIES.load(Ordering::Relaxed)
     );
     eprintln!(
-        "fastlane-race: busy_skips={} busy_cpu_ms={:.3} budget={} adapt_up={} adapt_down={}",
+        "fastlane-race: busy_skips={} busy_cpu_ms={:.3} budget={} adapt_up={} adapt_down={} reloads={} timed_submits={}",
         RACE_BUSY.load(Ordering::Relaxed),
         RACE_BUSY_NS.load(Ordering::Relaxed) as f64 / 1e6,
         cpu_first_budget().unwrap_or(0),
         ADAPT_UP.load(Ordering::Relaxed),
-        ADAPT_DOWN.load(Ordering::Relaxed)
+        ADAPT_DOWN.load(Ordering::Relaxed),
+        RELOADS.load(Ordering::Relaxed),
+        TIMED_SUBMITS.load(Ordering::Relaxed)
     );
     eprintln!(
         "fastlane-fuse: pushes={} used={}",
@@ -912,8 +1102,11 @@ pub fn report() {
         FUSED_PUSH_USED.load(Ordering::Relaxed)
     );
     eprintln!(
-        "fastlane-time: lane_model_ms={:.3} shadow_mismatch={}",
+        "fastlane-time: lane_model_ms={:.3} shadow_mismatch={} shadow_unsat={} core_cpu={} core_lane={}",
         LANE_NS.load(Ordering::Relaxed) as f64 / 1e6,
-        SHADOW_MISMATCH.load(Ordering::Relaxed)
+        SHADOW_MISMATCH.load(Ordering::Relaxed),
+        SHADOW_UNSAT.load(Ordering::Relaxed),
+        SHADOW_CORE_CPU.load(Ordering::Relaxed),
+        SHADOW_CORE_LANE.load(Ordering::Relaxed)
     );
 }

@@ -2886,6 +2886,9 @@ impl IC3 {
             && crate::accel::cdcl_host::block_batch_enabled()
             && BlockBatchCache::wavefront_enabled();
         loop {
+            if crate::fastlane::reload_pending() {
+                self.fastlane_reload();
+            }
             let mut semantic_ops = progress.as_ref().map(|_| Vec::new());
             let mut from_wave = false;
             let mut next = None;

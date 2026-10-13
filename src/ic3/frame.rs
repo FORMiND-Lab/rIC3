@@ -440,6 +440,26 @@ impl Index<usize> for Frames {
 }
 
 impl IC3 {
+    /// Rebuild the FastLane pool after its card lane overflowed: the live
+    /// lemmas of frame f (f > 0) hold in solvers 1..=f, frame 0's in solver
+    /// 0, and the invariant's in every solver from 1 on.
+    pub(super) fn fastlane_reload(&mut self) {
+        let raw = |lemma: &LitOrdVec| -> Vec<u32> {
+            (!lemma.as_litvec()).iter().map(|l| u32::from(*l)).collect()
+        };
+        let mut lemmas = Vec::new();
+        for f in 0..self.frame.len() {
+            let (lo, hi) = if f == 0 { (0, 0) } else { (1, f as u32) };
+            for lemma in self.frame[f].iter() {
+                lemmas.push((raw(lemma), lo, hi));
+            }
+        }
+        for lemma in self.frame.inf.iter() {
+            lemmas.push((raw(lemma), 1, u32::MAX));
+        }
+        crate::fastlane::pool_reload(&lemmas);
+    }
+
     #[inline]
     pub(super) fn add_lemma(
         &mut self,

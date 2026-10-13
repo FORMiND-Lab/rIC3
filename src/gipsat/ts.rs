@@ -67,9 +67,15 @@ impl TransysSolver {
         if crate::fastlane::enabled()
             && crate::fastlane::routes_phase(crate::inductor::current_phase())
             && (!crate::fastlane::pool_mode() || self.dcs.fastlane_frame.is_some())
+            && !crate::fastlane::reload_pending()
         {
             if crate::fastlane::shadow() {
                 return self.inductive_shadowed(&assump, &constraint);
+            }
+            if let Some(us) = crate::fastlane::race_us()
+                && crate::fastlane::card_ready()
+            {
+                return self.inductive_timed(cube, &assump, &constraint, us);
             }
             // While the card is coming up, light queries run on the CPU; a
             // query that exceeds the warm-up budget goes to the card (the
@@ -134,6 +140,14 @@ impl TransysSolver {
         };
         if status != if sat { 1 } else { 2 } {
             crate::fastlane::SHADOW_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        }
+        if let crate::fastlane::LaneResult::Unsat { core, .. } = &result
+            && !sat
+        {
+            let cpu_core = assump.iter().filter(|&&l| self.dcs.unsat_has(l)).count();
+            crate::fastlane::SHADOW_UNSAT.fetch_add(1, Ordering::Relaxed);
+            crate::fastlane::SHADOW_CORE_CPU.fetch_add(cpu_core as u64, Ordering::Relaxed);
+            crate::fastlane::SHADOW_CORE_LANE.fetch_add(core.len() as u64, Ordering::Relaxed);
         }
         crate::fastlane::log_query(
             crate::inductor::current_phase(),
@@ -243,6 +257,39 @@ impl TransysSolver {
         }
     }
 
+    /// Time-triggered race (see `fastlane::race_us`): the CPU search submits
+    /// the query to the card once it has run `us` microseconds.
+    fn inductive_timed(&mut self, cube: &[Lit], assump: &LitVec, constraint: &[LitVec], us: u64) -> bool {
+        let raw_assump: Vec<u32> = assump.iter().map(|l| u32::from(*l)).collect();
+        let raw_temps: Vec<Vec<u32>> = constraint
+            .iter()
+            .map(|c| c.iter().map(|l| u32::from(*l)).collect())
+            .collect();
+        let frame = self.dcs.fastlane_frame.unwrap_or(0);
+        crate::fastlane::race_arm(raw_assump, raw_temps, frame, us);
+        let cpu = self.dcs.solve_with_constraint_raced(assump, constraint.to_vec());
+        let submitted = crate::fastlane::race_disarm();
+        if let Some(sat) = cpu {
+            if submitted {
+                crate::fastlane::card_abort();
+                crate::fastlane::note_race(false);
+            }
+            return !sat;
+        }
+        crate::fastlane::note_race(true);
+        crate::fastlane::ROUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let result = crate::fastlane::with_pool(|pool| pool.replicas[0].collect_frame())
+            .unwrap_or(crate::fastlane::LaneResult::Unknown);
+        // the raced SOLVE has no budget: UNKNOWN means the lane overflowed
+        if matches!(result, crate::fastlane::LaneResult::Unknown) {
+            crate::fastlane::request_reload();
+        }
+        match self.install_lane_result(cube, assump, constraint, result) {
+            Some(blocked) => blocked,
+            None => !self.dcs.solve_with_constraint(assump, constraint.to_vec()),
+        }
+    }
+
     /// Race: the card solves the query while the CPU keeps searching; the
     /// first answer is used (the card's then installed as from a lane).
     fn inductive_raced(&mut self, cube: &[Lit], assump: &LitVec, constraint: &[LitVec]) -> Option<bool> {
@@ -279,6 +326,10 @@ impl TransysSolver {
         crate::fastlane::PHASE_COUNTS[phase.min(7)].fetch_add(1, Ordering::Relaxed);
         let result = crate::fastlane::with_pool(|pool| pool.replicas[0].collect_frame())
             .unwrap_or(crate::fastlane::LaneResult::Unknown);
+        // A raced SOLVE has no budget: UNKNOWN means the lane overflowed.
+        if matches!(result, crate::fastlane::LaneResult::Unknown) {
+            crate::fastlane::request_reload();
+        }
         match self.install_lane_result(cube, assump, constraint, result) {
             Some(blocked) => Some(blocked),
             // unusable card answer: the CPU solves the query after all

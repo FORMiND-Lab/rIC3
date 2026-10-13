@@ -286,6 +286,9 @@ impl IC3 {
             let frame_result_offset = result_offset;
             result_offset += active_queries.len();
             let _op = crate::inductor::macro_scope(inductor_trace::Phase::Push, frame_idx + 1);
+            if crate::fastlane::reload_pending() {
+                self.fastlane_reload();
+            }
             for (lemma_index, mut lemma) in frame.into_iter().enumerate() {
                 if self.frame[frame_idx].iter().all(|l| l.ne(&lemma)) {
                     continue;
