@@ -66,7 +66,7 @@ impl TransysSolver {
         }
         if crate::fastlane::enabled()
             && crate::fastlane::routes_phase(crate::inductor::current_phase())
-            && (!crate::fastlane::pool_mode() || self.dcs.fastlane_frame.is_some())
+            && (!crate::fastlane::pool_mode() || crate::fastlane::in_band(self.dcs.fastlane_frame))
             && !crate::fastlane::reload_pending()
         {
             if crate::fastlane::shadow() {
@@ -88,7 +88,9 @@ impl TransysSolver {
                 Some(crate::fastlane::warmup_conflicts())
             };
             if let Some(budget) = budget
-                && let Some(sat) = self.dcs.solve_with_constraint_budget(&assump, constraint.clone(), budget)
+                && let Some(sat) =
+                    self.dcs
+                        .solve_with_constraint_budget(&assump, constraint.clone(), budget)
             {
                 return !sat;
             }
@@ -110,8 +112,10 @@ impl TransysSolver {
     fn lane_solve(&mut self, assump: &[u32], temps: &[Vec<u32>]) -> crate::fastlane::LaneResult {
         if crate::fastlane::pool_mode() {
             let frame = self.dcs.fastlane_frame.unwrap_or(0);
-            return crate::fastlane::with_pool(|pool| pool.replicas[0].solve_frame(assump, temps, 0, frame))
-                .unwrap_or(crate::fastlane::LaneResult::Unknown);
+            return crate::fastlane::with_pool(|pool| {
+                pool.replicas[0].solve_frame(assump, temps, 0, frame)
+            })
+            .unwrap_or(crate::fastlane::LaneResult::Unknown);
         }
         self.dcs.fastlane_lane().solve(assump, temps, 0)
     }
@@ -259,7 +263,13 @@ impl TransysSolver {
 
     /// Time-triggered race (see `fastlane::race_us`): the CPU search submits
     /// the query to the card once it has run `us` microseconds.
-    fn inductive_timed(&mut self, cube: &[Lit], assump: &LitVec, constraint: &[LitVec], us: u64) -> bool {
+    fn inductive_timed(
+        &mut self,
+        cube: &[Lit],
+        assump: &LitVec,
+        constraint: &[LitVec],
+        us: u64,
+    ) -> bool {
         let raw_assump: Vec<u32> = assump.iter().map(|l| u32::from(*l)).collect();
         let raw_temps: Vec<Vec<u32>> = constraint
             .iter()
@@ -267,7 +277,9 @@ impl TransysSolver {
             .collect();
         let frame = self.dcs.fastlane_frame.unwrap_or(0);
         crate::fastlane::race_arm(raw_assump, raw_temps, frame, us);
-        let cpu = self.dcs.solve_with_constraint_raced(assump, constraint.to_vec());
+        let cpu = self
+            .dcs
+            .solve_with_constraint_raced(assump, constraint.to_vec());
         let submitted = crate::fastlane::race_disarm();
         if let Some(sat) = cpu {
             if submitted {
@@ -292,7 +304,12 @@ impl TransysSolver {
 
     /// Race: the card solves the query while the CPU keeps searching; the
     /// first answer is used (the card's then installed as from a lane).
-    fn inductive_raced(&mut self, cube: &[Lit], assump: &LitVec, constraint: &[LitVec]) -> Option<bool> {
+    fn inductive_raced(
+        &mut self,
+        cube: &[Lit],
+        assump: &LitVec,
+        constraint: &[LitVec],
+    ) -> Option<bool> {
         use std::sync::atomic::Ordering;
         let raw_assump: Vec<u32> = assump.iter().map(|l| u32::from(*l)).collect();
         let raw_temps: Vec<Vec<u32>> = constraint
@@ -303,17 +320,24 @@ impl TransysSolver {
             let t0 = std::time::Instant::now();
             let sat = self.dcs.solve_with_constraint(assump, constraint.to_vec());
             crate::fastlane::RACE_BUSY.fetch_add(1, Ordering::Relaxed);
-            crate::fastlane::RACE_BUSY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            crate::fastlane::RACE_BUSY_NS
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             return Some(!sat);
         }
         let frame = self.dcs.fastlane_frame.unwrap_or(0);
-        let submitted = crate::fastlane::with_pool(|pool| pool.replicas[0].submit_frame(&raw_assump, &raw_temps, frame))
-            .unwrap_or(false);
+        let submitted = crate::fastlane::with_pool(|pool| {
+            pool.replicas[0].submit_frame(&raw_assump, &raw_temps, frame)
+        })
+        .unwrap_or(false);
         if !submitted {
             return None;
         }
+        let depth = crate::fastlane::frame_depth(frame);
+        crate::fastlane::DEPTH_SUB[depth].fetch_add(1, Ordering::Relaxed);
         crate::fastlane::RACING.store(true, Ordering::Relaxed);
-        let cpu = self.dcs.solve_with_constraint_raced(assump, constraint.to_vec());
+        let cpu = self
+            .dcs
+            .solve_with_constraint_raced(assump, constraint.to_vec());
         crate::fastlane::RACING.store(false, Ordering::Relaxed);
         if let Some(sat) = cpu {
             crate::fastlane::card_abort();
@@ -321,6 +345,7 @@ impl TransysSolver {
             return Some(!sat);
         }
         crate::fastlane::note_race(true);
+        crate::fastlane::DEPTH_WIN[depth].fetch_add(1, Ordering::Relaxed);
         crate::fastlane::ROUTED.fetch_add(1, Ordering::Relaxed);
         let phase = crate::inductor::current_phase() as usize;
         crate::fastlane::PHASE_COUNTS[phase.min(7)].fetch_add(1, Ordering::Relaxed);

@@ -26,8 +26,8 @@ use utils::Statistic;
 mod activity;
 mod auxv;
 mod block;
-mod ctg_native;
 mod ctg_hardware;
+mod ctg_native;
 mod frame;
 mod localabs;
 mod mab;
@@ -229,6 +229,7 @@ impl IC3 {
         let frontier = self.solvers.len() - 1;
         self.solvers[frontier].dcs.accel_level = frontier as u32;
         self.solvers[frontier].dcs.fastlane_frame = Some(frontier as u32);
+        crate::fastlane::note_frontier(frontier as u32);
         if frontier == 0 {
             self.solvers[0].dcs.fastlane_pool_init();
         }

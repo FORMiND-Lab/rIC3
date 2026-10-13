@@ -248,6 +248,14 @@ pub static ROUTED: AtomicU64 = AtomicU64::new(0);
 /// Raced queries the CPU solved alone because the card was still finishing
 /// a stale (CPU-won) run, and the CPU time they took.
 pub static RACE_BUSY: AtomicU64 = AtomicU64::new(0);
+/// Highest frame solver bound to the pool, and raced queries by frame depth
+/// below it (clipped at 7): submitted, and answered by the card.
+pub static MAX_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static DEPTH_SUB: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static DEPTH_WIN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub fn frame_depth(frame: u32) -> usize {
+    (MAX_FRAME.load(Ordering::Relaxed).saturating_sub(frame) as usize).min(7)
+}
 pub static RACE_BUSY_NS: AtomicU64 = AtomicU64::new(0);
 pub static ROUTED_SAT: AtomicU64 = AtomicU64::new(0);
 pub static ROUTED_UNSAT: AtomicU64 = AtomicU64::new(0);
@@ -499,8 +507,10 @@ pub fn reload_pending() -> bool {
 
 /// Rebuild the pool (card lane included) from the creation-time clauses and
 /// the live frame lemmas `(clause, lo, hi)`.  Every dropped clause is a
-/// subsumed or moved lemma copy implied by the live ones.
-pub fn pool_reload(lemmas: &[(Vec<u32>, u32, u32)]) {
+/// subsumed or moved lemma copy implied by the live ones, or (frame band)
+/// ends below `band_lo`.
+pub fn pool_reload(lemmas: &[(Vec<u32>, u32, u32)], band_lo: u32) {
+    BAND_LO.store(band_lo, Ordering::Relaxed);
     POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         let Some(old) = pool.take() else {
@@ -1019,19 +1029,52 @@ pub fn pool_init(
     });
 }
 
+/// Frame band (`INDUCTOR_FASTLANE_BAND=<b>`): every reload keeps only the
+/// lemmas of frames >= `BAND_LO` = frontier - b, clauses ending below it are
+/// not mirrored, and only queries at frames >= `BAND_LO` are routed.  Exact:
+/// a clause ranged `lo..=hi` with `hi < BAND_LO` is inactive for every routed
+/// query, it only costs the card watch visits (GipSAT's per-frame solvers
+/// never hold it).
+pub fn band() -> Option<u32> {
+    static B: OnceLock<Option<u32>> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_BAND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+pub static BAND_LO: AtomicU32 = AtomicU32::new(0);
+pub fn in_band(frame: Option<u32>) -> bool {
+    frame.is_some_and(|f| f >= BAND_LO.load(Ordering::Relaxed))
+}
+/// A new frontier frame: reload once the band is more than one frame behind.
+pub fn note_frontier(frontier: u32) {
+    MAX_FRAME.fetch_max(frontier, Ordering::Relaxed);
+    if let Some(b) = band()
+        && pool_mode()
+        && frontier.saturating_sub(BAND_LO.load(Ordering::Relaxed)) > b + 1
+    {
+        request_reload();
+    }
+}
+
 /// Proactive reload (`INDUCTOR_FASTLANE_RELOAD_CLAUSES=<n>`): rebuild the
 /// pool once n clauses were mirrored since it was (re)loaded.  The card lane
 /// otherwise fills with stale lemma copies and compacts over and over near
 /// its capacity before it finally overflows.
 fn reload_clauses() -> Option<u64> {
     static N: OnceLock<Option<u64>> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_RELOAD_CLAUSES").ok().and_then(|v| v.parse().ok()))
+    *N.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_RELOAD_CLAUSES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
 }
 static MIRRORED: AtomicU64 = AtomicU64::new(0);
 
 /// Mirror one frame-ranged clause (IC3 solver indices lo..=hi).
 pub fn pool_register(lits: &[u32], lo: u32, hi: u32) {
-    if !pool_mode() {
+    if !pool_mode() || hi < BAND_LO.load(Ordering::Relaxed) {
         return;
     }
     if let Some(n) = reload_clauses()
@@ -1111,6 +1154,18 @@ pub fn report() {
         ADAPT_DOWN.load(Ordering::Relaxed),
         RELOADS.load(Ordering::Relaxed),
         TIMED_SUBMITS.load(Ordering::Relaxed)
+    );
+    let hist = |h: &[AtomicU64; 8]| {
+        h.iter()
+            .map(|c| c.load(Ordering::Relaxed).to_string())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    eprintln!(
+        "fastlane-depth: max_frame={} submitted={} card_won={}",
+        MAX_FRAME.load(Ordering::Relaxed),
+        hist(&DEPTH_SUB),
+        hist(&DEPTH_WIN)
     );
     eprintln!(
         "fastlane-fuse: pushes={} used={}",

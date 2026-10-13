@@ -448,7 +448,9 @@ impl IC3 {
             (!lemma.as_litvec()).iter().map(|l| u32::from(*l)).collect()
         };
         let mut lemmas = Vec::new();
-        for f in 0..self.frame.len() {
+        let frontier = self.frame.len() as u32 - 1;
+        let band_lo = crate::fastlane::band().map_or(0, |b| frontier.saturating_sub(b));
+        for f in band_lo as usize..self.frame.len() {
             let (lo, hi) = if f == 0 { (0, 0) } else { (1, f as u32) };
             for lemma in self.frame[f].iter() {
                 lemmas.push((raw(lemma), lo, hi));
@@ -457,7 +459,7 @@ impl IC3 {
         for lemma in self.frame.inf.iter() {
             lemmas.push((raw(lemma), 1, u32::MAX));
         }
-        crate::fastlane::pool_reload(&lemmas);
+        crate::fastlane::pool_reload(&lemmas, band_lo);
     }
 
     #[inline]
