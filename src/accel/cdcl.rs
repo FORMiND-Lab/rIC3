@@ -15,6 +15,18 @@ pub const ABI_VERSION: u32 = 2;
 /// query-private records. Query and response records remain ABI v2.
 pub const SHARED_DOMAIN_BATCH_VERSION: u32 = 3;
 
+/// Version written into ordinary query and batch headers. Ordinary records are
+/// wire-identical between v1 and v2 (only the MIC response header grew), so
+/// `INDUCTOR_CDCL_WIRE_ABI=1` lets this client drive archived v1 images.
+pub fn wire_abi_version() -> u32 {
+    use std::sync::OnceLock;
+    static VERSION: OnceLock<u32> = OnceLock::new();
+    *VERSION.get_or_init(|| match std::env::var("INDUCTOR_CDCL_WIRE_ABI").ok().as_deref() {
+        Some("1") => 1,
+        _ => ABI_VERSION,
+    })
+}
+
 /// Return a sparse model over the variables assigned by the search.
 pub const WANT_MODEL: u32 = 1 << 0;
 /// Return the subset of assumptions used by an UNSAT result.
@@ -845,7 +857,7 @@ pub struct BatchResponseHeader {
 
 impl BatchHeader {
     pub fn valid_for(&self, request_words: &[u32]) -> bool {
-        if self.version != ABI_VERSION
+        if self.version != wire_abi_version()
             || usize::try_from(self.n_request_words).ok() != Some(request_words.len())
         {
             return false;
@@ -993,7 +1005,7 @@ impl QueryHeader {
     }
 
     pub fn valid_for(&self, payload: &[u32]) -> bool {
-        if self.version != ABI_VERSION
+        if self.version != wire_abi_version()
             || self.payload_words() != Some(payload.len())
             || self.flags & PACKED_SAT_MODEL != 0 && self.flags & BANK_ALIGNED_DOMAIN == 0
             || self.flags & BANK_ALIGNED_DOMAIN != 0 && self.n_domain & 3 != 0

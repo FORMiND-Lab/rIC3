@@ -2636,10 +2636,37 @@ impl IC3 {
         Some(result)
     }
 
+    /// INDUCTOR_EXP_SKIP=3: generalize and push the deferred core lemma.
+    pub(super) fn exp_flush_pending(&mut self) -> bool {
+        let Some((k, cube, mic_type)) = self.exp_pending_mic.take() else {
+            return false;
+        };
+        let mic = self.mic(k, cube, &[], mic_type);
+        let (frame, mic) = self.push_lemma(k, mic);
+        self.add_lemma(frame - 1, mic, false, None)
+    }
+
     fn push_lemma(&mut self, frame: usize, mut cube: LitVec) -> (usize, LitVec) {
         let start = Instant::now();
         let _op = crate::inductor::macro_scope(inductor_trace::Phase::Push, frame);
-        for i in frame + 1..=self.level() {
+        let mut first = frame + 1;
+        if let Some(fused) = self.fastlane_pushed.take() {
+            let raw: Vec<u32> = cube.iter().map(|l| u32::from(*l)).collect();
+            if raw == fused.input {
+                crate::fastlane::FUSED_PUSH_USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let to_lit = |x: u32| Lit::new(logicrs::Var::from(x >> 1), x & 1 == 0);
+                cube = LitVec::from_iter(fused.cube.iter().map(|&x| to_lit(x)));
+                if fused.complete {
+                    self.statistic.block.push_time += start.elapsed();
+                    if fused.frame <= self.level() {
+                        return (fused.frame, cube);
+                    }
+                    return (self.level() + 1, cube);
+                }
+                first = fused.frame;
+            }
+        }
+        for i in first..=self.level() {
             let _ctx = crate::inductor::set_context(inductor_trace::Phase::Push, i);
             if self.solvers[i - 1].inductive(&cube, true) {
                 cube = self.solvers[i - 1].inductive_core().unwrap_or(cube);
@@ -2670,9 +2697,36 @@ impl IC3 {
             return proved;
         };
         let original_cube_size = mic.len();
-        mic = self.mic(po.frame, mic, &[], mic_type);
+        // FastLane: let the card run push_lemma right after its PMIC (one
+        // round trip); push_lemma below adopts the result if the cube
+        // matches.
+        self.fastlane_pushed = None;
+        self.fastlane_push_req = crate::fastlane::fuse_push_enabled().then(|| (po.frame, self.level()));
+        // Experiment (INDUCTOR_EXP_SKIP: 1 = skip MIC, 2 = skip MIC and
+        // push): measures what MIC/push buy on a benchmark.
+        let skip = exp_skip();
+        if skip == 0 {
+            mic = self.mic(po.frame, mic, &[], mic_type);
+        }
+        self.fastlane_push_req = None;
         let generalized_cube_size = mic.len();
-        let (frame, mic) = self.push_lemma(po.frame, mic);
+        if skip == 3 {
+            // Deferred MIC: block with the core lemma now, generalize and
+            // push it after the next block query (the CPU/card overlap
+            // trajectory).
+            if self.exp_flush_pending() {
+                return true;
+            }
+            po.push_to(po.frame + 1);
+            self.add_obligation(po.clone());
+            note_exact_obligation_op(semantic_ops, BLOCK_SEMANTIC_INSERT_OBLIGATION, &po);
+            let proved = self.add_lemma(po.frame - 1, mic.clone(), false, Some(po.clone()));
+            note_exact_lemma_mutations(semantic_ops, finish_block_lemma_journal());
+            self.exp_pending_mic = Some((po.frame - 1, mic, mic_type));
+            return proved;
+        }
+        let (frame, mic) =
+            if skip >= 2 { (po.frame + 1, mic) } else { self.push_lemma(po.frame, mic) };
         if self.cfg.mab {
             self.mab_feedback(&po, original_cube_size, generalized_cube_size, frame);
         }
@@ -2773,13 +2827,16 @@ impl IC3 {
                 )
             })
             .flatten();
-        let result = self.block_inner(
+        let mut result = self.block_inner(
             limit,
             &mut progress,
             full_root_fpga_enabled,
             leaf_fpga_enabled,
             &mut resident_full_root_inquiries,
         );
+        if self.exp_flush_pending() && matches!(result, BlockResult::Success) {
+            result = BlockResult::Proved;
+        }
         let root_elapsed_ns =
             root_started.map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         let (result_code, result_aux) = match &result {
@@ -3971,6 +4028,9 @@ impl IC3 {
                 let (model, inputs) = speculative_pred
                     .take()
                     .unwrap_or_else(|| self.get_pred(po.frame, true));
+                if self.exp_flush_pending() {
+                    return BlockResult::Proved;
+                }
                 let pred = ProofObligation::new(
                     po.frame - 1,
                     LitOrdVec::new(model),
@@ -4090,4 +4150,11 @@ fn luby(y: f64, mut x: usize) -> f64 {
         x %= size;
     }
     y.powi(seq)
+}
+
+fn exp_skip() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INDUCTOR_EXP_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
 }

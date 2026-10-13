@@ -420,6 +420,34 @@ impl Drop for PhaseGuard {
     }
 }
 
+thread_local! {
+    static DOWN_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Start a new MIC `down()` chain; queries issued until the next call share
+/// its id (used to model speculative parallel MIC offline).
+#[inline]
+pub fn next_down_id() {
+    DOWN_ID.with(|d| d.set(d.get() + 1));
+}
+
+#[inline]
+pub fn current_down_id() -> u64 {
+    DOWN_ID.with(|d| d.get())
+}
+
+/// Macro-op id (innermost, outermost) of the query being issued.
+#[inline]
+pub fn current_ops() -> (u32, u32) {
+    (OP.with(|o| o.get()), ROOT_OP.with(|o| o.get()))
+}
+
+/// Phase label of the query being issued on this thread (`Phase as u8`).
+#[inline]
+pub fn current_phase() -> u8 {
+    PHASE.with(|p| p.get())
+}
+
 /// Label the queries issued for as long as the returned guard lives.
 #[inline]
 pub fn set_context(phase: Phase, frame: usize) -> PhaseGuard {

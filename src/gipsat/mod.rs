@@ -70,6 +70,12 @@ pub struct DagCnfSolver {
     /// The frame this solver belongs to. Queries pass it to the card, which
     /// holds every frame's lemmas and skips the ones this frame does not.
     pub accel_level: u32,
+    /// Software model of a resident hardware lane mirroring this solver
+    /// (created lazily; see `crate::fastlane`).
+    pub fastlane: Option<crate::fastlane::LaneHandle>,
+    /// IC3 frame (solver index) when this is a frame solver served by the
+    /// frame-ranged lane pool.
+    pub fastlane_frame: Option<u32>,
     /// Inductor instrumentation: per-query timings and counters.
     pub probe: crate::inductor::QueryProbe,
     /// Inductor: fanout degree per variable, i.e. how many gates a
@@ -142,6 +148,64 @@ impl DagCnfSolver {
         )
     }
 
+    /// Tab-separated GipSAT probe fields of the last query (shadow logging).
+    pub fn probe_summary(&self) -> String {
+        let p = &self.probe;
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            p.t_setup_ns, p.t_search_ns, p.t_bcp_ns, p.t_teardown_ns, p.n_decide, p.n_prop,
+            p.n_conflict, p.n_learnt
+        )
+    }
+
+    /// Initialise the frame-ranged pool from this (first) frame solver.
+    pub fn fastlane_pool_init(&self) {
+        let n_var = self.dc.num_var();
+        let mut offsets = Vec::with_capacity(n_var + 1);
+        let mut deps = Vec::new();
+        offsets.push(0u32);
+        for v in 0..n_var {
+            deps.extend(self.dc.dep(Var::from(v)).iter().map(|d| u32::from(*d)));
+            offsets.push(deps.len() as u32);
+        }
+        let raw = |c: &LitVec| c.iter().map(|l| u32::from(*l)).collect::<Vec<u32>>();
+        let trans: Vec<Vec<u32>> = self.resident_trans.iter().map(raw).collect();
+        let base: Vec<Vec<u32>> = self.resident_lemmas.iter().map(raw).collect();
+        crate::fastlane::pool_init(n_var as u32, &offsets, &deps, &trans, &base);
+    }
+
+    /// The lane mirroring this solver, built on first use from the resident
+    /// transition and every clause added so far.
+    pub fn fastlane_lane(&mut self) -> &mut crate::fastlane::LaneHandle {
+        if self.fastlane.is_none() {
+            let n_var = self.dc.num_var();
+            let mut offsets = Vec::with_capacity(n_var + 1);
+            let mut deps = Vec::new();
+            offsets.push(0u32);
+            for v in 0..n_var {
+                deps.extend(self.dc.dep(Var::from(v)).iter().map(|d| u32::from(*d)));
+                offsets.push(deps.len() as u32);
+            }
+            let mut lane = crate::fastlane::LaneHandle::new(n_var as u32, &offsets, &deps)
+                .expect("FastLane model library is not linked");
+            // GipSAT's domain always holds the constant variable.
+            lane.add_fixed_domain(0);
+            for clause in self.resident_trans.iter() {
+                let raw: Vec<u32> = clause.iter().map(|l| u32::from(*l)).collect();
+                lane.add_clause(&raw);
+            }
+            for clause in self.resident_lemmas.iter() {
+                let raw: Vec<u32> = clause.iter().map(|l| u32::from(*l)).collect();
+                lane.add_clause(&raw);
+                for l in clause.iter() {
+                    lane.add_fixed_domain(u32::from(l.var()));
+                }
+            }
+            self.fastlane = Some(lane);
+        }
+        self.fastlane.as_mut().unwrap()
+    }
+
     pub fn new(dc: &DagCnf) -> Self {
         let constrain_act = Var::CONST;
         let resident_trans = dc.clause().cloned().collect();
@@ -176,6 +240,8 @@ impl DagCnfSolver {
             trivial_unsat: false,
             accel_id: Self::fresh_accel_id(),
             accel_level: 0,
+            fastlane: None,
+            fastlane_frame: None,
             probe: Default::default(),
             fanout_len: Default::default(),
             rng: SmallRng::seed_from_u64(0),
@@ -274,6 +340,19 @@ impl DagCnfSolver {
         self.eqc.add_eq(x, y);
     }
 
+    /// Like `reset`, but keeps a temporary (MIC-wide) domain installed by
+    /// `set_domain`, so an externally answered query inside a MIC does not
+    /// tear down the domain that later queries of the same MIC rely on.
+    pub(crate) fn reset_keep_domain(&mut self) {
+        if !self.temporary_domain {
+            self.reset();
+            return;
+        }
+        self.backtrack(0, true);
+        self.clean_temporary();
+        self.prepared_vsids = false;
+    }
+
     fn reset(&mut self) {
         self.backtrack(0, false);
         self.clean_temporary();
@@ -335,6 +414,33 @@ impl DagCnfSolver {
         limit: Option<usize>,
     ) -> Option<bool> {
         self.solve_with_limits(assump, constraint, domain, limit, None, true)
+    }
+
+    /// Budgeted inquiry (used while the card is still coming up): the
+    /// result when it completes within `conflict_limit` conflicts, else
+    /// `None` with the solver back at a clean query boundary.
+    pub fn solve_with_constraint_budget(
+        &mut self,
+        assump: &[Lit],
+        constraint: Vec<LitVec>,
+        conflict_limit: u32,
+    ) -> Option<bool> {
+        let result =
+            self.solve_with_limits(assump, constraint, empty::<Var>(), None, Some(conflict_limit), true);
+        if result.is_none() {
+            self.reset();
+        }
+        result
+    }
+
+    /// Unlimited inquiry that stops (`None`, clean query boundary) once a
+    /// raced card SOLVE has answered (`fastlane::RACING`).
+    pub fn solve_with_constraint_raced(&mut self, assump: &[Lit], constraint: Vec<LitVec>) -> Option<bool> {
+        let result = self.solve_with_limits(assump, constraint, empty::<Var>(), None, None, true);
+        if result.is_none() {
+            self.reset();
+        }
+        result
     }
 
     fn solve_with_limits(
@@ -803,6 +909,13 @@ impl Satif for DagCnfSolver {
 
     fn add_clause(&mut self, clause: &[Lit]) {
         self.reset();
+        if let Some(lane) = self.fastlane.as_mut() {
+            let raw: Vec<u32> = clause.iter().map(|l| u32::from(*l)).collect();
+            lane.add_clause(&raw);
+            for l in clause.iter() {
+                lane.add_fixed_domain(u32::from(l.var()));
+            }
+        }
         self.resident_lemmas.push(LitVec::from(clause));
         self.resident_revision = self.resident_revision.saturating_add(1);
         for l in clause.iter() {

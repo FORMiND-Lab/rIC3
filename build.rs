@@ -34,6 +34,18 @@ fn main() {
     // argument indices and threw on init.
     println!("cargo:rerun-if-changed={lib}/libinductor_accel.a");
     println!("cargo:rerun-if-changed={lib}/libinductor_cdcl_host.a");
+    // FastLane golden model (software lane), optional.
+    let fastlane = std::env::var("INDUCTOR_FASTLANE_LIB")
+        .unwrap_or_else(|_| "../../hls/fastlane/build".to_string());
+    if std::path::Path::new(&format!("{fastlane}/libfastlane_model.a")).exists() {
+        println!("cargo:rustc-link-search=native={fastlane}");
+        println!("cargo:rustc-link-lib=static=fastlane_model");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-cfg=has_fastlane");
+    }
+    println!("cargo:rerun-if-env-changed=INDUCTOR_FASTLANE_LIB");
+    println!("cargo:rerun-if-changed={fastlane}/libfastlane_model.a");
+    println!("cargo:rustc-check-cfg=cfg(has_fastlane)");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(has_accel)");
     println!("cargo:rustc-check-cfg=cfg(has_cdcl_accel)");

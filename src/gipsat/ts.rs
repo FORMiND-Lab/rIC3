@@ -13,6 +13,11 @@ pub struct TransysSolver {
     relind: LitVec,
 }
 
+#[inline]
+fn raw_lit(raw: u32) -> Lit {
+    Lit::new(Var::from(raw >> 1), raw & 1 == 0)
+}
+
 impl TransysSolver {
     pub fn new(ts: &Grc<TransysCtx>) -> Self {
         let mut dcs = DagCnfSolver::new(&ts.rel);
@@ -59,7 +64,226 @@ impl TransysSolver {
         if strengthen {
             constraint.push(LitVec::from_iter(cube.iter().map(|l| !*l)));
         }
+        if crate::fastlane::enabled()
+            && crate::fastlane::routes_phase(crate::inductor::current_phase())
+            && (!crate::fastlane::pool_mode() || self.dcs.fastlane_frame.is_some())
+        {
+            if crate::fastlane::shadow() {
+                return self.inductive_shadowed(&assump, &constraint);
+            }
+            // While the card is coming up, light queries run on the CPU; a
+            // query that exceeds the warm-up budget goes to the card (the
+            // flush waits for it).
+            // With INDUCTOR_FASTLANE_CPU_FIRST=<conflicts> every query first
+            // runs on the CPU under that budget and only harder ones go on.
+            let budget = if crate::fastlane::card_ready() {
+                crate::fastlane::cpu_first_budget()
+            } else {
+                Some(crate::fastlane::warmup_conflicts())
+            };
+            if let Some(budget) = budget
+                && let Some(sat) = self.dcs.solve_with_constraint_budget(&assump, constraint.clone(), budget)
+            {
+                return !sat;
+            }
+            if crate::fastlane::race_enabled()
+                && crate::fastlane::card_ready()
+                && let Some(blocked) = self.inductive_raced(cube, &assump, &constraint)
+            {
+                return blocked;
+            }
+            if let Some(blocked) = self.inductive_on_lane(cube, &assump, &constraint) {
+                return blocked;
+            }
+        }
         !self.dcs.solve_with_constraint(&assump, constraint.clone())
+    }
+
+    /// Solve on this solver's private lane, or on pool replica 0 at this
+    /// solver's frame in pool mode.
+    fn lane_solve(&mut self, assump: &[u32], temps: &[Vec<u32>]) -> crate::fastlane::LaneResult {
+        if crate::fastlane::pool_mode() {
+            let frame = self.dcs.fastlane_frame.unwrap_or(0);
+            return crate::fastlane::with_pool(|pool| pool.replicas[0].solve_frame(assump, temps, 0, frame))
+                .unwrap_or(crate::fastlane::LaneResult::Unknown);
+        }
+        self.dcs.fastlane_lane().solve(assump, temps, 0)
+    }
+
+    /// GipSAT answers; the lane solves the same query for paired logging.
+    fn inductive_shadowed(&mut self, assump: &LitVec, constraint: &[LitVec]) -> bool {
+        use std::sync::atomic::Ordering;
+        let started = std::time::Instant::now();
+        let sat = self.dcs.solve_with_constraint(assump, constraint.to_vec());
+        let cpu_ns = started.elapsed().as_nanos() as u64;
+        let raw_assump: Vec<u32> = assump.iter().map(|l| u32::from(*l)).collect();
+        let raw_temps: Vec<Vec<u32>> = constraint
+            .iter()
+            .map(|c| c.iter().map(|l| u32::from(*l)).collect())
+            .collect();
+        let before = crate::fastlane::global_events();
+        let lane_started = std::time::Instant::now();
+        let result = self.lane_solve(&raw_assump, &raw_temps);
+        let ns = lane_started.elapsed().as_nanos() as u64;
+        crate::fastlane::LANE_NS.fetch_add(ns, Ordering::Relaxed);
+        let after = crate::fastlane::global_events();
+        let status = match &result {
+            crate::fastlane::LaneResult::Sat { .. } => 1,
+            crate::fastlane::LaneResult::Unsat { .. } => 2,
+            crate::fastlane::LaneResult::Unknown => 0,
+        };
+        if status != if sat { 1 } else { 2 } {
+            crate::fastlane::SHADOW_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::fastlane::log_query(
+            crate::inductor::current_phase(),
+            self.dcs.accel_level,
+            status,
+            ns,
+            cpu_ns,
+            &self.dcs.probe_summary(),
+            &before,
+            &after,
+        );
+        !sat
+    }
+
+    /// Answer one relative-induction query on this solver's FastLane model
+    /// and install the result into GipSAT's live state, so IC3 reads the
+    /// model or core exactly as after a CPU solve.  `None` falls back to CPU.
+    fn inductive_on_lane(
+        &mut self,
+        cube: &[Lit],
+        assump: &LitVec,
+        constraint: &[LitVec],
+    ) -> Option<bool> {
+        use crate::fastlane::{LaneResult, ROUTED};
+        use std::sync::atomic::Ordering;
+        let phase = crate::inductor::current_phase() as usize;
+        let raw_assump: Vec<u32> = assump.iter().map(|l| u32::from(*l)).collect();
+        let raw_temps: Vec<Vec<u32>> = constraint
+            .iter()
+            .map(|c| c.iter().map(|l| u32::from(*l)).collect())
+            .collect();
+        ROUTED.fetch_add(1, Ordering::Relaxed);
+        crate::fastlane::PHASE_COUNTS[phase.min(7)].fetch_add(1, Ordering::Relaxed);
+        let before = crate::fastlane::global_events();
+        let started = std::time::Instant::now();
+        let result = self.lane_solve(&raw_assump, &raw_temps);
+        let ns = started.elapsed().as_nanos() as u64;
+        crate::fastlane::LANE_NS.fetch_add(ns, Ordering::Relaxed);
+        let after = crate::fastlane::global_events();
+        crate::fastlane::note_card(crate::fastlane::wide_cycles(&before, &after));
+        let status = match &result {
+            LaneResult::Sat { .. } => 1,
+            LaneResult::Unsat { .. } => 2,
+            LaneResult::Unknown => 0,
+        };
+        crate::fastlane::log_query(
+            phase as u8,
+            self.dcs.accel_level,
+            status,
+            ns,
+            0,
+            "0\t0\t0\t0\t0\t0\t0\t0",
+            &before,
+            &after,
+        );
+        self.install_lane_result(cube, assump, constraint, result)
+    }
+
+    /// Install a lane answer into GipSAT's live state (see
+    /// `inductive_on_lane`); `None` if it cannot be used.
+    fn install_lane_result(
+        &mut self,
+        cube: &[Lit],
+        assump: &LitVec,
+        constraint: &[LitVec],
+        result: crate::fastlane::LaneResult,
+    ) -> Option<bool> {
+        use crate::fastlane::{LaneResult, ROUTED_SAT, ROUTED_UNKNOWN, ROUTED_UNSAT};
+        use std::sync::atomic::Ordering;
+        let query = |domain: Vec<Var>| IncrementalQuery {
+            frame: self.dcs.accel_level,
+            assumptions: assump.clone(),
+            constraints: constraint.to_vec(),
+            domain,
+            budget: QueryBudget::default(),
+            keep_learnts: false,
+        };
+        match result {
+            LaneResult::Sat { domain, model } => {
+                let q = query(domain.into_iter().map(|v| Var::from(v as usize)).collect());
+                let model: Vec<Lit> = model.into_iter().map(raw_lit).collect();
+                if !self.dcs.install_lane_sat_model(&q, &model) {
+                    crate::fastlane::INSTALL_FAILED.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                ROUTED_SAT.fetch_add(1, Ordering::Relaxed);
+                Some(false)
+            }
+            LaneResult::Unsat { core, used_temps } => {
+                let q = query(Vec::new());
+                let core: Vec<Lit> = core.into_iter().map(raw_lit).collect();
+                if !self
+                    .dcs
+                    .install_incremental_proven_unsat_core(&q, &core, used_temps)
+                {
+                    crate::fastlane::INSTALL_FAILED.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                self.relind = LitVec::from(cube);
+                ROUTED_UNSAT.fetch_add(1, Ordering::Relaxed);
+                Some(true)
+            }
+            LaneResult::Unknown => {
+                ROUTED_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Race: the card solves the query while the CPU keeps searching; the
+    /// first answer is used (the card's then installed as from a lane).
+    fn inductive_raced(&mut self, cube: &[Lit], assump: &LitVec, constraint: &[LitVec]) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        let raw_assump: Vec<u32> = assump.iter().map(|l| u32::from(*l)).collect();
+        let raw_temps: Vec<Vec<u32>> = constraint
+            .iter()
+            .map(|c| c.iter().map(|l| u32::from(*l)).collect())
+            .collect();
+        if crate::fastlane::card_busy() {
+            let t0 = std::time::Instant::now();
+            let sat = self.dcs.solve_with_constraint(assump, constraint.to_vec());
+            crate::fastlane::RACE_BUSY.fetch_add(1, Ordering::Relaxed);
+            crate::fastlane::RACE_BUSY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return Some(!sat);
+        }
+        let frame = self.dcs.fastlane_frame.unwrap_or(0);
+        let submitted = crate::fastlane::with_pool(|pool| pool.replicas[0].submit_frame(&raw_assump, &raw_temps, frame))
+            .unwrap_or(false);
+        if !submitted {
+            return None;
+        }
+        crate::fastlane::RACING.store(true, Ordering::Relaxed);
+        let cpu = self.dcs.solve_with_constraint_raced(assump, constraint.to_vec());
+        crate::fastlane::RACING.store(false, Ordering::Relaxed);
+        if let Some(sat) = cpu {
+            crate::fastlane::card_abort();
+            crate::fastlane::note_race(false);
+            return Some(!sat);
+        }
+        crate::fastlane::note_race(true);
+        crate::fastlane::ROUTED.fetch_add(1, Ordering::Relaxed);
+        let phase = crate::inductor::current_phase() as usize;
+        crate::fastlane::PHASE_COUNTS[phase.min(7)].fetch_add(1, Ordering::Relaxed);
+        let result = crate::fastlane::with_pool(|pool| pool.replicas[0].collect_frame())
+            .unwrap_or(crate::fastlane::LaneResult::Unknown);
+        match self.install_lane_result(cube, assump, constraint, result) {
+            Some(blocked) => Some(blocked),
+            // unusable card answer: the CPU solves the query after all
+            None => Some(!self.dcs.solve_with_constraint(assump, constraint.to_vec())),
+        }
     }
 
     pub fn inductive(&mut self, cube: &[Lit], strengthen: bool) -> bool {

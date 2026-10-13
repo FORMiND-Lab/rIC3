@@ -85,7 +85,9 @@ impl DagCnfSolver {
             });
             match self.search(assumption, Some(search_conflicts), retain_learnts) {
                 None => {
-                    if conflict_limit.is_some_and(|limit| self.probe.n_conflict >= limit) {
+                    if conflict_limit.is_some_and(|limit| self.probe.n_conflict >= limit)
+                        || crate::fastlane::race_stop()
+                    {
                         return None;
                     }
                     restarts += 1;
@@ -144,6 +146,10 @@ impl DagCnfSolver {
                 }
                 self.vsids.decay();
                 self.cdb.decay();
+                if crate::fastlane::race_stop() {
+                    self.backtrack(assumption.len(), true);
+                    return None;
+                }
             } else {
                 if let Some(noc) = noc
                     && num_conflict >= noc

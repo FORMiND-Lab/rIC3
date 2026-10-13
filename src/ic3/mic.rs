@@ -784,6 +784,7 @@ impl IC3 {
     ) -> Option<LitVec> {
         let mut cube = cube.clone();
         self.statistic.num_down += 1;
+        crate::inductor::next_down_id();
         loop {
             if self.tsctx.cube_subsume_init(&cube) {
                 if let Some(prefetched) = prefetched.take() {
@@ -1043,6 +1044,7 @@ impl IC3 {
     ) -> Option<LitVec> {
         let mut cube = cube.clone();
         self.statistic.num_down += 1;
+        crate::inductor::next_down_id();
         let mut ctg = 0;
         loop {
             if self.tsctx.cube_subsume_init(&cube) {
@@ -1154,6 +1156,46 @@ impl IC3 {
             }
             cube = cube_new;
         }
+    }
+
+    /// Speculative parallel MIC on the FastLane replica pool.
+    fn fastlane_pmic(&mut self, frame: usize, cube: &LitVec, constraint: &[LitVec]) -> Option<LitVec> {
+        let n_var = crate::fastlane::with_pool(|pool| pool.n_var)? as usize;
+        let mut next_of_var = vec![u32::MAX; n_var];
+        let mut init_of_var = vec![2u8; n_var];
+        for latch in self.tsctx.latch.iter() {
+            let v: usize = (*latch).into();
+            if v < n_var {
+                next_of_var[v] = u32::from(self.tsctx.next(latch.lit()));
+                if let Some(c) = self.tsctx.init_map[*latch].and_then(|l| l.try_constant()) {
+                    init_of_var[v] = u8::from(c);
+                }
+            }
+        }
+        let mut act_key = vec![0u64; n_var];
+        for l in cube.iter() {
+            let v: usize = l.var().into();
+            if v < n_var {
+                act_key[v] = self.activity.key(l.var());
+            }
+        }
+        let raw: Vec<u32> = cube.iter().map(|l| u32::from(*l)).collect();
+        let cons: Vec<Vec<u32>> = constraint
+            .iter()
+            .map(|c| c.iter().map(|l| u32::from(*l)).collect())
+            .collect();
+        let push = self.fastlane_push_req.take().map(|(from, to)| (from as u32, to as u32));
+        let (out, fused) = crate::fastlane::pool_pmic_push(
+            (frame - 1) as u32,
+            &raw,
+            &cons,
+            &act_key,
+            &next_of_var,
+            &init_of_var,
+            push,
+        )?;
+        self.fastlane_pushed = fused;
+        Some(LitVec::from_iter(out.into_iter().map(|x| Lit::new(logicrs::Var::from(x >> 1), x & 1 == 0))))
     }
 
     fn handle_down_success(
@@ -1270,6 +1312,16 @@ impl IC3 {
         } else {
             None
         };
+        if parameter.level == 0
+            && crate::fastlane::pmic_enabled()
+            && crate::fastlane::card_ready()
+            && let Some(new_cube) = self.fastlane_pmic(frame, &cube, constraint)
+        {
+            self.solvers[frame - 1].unset_domain();
+            self.activity.bump_cube_activity(&new_cube);
+            self.statistic.block.mic_time += start.elapsed();
+            return new_cube;
+        }
         let mut keep = GHashSet::new();
         // Independent MIC batches lose almost all useful tail work as soon as
         // one early drop shrinks the cube. The full-CDCL MIC-chain command

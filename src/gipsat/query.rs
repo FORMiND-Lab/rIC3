@@ -1,9 +1,9 @@
 use super::DagCnfSolver;
 use super::cdb::CREF_NONE;
 use crate::accel::cdcl::{
-    ABI_VERSION, BANK_ALIGNED_DOMAIN, BatchHeader, BatchResponseHeader, KEEP_LEARNTS,
-    PACKED_SAT_MODEL, QueryHeader, RESPONSE_HEADER_WORDS, ResponseHeader, Status, UnknownReason,
-    WANT_CORE, WANT_MODEL,
+    BANK_ALIGNED_DOMAIN, BatchHeader, BatchResponseHeader, KEEP_LEARNTS, PACKED_SAT_MODEL,
+    QueryHeader, RESPONSE_HEADER_WORDS, ResponseHeader, Status, UnknownReason, WANT_CORE,
+    WANT_MODEL,
 };
 use logicrs::{Lbool, Lit, LitVec, Var, satif::Satif};
 
@@ -143,7 +143,7 @@ impl IncrementalQuery {
             }
         }
         let header = QueryHeader {
-            version: ABI_VERSION,
+            version: crate::accel::cdcl::wire_abi_version(),
             frame: self.frame,
             flags,
             n_assumptions: self.assumptions.len() as u32,
@@ -182,7 +182,7 @@ pub(crate) fn pack_batch_with_domain_mode(
         words.extend(payload);
     }
     let header = BatchHeader {
-        version: ABI_VERSION,
+        version: crate::accel::cdcl::wire_abi_version(),
         n_queries: queries
             .len()
             .try_into()
@@ -257,7 +257,7 @@ pub fn decode_batch_results(
         n_result_words: prefix[2],
         error: prefix[3],
     };
-    if batch.version != ABI_VERSION {
+    if batch.version != crate::accel::cdcl::wire_abi_version() {
         return Err(BatchDecodeError::Version);
     }
     if usize::try_from(batch.n_queries).ok() != Some(queries.len()) {
@@ -445,7 +445,7 @@ impl DagCnfSolver {
             unmatched.swap_remove(position);
         }
 
-        self.reset();
+        self.reset_keep_domain();
         self.assump = query.assumptions.clone();
         self.constraint = query.constraints.clone();
         self.unsat_core.clear();
@@ -573,19 +573,20 @@ impl DagCnfSolver {
             true,
         );
         if !setup_ok {
-            self.reset();
+            self.reset_keep_domain();
             return false;
         }
         self.clean_learnt(true);
         self.simplify();
 
         self.new_level();
+        let level_start = self.trail.len() as u32;
         if !query.constraints.is_empty() {
             let activation = self.constrain_act.lit();
             match self.value.v(activation) {
                 Lbool::TRUE => {}
                 Lbool::FALSE => {
-                    self.reset();
+                    self.reset_keep_domain();
                     return false;
                 }
                 _ => self.assign(activation, CREF_NONE),
@@ -599,7 +600,7 @@ impl DagCnfSolver {
             match self.value.v(lit) {
                 Lbool::TRUE => {}
                 Lbool::FALSE => {
-                    self.reset();
+                    self.reset_keep_domain();
                     return false;
                 }
                 _ => self.assign(lit, CREF_NONE),
@@ -611,7 +612,16 @@ impl DagCnfSolver {
         // violates its normal one-decision-at-a-time invariant. Downstream
         // predecessor lifting only reads values and selectively calls
         // `flip_to_none`.
-        self.propagated = self.trail.len() as u32;
+        // Run BCP over the installed assignment once.  A consistent model
+        // propagates nothing new, but this restores the two-watched-literal
+        // invariant that `flip_to_none` relies on during predecessor lifting:
+        // a clause kept true only by literal l must watch l.  Without it,
+        // lifting can drop a latch the clause still needs.
+        self.propagated = level_start;
+        if self.propagate() != CREF_NONE {
+            self.reset_keep_domain();
+            return false;
+        }
         true
     }
 
@@ -651,6 +661,60 @@ impl DagCnfSolver {
     /// not a solver fallback: only frame/model transport shape is checked, then
     /// GipSAT's live model state is reconstructed for existing IC3 consumers.
     /// Use only behind the explicit accelerator trust policy.
+    /// Install a lane model whose domain is exactly `query.domain`.
+    pub fn install_lane_sat_model(&mut self, query: &IncrementalQuery, model: &[Lit]) -> bool {
+        if crate::fastlane::check_models() {
+            let Some(assignment) = self.incremental_domain_assignment(query, model) else {
+                eprintln!("fastlane-check: model does not cover the domain exactly");
+                return false;
+            };
+            let lit_value = |lit: Lit| -> Option<bool> {
+                let var: usize = lit.var().into();
+                assignment.get(var).copied().flatten().map(|v| v == lit.polarity())
+            };
+            let gipsat_domain: std::collections::BTreeSet<usize> = self
+                .incremental_local_domain(
+                    query
+                        .assumptions
+                        .iter()
+                        .chain(query.constraints.iter().flatten())
+                        .map(|l| l.var()),
+                )
+                .into_iter()
+                .map(usize::from)
+                .collect();
+            let lane_domain: std::collections::BTreeSet<usize> =
+                query.domain.iter().map(|v| usize::from(*v)).collect();
+            if gipsat_domain != lane_domain {
+                let missing = gipsat_domain.difference(&lane_domain).count();
+                let extra = lane_domain.difference(&gipsat_domain).count();
+                eprintln!(
+                    "fastlane-check: domain gipsat={} lane={} missing={missing} extra={extra} missing_vars={:?}",
+                    gipsat_domain.len(),
+                    lane_domain.len(),
+                    gipsat_domain.difference(&lane_domain).take(8).collect::<Vec<_>>()
+                );
+            }
+            if query.assumptions.iter().any(|&l| lit_value(l) != Some(true)) {
+                eprintln!("fastlane-check: assumption not satisfied");
+                return false;
+            }
+            for clause in self
+                .resident_trans
+                .iter()
+                .chain(&self.resident_lemmas)
+                .chain(&query.constraints)
+            {
+                let values: Vec<Option<bool>> = clause.iter().map(|&l| lit_value(l)).collect();
+                if values.iter().all(|v| v.is_some()) && !values.iter().any(|v| *v == Some(true)) {
+                    eprintln!("fastlane-check: violated in-domain clause {clause:?}");
+                    return false;
+                }
+            }
+        }
+        self.install_trusted_incremental_sat_model(query, model)
+    }
+
     pub fn install_trusted_incremental_sat_model(
         &mut self,
         query: &IncrementalQuery,
@@ -765,6 +829,7 @@ impl IncrementalCdcl for DagCnfSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accel::cdcl::ABI_VERSION;
     use logicrs::satif::Satif;
     use logicrs::{DagCnf, LitVec};
 

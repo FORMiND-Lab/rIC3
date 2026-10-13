@@ -52,6 +52,11 @@ impl Activity {
         cube.iter().for_each(|l| self.bump(l.var()));
     }
 
+    /// Order-preserving integer key of a variable's activity (>= 0).
+    pub fn key(&self, var: Var) -> u64 {
+        self.activity[var].to_bits()
+    }
+
     #[inline]
     pub fn cmp(&self, a: impl Into<Var>, b: impl Into<Var>) -> Ordering {
         self.activity[a].partial_cmp(&self.activity[b]).unwrap()

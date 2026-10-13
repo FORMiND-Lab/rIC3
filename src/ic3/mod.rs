@@ -192,6 +192,12 @@ pub struct IC3 {
     mic_batch_policy: mic::MicBatchPolicy,
     mic_chain_policy: mic::MicChainPolicy,
     push_prefetch: push_prefetch::PushPrefetchCache,
+    /// FastLane fused push: push range requested for the next PMIC (set
+    /// around `mic` in generalization) and the card's push_lemma result,
+    /// consumed by `push_lemma` when its input cube matches.
+    fastlane_push_req: Option<(usize, usize)>,
+    fastlane_pushed: Option<crate::fastlane::FusedPush>,
+    exp_pending_mic: Option<(usize, LitVec, mic::MicType)>,
 
     rng: StdRng,
     filog: IntervalLogger,
@@ -222,6 +228,10 @@ impl IC3 {
         // names its frame and the engine skips what that frame does not hold.
         let frontier = self.solvers.len() - 1;
         self.solvers[frontier].dcs.accel_level = frontier as u32;
+        self.solvers[frontier].dcs.fastlane_frame = Some(frontier as u32);
+        if frontier == 0 {
+            self.solvers[0].dcs.fastlane_pool_init();
+        }
         self.frame.extend();
         if self.level() == 0 {
             for init in self.tsctx.init.clone() {
@@ -311,6 +321,9 @@ impl IC3 {
             mic_batch_policy: Default::default(),
             mic_chain_policy: Default::default(),
             push_prefetch: Default::default(),
+            fastlane_push_req: None,
+            fastlane_pushed: None,
+            exp_pending_mic: None,
             rng,
             filog: Default::default(),
             tracer: Tracer::new(),
@@ -577,6 +590,7 @@ impl Engine for IC3 {
         }
         self.push_prefetch.finish();
         crate::accel::report();
+        crate::fastlane::report();
         crate::inductor::finish(
             name,
             t0.elapsed().as_nanos() as u64,

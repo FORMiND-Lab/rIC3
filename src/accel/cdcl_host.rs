@@ -238,6 +238,10 @@ pub fn reset_frame_resident_context(solver: &DagCnfSolver) {
 /// The log stays append-only so the card normally advances with
 /// ADD_FRAME_CLAUSES instead of replacing the whole resident context.
 pub fn register_frame_resident_clause(literals: &[Lit], lo: u32, hi: u32) {
+    if crate::fastlane::pool_mode() && lo <= hi && !literals.is_empty() {
+        let raw: Vec<u32> = literals.iter().map(|l| u32::from(*l)).collect();
+        crate::fastlane::pool_register(&raw, lo, hi);
+    }
     if !active_frame_ranges() || lo > hi || literals.is_empty() {
         return;
     }

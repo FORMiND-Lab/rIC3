@@ -4,6 +4,7 @@ pub mod accel;
 pub mod bmc;
 pub mod cegar;
 pub mod config;
+pub mod fastlane;
 pub mod frontend;
 pub mod gipsat;
 pub mod ic3;
