@@ -527,6 +527,7 @@ pub fn pool_reload(lemmas: &[(Vec<u32>, u32, u32)]) {
         });
     });
     RELOAD_WANTED.store(false, Ordering::Relaxed);
+    MIRRORED.store(0, Ordering::Relaxed);
     RELOADS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1018,10 +1019,25 @@ pub fn pool_init(
     });
 }
 
+/// Proactive reload (`INDUCTOR_FASTLANE_RELOAD_CLAUSES=<n>`): rebuild the
+/// pool once n clauses were mirrored since it was (re)loaded.  The card lane
+/// otherwise fills with stale lemma copies and compacts over and over near
+/// its capacity before it finally overflows.
+fn reload_clauses() -> Option<u64> {
+    static N: OnceLock<Option<u64>> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_RELOAD_CLAUSES").ok().and_then(|v| v.parse().ok()))
+}
+static MIRRORED: AtomicU64 = AtomicU64::new(0);
+
 /// Mirror one frame-ranged clause (IC3 solver indices lo..=hi).
 pub fn pool_register(lits: &[u32], lo: u32, hi: u32) {
     if !pool_mode() {
         return;
+    }
+    if let Some(n) = reload_clauses()
+        && MIRRORED.fetch_add(1, Ordering::Relaxed) + 1 >= n
+    {
+        request_reload();
     }
     POOL.with(|pool| {
         if let Some(pool) = pool.borrow_mut().as_mut() {
