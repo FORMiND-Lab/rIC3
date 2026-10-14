@@ -289,10 +289,12 @@ impl IC3 {
             if crate::fastlane::reload_pending() {
                 self.fastlane_reload();
             }
+            let mut live = 0usize;
             for (lemma_index, mut lemma) in frame.into_iter().enumerate() {
                 if self.frame[frame_idx].iter().all(|l| l.ne(&lemma)) {
                     continue;
                 }
+                live += 1;
                 for ctp in 0..3 {
                     // A validated SAT model means the lemma is not blocked;
                     // a CPU-reproved FPGA core means it is blocked. Any stale,
@@ -370,6 +372,7 @@ impl IC3 {
                     } else {
                         None
                     };
+                    let check_start = Instant::now();
                     let blocked = match active_answer {
                         Some(blocked) => blocked,
                         None => self
@@ -378,7 +381,13 @@ impl IC3 {
                             .with_act_order(false)
                             .check(),
                     };
+                    if ctp == 0 {
+                        self.statistic.propagate.check0 += check_start.elapsed();
+                    } else {
+                        self.statistic.propagate.check_retry += check_start.elapsed();
+                    }
                     if blocked {
+                        let add_start = Instant::now();
                         let core = self.solvers[frame_idx]
                             .inductive_core()
                             .unwrap_or(lemma.as_litvec().clone());
@@ -390,12 +399,14 @@ impl IC3 {
                             self.obligations.add(po.clone());
                         }
                         self.add_lemma(frame_idx + 1, core, true, lemma.po);
+                        self.statistic.propagate.add_pushed += add_start.elapsed();
                         self.statistic.ctp.statistic(ctp > 0);
                         break;
                     }
                     if !self.cfg.ctp {
                         break;
                     }
+                    let ctp_start = Instant::now();
                     let (ctp, _) = self.get_pred(frame_idx + 1, false);
                     if !self.tsctx.cube_subsume_init(&ctp) && {
                         let _ctx = crate::inductor::set_context(
@@ -407,13 +418,21 @@ impl IC3 {
                         let core = self.solvers[frame_idx - 1].inductive_core().unwrap();
                         let mic =
                             self.mic(frame_idx, core, &[], MicType::DropVar(Default::default()));
-                        if self.add_lemma(frame_idx, mic, false, None) {
+                        let proved = self.add_lemma(frame_idx, mic, false, None);
+                        self.statistic.propagate.ctp_gen += ctp_start.elapsed();
+                        if proved {
                             return true;
                         }
                     } else {
+                        self.statistic.propagate.ctp_gen += ctp_start.elapsed();
                         break;
                     }
                 }
+            }
+            if live > 0 {
+                self.statistic.propagate.groups += 1;
+                self.statistic.propagate.group_lemmas += live;
+                self.statistic.propagate.max_group = self.statistic.propagate.max_group.max(live);
             }
             if self.frame[frame_idx].is_empty() {
                 return true;
