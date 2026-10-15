@@ -68,6 +68,7 @@ impl TransysSolver {
             && crate::fastlane::routes_phase(crate::inductor::current_phase())
             && (!crate::fastlane::pool_mode() || crate::fastlane::in_band(self.dcs.fastlane_frame))
             && !crate::fastlane::reload_pending()
+            && !crate::fastlane::push_split_enabled()
         {
             if crate::fastlane::shadow() {
                 return self.inductive_shadowed(&assump, &constraint);
@@ -360,6 +361,24 @@ impl TransysSolver {
             // unusable card answer: the CPU solves the query after all
             None => Some(!self.dcs.solve_with_constraint(assump, constraint.to_vec())),
         }
+    }
+
+    /// Push split: the card query for `cube`, as
+    /// `inductive_with_constrain(cube, false, vec![])` asks it (raw
+    /// assumption literals, no temporary clauses).
+    pub fn push_query_raw(&self, cube: &[Lit]) -> Vec<u32> {
+        self.ts.lits_next(cube).iter().map(|l| u32::from(*l)).collect()
+    }
+
+    /// Install the card's answer to `push_query_raw(cube)` as if this
+    /// solver had answered it; `None` if it cannot be used.
+    pub fn install_push_result(
+        &mut self,
+        cube: &[Lit],
+        result: crate::fastlane::LaneResult,
+    ) -> Option<bool> {
+        let assump = self.ts.lits_next(cube);
+        self.install_lane_result(cube, &assump, &[], result)
     }
 
     pub fn inductive(&mut self, cube: &[Lit], strengthen: bool) -> bool {

@@ -10,7 +10,7 @@ use crate::{
 };
 use logicrs::{LitOrdVec, LitVec, satif::Satif};
 use rand::seq::SliceRandom;
-use std::time::Instant;
+use std::{sync::atomic::Ordering, time::Instant};
 
 impl IC3 {
     fn consume_hardware_push_result(
@@ -289,6 +289,7 @@ impl IC3 {
             if crate::fastlane::reload_pending() {
                 self.fastlane_reload();
             }
+            let mut split = self.push_split(frame_idx, &frame);
             let mut live = 0usize;
             for (lemma_index, mut lemma) in frame.into_iter().enumerate() {
                 if self.frame[frame_idx].iter().all(|l| l.ne(&lemma)) {
@@ -372,6 +373,20 @@ impl IC3 {
                     } else {
                         None
                     };
+                    let mut split_core = None;
+                    let active_answer = match &mut split {
+                        Some(sp) if active_answer.is_none() && ctp == 0 && lemma_index >= sp.at => {
+                            if let Some(cpu) = &mut sp.cpu {
+                                let (blocked, core) = std::mem::take(&mut cpu[lemma_index - sp.at]);
+                                split_core = core;
+                                Some(blocked)
+                            } else {
+                                self.split_answer(frame_idx, sp, lemma_index)
+                            }
+                        }
+                        _ => active_answer,
+                    };
+                    let on_cpu = active_answer.is_none();
                     let check_start = Instant::now();
                     let blocked = match active_answer {
                         Some(blocked) => blocked,
@@ -383,14 +398,22 @@ impl IC3 {
                     };
                     if ctp == 0 {
                         self.statistic.propagate.check0 += check_start.elapsed();
+                        if on_cpu {
+                            crate::fastlane::note_cpu_check(check_start.elapsed().as_nanos() as u64);
+                            if split.is_some() {
+                                crate::fastlane::SPLIT_CPU_CHECKS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     } else {
                         self.statistic.propagate.check_retry += check_start.elapsed();
                     }
                     if blocked {
                         let add_start = Instant::now();
-                        let core = self.solvers[frame_idx]
-                            .inductive_core()
-                            .unwrap_or(lemma.as_litvec().clone());
+                        let core = split_core.take().unwrap_or_else(|| {
+                            self.solvers[frame_idx]
+                                .inductive_core()
+                                .unwrap_or(lemma.as_litvec().clone())
+                        });
                         if let Some(po) = &mut lemma.po
                             && po.frame < frame_idx + 2
                             && self.obligations.remove(po)
@@ -441,6 +464,102 @@ impl IC3 {
         self.launch_push_prefetch(from, level);
         self.frame.early = self.level();
         false
+    }
+
+    /// Push split (see `fastlane::push_split_enabled`): send the tail of
+    /// `frame`'s lemmas to the card in one run, sized so the card finishes
+    /// when the CPU reaches it.
+    fn push_split(&mut self, frame_idx: usize, frame: &Frame) -> Option<crate::fastlane::PushSplit> {
+        use crate::fastlane as fl;
+        if fl::push_split_cpu() {
+            let k = fl::split_size(frame.len());
+            if k == 0 {
+                return None;
+            }
+            let at = frame.len() - k;
+            let mut answers = Vec::with_capacity(k);
+            for lemma in frame[at..].iter() {
+                let start = Instant::now();
+                let blocked = self
+                    .blocked(frame_idx + 1, lemma)
+                    .in_phase(inductor_trace::Phase::Push)
+                    .with_act_order(false)
+                    .check();
+                fl::note_cpu_check(start.elapsed().as_nanos() as u64);
+                let core = blocked.then(|| {
+                    self.solvers[frame_idx]
+                        .inductive_core()
+                        .unwrap_or(lemma.as_litvec().clone())
+                });
+                answers.push((blocked, core));
+            }
+            return Some(fl::PushSplit::cpu_answered(at, answers));
+        }
+        if !fl::push_split_enabled()
+            || !fl::enabled()
+            || !fl::pool_mode()
+            || !fl::routes_phase(inductor_trace::Phase::Push as u8)
+            || !fl::card_ready()
+            || fl::reload_pending()
+            || !fl::in_band(self.solvers[frame_idx].dcs.fastlane_frame)
+        {
+            return None;
+        }
+        let k = fl::split_size(frame.len());
+        if k == 0 {
+            return None;
+        }
+        let at = frame.len() - k;
+        let mut cubes = Vec::with_capacity(k);
+        let mut queries = Vec::with_capacity(k);
+        for lemma in frame[at..].iter() {
+            let mut cube = lemma.as_litvec().clone();
+            self.activity.sort_by_activity(&mut cube, false);
+            queries.push(self.solvers[frame_idx].push_query_raw(&cube));
+            cubes.push(cube);
+        }
+        let fl_frame = self.solvers[frame_idx].dcs.fastlane_frame.unwrap_or(0);
+        fl::PushSplit::submit(at, cubes, queries, fl_frame)
+    }
+
+    /// The card's push answer for frame lemma `index` installed into the
+    /// frame's solver (`None`: the CPU checks it).  A SAT answer is used
+    /// directly only without CTP, which would need the model.
+    fn split_answer(
+        &mut self,
+        frame_idx: usize,
+        split: &mut crate::fastlane::PushSplit,
+        index: usize,
+    ) -> Option<bool> {
+        use crate::fastlane::{self as fl, LaneResult};
+        // results missing when the card's output buffer filled
+        let result = if ((index - split.at) as u32) < split.finish() {
+            split.take(index)
+        } else {
+            LaneResult::Unknown
+        };
+        let missing = matches!(result, LaneResult::Unknown) && ((index - split.at) as u32) >= split.finish();
+        let answer = match result {
+            LaneResult::Unsat { .. } => {
+                let cube = split.cubes[index - split.at].clone();
+                self.solvers[frame_idx].install_push_result(&cube, result)
+            }
+            LaneResult::Sat { .. } if !self.cfg.ctp => Some(false),
+            LaneResult::Sat { .. } => None,
+            LaneResult::Unknown => {
+                // no budget: an UNKNOWN answer means the lane overflowed
+                if !missing {
+                    fl::request_reload();
+                }
+                None
+            }
+        };
+        match answer {
+            Some(true) => fl::SPLIT_CARD_UNSAT.fetch_add(1, Ordering::Relaxed),
+            Some(false) => fl::SPLIT_CARD_SAT.fetch_add(1, Ordering::Relaxed),
+            None => fl::SPLIT_CARD_FALLBACK.fetch_add(1, Ordering::Relaxed),
+        };
+        answer
     }
 
     pub fn propagete_to_inf_rec(&mut self, lastf: &mut Vec<FrameLemma>, ctp: LitVec) -> bool {

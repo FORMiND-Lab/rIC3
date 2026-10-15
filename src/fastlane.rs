@@ -74,6 +74,10 @@ mod ffi {
         pub fn fl_board_poll() -> i32;
         pub fn fl_board_busy() -> i32;
         pub fn fl_solve_frame_collect(lane: *mut FlLane) -> i32;
+        pub fn fl_batch_submit(lane: *mut FlLane, words: *const u32, offs: *const u32, n: u32) -> i32;
+        pub fn fl_batch_collect() -> u32;
+        pub fn fl_batch_take(lane: *mut FlLane, i: u32) -> i32;
+        pub fn fl_board_kernel_ns() -> u64;
         pub fn fl_pmic_push(
             lanes: *mut *mut FlLane,
             k: u32,
@@ -370,6 +374,47 @@ impl LaneHandle {
         false
     }
 
+    /// Start several SOLVEs at `frame` on the card in one run (board mode,
+    /// replica 0); false if not available.
+    #[allow(unused_variables)]
+    pub fn submit_batch(&mut self, queries: &[(Vec<u32>, Vec<Vec<u32>>)], frame: u32) -> bool {
+        #[cfg(has_fastlane)]
+        unsafe {
+            let mut words = Vec::new();
+            let mut offs = vec![0u32];
+            for (assumptions, temps) in queries {
+                words.extend([frame, 0, assumptions.len() as u32]);
+                words.extend_from_slice(assumptions);
+                words.push(temps.len() as u32);
+                for t in temps {
+                    words.push(t.len() as u32);
+                    words.extend_from_slice(t);
+                }
+                offs.push(words.len() as u32);
+            }
+            return ffi::fl_batch_submit(
+                self.ptr,
+                words.as_ptr(),
+                offs.as_ptr(),
+                queries.len() as u32,
+            ) != 0;
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+
+    /// Result i of the batch collected by `batch_collect`.
+    #[allow(unused_variables)]
+    pub fn batch_take(&mut self, i: u32) -> LaneResult {
+        #[cfg(has_fastlane)]
+        unsafe {
+            let r = ffi::fl_batch_take(self.ptr, i);
+            return self.result(r);
+        }
+        #[allow(unreachable_code)]
+        LaneResult::Unknown
+    }
+
     /// Result of the submitted SOLVE (waits for the card).
     pub fn collect_frame(&mut self) -> LaneResult {
         #[cfg(has_fastlane)]
@@ -645,6 +690,196 @@ pub fn note_race(card_won: bool) {
 pub fn race_enabled() -> bool {
     static R: OnceLock<bool> = OnceLock::new();
     *R.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_RACE").is_ok_and(|v| v == "1"))
+}
+
+/// Push split (`INDUCTOR_FASTLANE_PUSH_SPLIT=1`, board pool mode): in each
+/// frame's push pass the card answers a suffix of the lemmas in one run
+/// while the CPU checks the rest, sized from measured costs so both finish
+/// together.  No query is solved twice.
+pub fn push_split_enabled() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_PUSH_SPLIT").is_ok_and(|v| v == "1"))
+}
+
+/// Control for the push split (`INDUCTOR_FASTLANE_PUSH_SPLIT_CPU=1`, no
+/// card): the same split, sized the same way, but the CPU answers the tail
+/// against the frame as it was at the split, exactly when the card would
+/// have been sent it.  It isolates what the split itself changes in the
+/// search (stale answers) from the work the card takes off the CPU.
+pub fn push_split_cpu() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_PUSH_SPLIT_CPU").is_ok_and(|v| v == "1"))
+}
+
+pub static SPLIT_BATCHES: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_CARD_QUERIES: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_CARD_UNSAT: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_CARD_SAT: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_CARD_FALLBACK: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_CPU_CHECKS: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// Kernel time of the push batches (with the clause records they carried).
+pub static SPLIT_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+// Cost model (ns): CPU push check and card query, running means.
+static SPLIT_CPU_NS: AtomicU64 = AtomicU64::new(30_000);
+static SPLIT_CARD_NS: AtomicU64 = AtomicU64::new(100_000);
+/// Batch size cap: results (with SAT models) must fit the card's output
+/// buffer; lowered when a batch comes back short, raised slowly otherwise.
+static SPLIT_CAP: AtomicU64 = AtomicU64::new(256);
+/// Card run overhead (ns) beyond the queries: start, kernel entry and exit,
+/// result transfer; and the CPU's own share of it (command and result syncs).
+const SPLIT_CARD_FIXED_NS: u64 = 40_000;
+const SPLIT_CPU_FIXED_NS: u64 = 40_000;
+
+fn ema(a: &AtomicU64, x: u64) {
+    let old = a.load(Ordering::Relaxed);
+    a.store(old - old / 8 + x / 8, Ordering::Relaxed);
+}
+
+/// A CPU push check took `ns`.
+pub fn note_cpu_check(ns: u64) {
+    ema(&SPLIT_CPU_NS, ns);
+}
+
+/// The CPU waited `wait_ns` for a batch when it reached the card's part.
+/// The card's cost per query follows from that directly (the kernel time of
+/// a run also covers the clause records queued since the last run): up when
+/// the CPU had to wait, slowly down when it did not, so both parts end
+/// together.
+pub fn note_card_wait(wait_ns: u64) {
+    let c = SPLIT_CARD_NS.load(Ordering::Relaxed);
+    let nc = if wait_ns > 30_000 { c + c / 4 } else { c - c / 32 };
+    SPLIT_CARD_NS.store(nc.clamp(2_000, 50_000_000), Ordering::Relaxed);
+}
+
+/// How many of `n` push checks the card should take (0: none), so that the
+/// CPU's part plus its sync cost ends when the card's part does.
+pub fn split_size(n: usize) -> usize {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // INDUCTOR_FASTLANE_SPLIT_CARD_US: initial card cost per query (the
+        // control keeps it, having no card to measure)
+        if let Some(us) = std::env::var("INDUCTOR_FASTLANE_SPLIT_CARD_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            SPLIT_CARD_NS.store(us * 1000, Ordering::Relaxed);
+        }
+    });
+    let c = SPLIT_CPU_NS.load(Ordering::Relaxed).max(1);
+    let k = SPLIT_CARD_NS.load(Ordering::Relaxed).max(1);
+    let total = n as u64 * c;
+    if total <= SPLIT_CARD_FIXED_NS + SPLIT_CPU_FIXED_NS {
+        return 0;
+    }
+    // (n - x) c + F_cpu = F_card + x k
+    let x = (total + SPLIT_CPU_FIXED_NS).saturating_sub(SPLIT_CARD_FIXED_NS) / (c + k);
+    let x = (x as usize).min(n).min(SPLIT_CAP.load(Ordering::Relaxed) as usize);
+    // worth it only if the CPU time it frees exceeds the CPU's sync cost
+    if x < 2 || x as u64 * c < 2 * SPLIT_CPU_FIXED_NS {
+        0
+    } else {
+        x
+    }
+}
+
+/// Kernel time of all card runs so far (ns).
+pub fn kernel_ns() -> u64 {
+    #[cfg(has_fastlane)]
+    return unsafe { ffi::fl_board_kernel_ns() };
+    #[allow(unreachable_code)]
+    0
+}
+
+/// Wait for the submitted batch; the number of results that came back.
+pub fn batch_collect() -> u32 {
+    #[cfg(has_fastlane)]
+    return unsafe { ffi::fl_batch_collect() };
+    #[allow(unreachable_code)]
+    0
+}
+
+/// One frame's push split: lemmas `at..` went to the card as `cubes`.
+pub struct PushSplit {
+    pub at: usize,
+    pub cubes: Vec<logicrs::LitVec>,
+    kernel_ns0: u64,
+    results: Option<u32>,
+    /// Control mode: the CPU's answers (blocked, core) for the tail.
+    pub cpu: Option<Vec<(bool, Option<logicrs::LitVec>)>>,
+}
+
+impl PushSplit {
+    /// Submit the card's part (`cubes` with their raw queries) at `frame`.
+    pub fn submit(at: usize, cubes: Vec<logicrs::LitVec>, queries: Vec<Vec<u32>>, frame: u32) -> Option<Self> {
+        let queries: Vec<(Vec<u32>, Vec<Vec<u32>>)> =
+            queries.into_iter().map(|q| (q, Vec::new())).collect();
+        if !with_pool(|pool| pool.replicas[0].submit_batch(&queries, frame)).unwrap_or(false) {
+            return None;
+        }
+        // after the submit, which first ends any earlier run
+        let kernel_ns0 = kernel_ns();
+        SPLIT_BATCHES.fetch_add(1, Ordering::Relaxed);
+        SPLIT_CARD_QUERIES.fetch_add(queries.len() as u64, Ordering::Relaxed);
+        Some(Self {
+            at,
+            cubes,
+            kernel_ns0,
+            results: None,
+            cpu: None,
+        })
+    }
+
+    /// Control mode: the tail answered by the CPU at the split.
+    pub fn cpu_answered(at: usize, answers: Vec<(bool, Option<logicrs::LitVec>)>) -> Self {
+        SPLIT_BATCHES.fetch_add(1, Ordering::Relaxed);
+        SPLIT_CARD_QUERIES.fetch_add(answers.len() as u64, Ordering::Relaxed);
+        Self {
+            at,
+            cubes: Vec::new(),
+            kernel_ns0: 0,
+            results: Some(answers.len() as u32),
+            cpu: Some(answers),
+        }
+    }
+
+    /// Wait for the card (once); the number of results it returned.
+    pub fn finish(&mut self) -> u32 {
+        if let Some(n) = self.results {
+            return n;
+        }
+        // the control's batch costs what a CPU check costs: note_cpu_check
+        let t0 = std::time::Instant::now();
+        let n = batch_collect();
+        let wait = t0.elapsed().as_nanos() as u64;
+        SPLIT_WAIT_NS.fetch_add(wait, Ordering::Relaxed);
+        let k = self.cubes.len() as u64;
+        note_card_wait(wait);
+        SPLIT_KERNEL_NS.fetch_add(kernel_ns() - self.kernel_ns0, Ordering::Relaxed);
+        let cap = SPLIT_CAP.load(Ordering::Relaxed);
+        if (n as u64) < k {
+            SPLIT_CAP.store((n as u64 * 3 / 4).max(2), Ordering::Relaxed);
+        } else if k >= cap {
+            SPLIT_CAP.store((cap + cap / 8 + 1).min(256), Ordering::Relaxed);
+        }
+        self.results = Some(n);
+        n
+    }
+
+    /// The card's answer for frame lemma `index` (>= `at`).
+    pub fn take(&mut self, index: usize) -> LaneResult {
+        let i = index - self.at;
+        if i as u32 >= self.finish() {
+            return LaneResult::Unknown;
+        }
+        with_pool(|pool| pool.replicas[0].batch_take(i as u32)).unwrap_or(LaneResult::Unknown)
+    }
+}
+
+impl Drop for PushSplit {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 /// Set while a CPU search races a submitted card SOLVE.
@@ -1166,6 +1401,19 @@ pub fn report() {
         MAX_FRAME.load(Ordering::Relaxed),
         hist(&DEPTH_SUB),
         hist(&DEPTH_WIN)
+    );
+    eprintln!(
+        "fastlane-split: batches={} card_queries={} card_unsat={} card_sat={} card_fallback={} cpu_checks={} wait_ms={:.3} cpu_us={:.1} card_us={:.1} batch_kernel_ms={:.3}",
+        SPLIT_BATCHES.load(Ordering::Relaxed),
+        SPLIT_CARD_QUERIES.load(Ordering::Relaxed),
+        SPLIT_CARD_UNSAT.load(Ordering::Relaxed),
+        SPLIT_CARD_SAT.load(Ordering::Relaxed),
+        SPLIT_CARD_FALLBACK.load(Ordering::Relaxed),
+        SPLIT_CPU_CHECKS.load(Ordering::Relaxed),
+        SPLIT_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        SPLIT_CPU_NS.load(Ordering::Relaxed) as f64 / 1e3,
+        SPLIT_CARD_NS.load(Ordering::Relaxed) as f64 / 1e3,
+        SPLIT_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1e6
     );
     eprintln!(
         "fastlane-fuse: pushes={} used={}",
