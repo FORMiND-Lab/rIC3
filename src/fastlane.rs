@@ -9,7 +9,7 @@
 //! weights; it never measures time.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 #[cfg(has_fastlane)]
 mod ffi {
@@ -61,6 +61,7 @@ mod ffi {
         pub fn fl_board_shutdown();
         pub fn fl_board_abort();
         pub fn fl_board_reset();
+        pub fn fl_board_go();
         pub fn fl_solve_frame_submit(
             lane: *mut FlLane,
             assumptions: *const u32,
@@ -556,6 +557,10 @@ pub fn reload_pending() -> bool {
 /// ends below `band_lo`.
 pub fn pool_reload(lemmas: &[(Vec<u32>, u32, u32)], band_lo: u32) {
     BAND_LO.store(band_lo, Ordering::Relaxed);
+    LOADED.store(lemmas.len() as u64, Ordering::Relaxed);
+    RELOAD_AT_NS.store(reload_clock().elapsed().as_nanos() as u64, Ordering::Relaxed);
+    WAIT_AT_RELOAD_NS.store(SPLIT_WAIT_NS.load(Ordering::Relaxed), Ordering::Relaxed);
+    LOADED_SUM.fetch_add(lemmas.len() as u64, Ordering::Relaxed);
     POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         let Some(old) = pool.take() else {
@@ -582,7 +587,10 @@ pub fn pool_reload(lemmas: &[(Vec<u32>, u32, u32)], band_lo: u32) {
         });
     });
     RELOAD_WANTED.store(false, Ordering::Relaxed);
+    ANSWERED.store(false, Ordering::Relaxed);
     MIRRORED.store(0, Ordering::Relaxed);
+    SLOW_RUNS.store(0, Ordering::Relaxed);
+    SLOW_BASE_NS.store(0, Ordering::Relaxed);
     RELOADS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -706,6 +714,104 @@ pub fn push_split_enabled() -> bool {
 /// against the frame as it was at the split, exactly when the card would
 /// have been sent it.  It isolates what the split itself changes in the
 /// search (stale answers) from the work the card takes off the CPU.
+/// Pushed lemmas and their cores, by who answered (card / CPU): whether the
+/// card's cores shrink lemmas as much as GipSAT's.
+static CORE_N: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static CORE_LEMMA_LITS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static CORE_LITS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub fn note_push_core(card: bool, lemma_len: usize, core_len: usize) {
+    let k = card as usize;
+    CORE_N[k].fetch_add(1, Ordering::Relaxed);
+    CORE_LEMMA_LITS[k].fetch_add(lemma_len as u64, Ordering::Relaxed);
+    CORE_LITS[k].fetch_add(core_len as u64, Ordering::Relaxed);
+}
+
+/// INDUCTOR_FASTLANE_SPLIT_LOCK=1: a split that leaves the search unchanged
+/// whoever answers, for measuring the card against its CPU counterpart: the
+/// card's part is a fixed fraction of each frame of 16 lemmas or more
+/// (INDUCTOR_FASTLANE_SPLIT_LOCK_FRAC, default 0.25, at most 384), answered
+/// by the card or else on a clone of the frame solver, and its pushed lemmas
+/// keep all their literals.  The frame solvers then run the same checks with
+/// the card, with the CPU-split control, or with the card unavailable.
+pub fn split_lock() -> Option<f64> {
+    static LOCK: OnceLock<Option<f64>> = OnceLock::new();
+    *LOCK.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_SPLIT_LOCK").is_ok_and(|v| v == "1").then(|| {
+            std::env::var("INDUCTOR_FASTLANE_SPLIT_LOCK_FRAC")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map_or(0.25, |f| f.clamp(0.0, 1.0))
+        })
+    })
+}
+
+/// Lock mode: the card's part of a frame of `n` lemmas.
+/// (INDUCTOR_FASTLANE_SPLIT_LOCK_MIN: smallest frame split, default 16)
+pub fn lock_size(n: usize) -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_SPLIT_LOCK_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+    });
+    match split_lock() {
+        Some(f) if n >= min => ((n as f64 * f) as usize).min(384),
+        _ => 0,
+    }
+}
+
+/// INDUCTOR_FASTLANE_SPLIT_FB_BATCH=1: lock mode checks a split's missing
+/// card answers on one clone (see `propagate`).
+pub fn split_fb_batch() -> bool {
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_SPLIT_FB_BATCH").is_ok_and(|v| v == "1"))
+}
+
+/// Time spent cloning frame solvers for lock-mode CPU answers (ns).
+pub static SPLIT_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The card split stops for the rest of the run after
+/// INDUCTOR_FASTLANE_SPLIT_MAX_RELOADS (default 30) pool reloads: the lemmas
+/// then no longer fit the card, and every reload resends them all.
+pub fn split_card_off() -> bool {
+    static MAX: OnceLock<u64> = OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_SPLIT_MAX_RELOADS").ok().and_then(|v| v.parse().ok()).unwrap_or(30)
+    });
+    // INDUCTOR_FASTLANE_SPLIT_CAP_OVF=1: count only the reloads an overflow
+    // asked for; proactive ones (RELOAD_REL, RELOAD_SLOW) keep a lane fresh
+    // that still fits, and on small designs they are cheap and frequent
+    static OVF: OnceLock<bool> = OnceLock::new();
+    let n = if *OVF.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_SPLIT_CAP_OVF").is_ok_and(|v| v == "1")) {
+        RELOADS.load(Ordering::Relaxed)
+            .saturating_sub(REL_RELOADS.load(Ordering::Relaxed) + SLOW_RELOADS.load(Ordering::Relaxed))
+    } else {
+        RELOADS.load(Ordering::Relaxed)
+    };
+    n >= max || split_dead().is_some_and(|n| DEAD_RELOADS.load(Ordering::Relaxed) >= n)
+}
+
+/// INDUCTOR_FASTLANE_SPLIT_DEAD=<n>: the card split also stops after n
+/// reloads in a row whose lane overflowed before it gave a single answer:
+/// the live lemmas alone no longer fit it, and each reload resends them all.
+fn split_dead() -> Option<u64> {
+    static N: OnceLock<Option<u64>> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_SPLIT_DEAD").ok().and_then(|v| v.parse().ok()))
+}
+static DEAD_RELOADS: AtomicU64 = AtomicU64::new(0);
+static ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The card answered a split query (SAT or UNSAT).
+pub fn note_card_answer() {
+    ANSWERED.store(true, Ordering::Relaxed);
+    DEAD_RELOADS.store(0, Ordering::Relaxed);
+}
+
+/// The lane overflowed (an UNKNOWN answer): a reload follows.
+pub fn note_card_overflow() {
+    if !reload_pending() && !ANSWERED.swap(false, Ordering::Relaxed) {
+        DEAD_RELOADS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn push_split_cpu() -> bool {
     static S: OnceLock<bool> = OnceLock::new();
     *S.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_PUSH_SPLIT_CPU").is_ok_and(|v| v == "1"))
@@ -741,16 +847,77 @@ pub fn note_cpu_check(ns: u64) {
     ema(&SPLIT_CPU_NS, ns);
 }
 
-/// The CPU waited `wait_ns` for a batch when it reached the card's part.
-/// The card's cost per query follows from that directly (the kernel time of
-/// a run also covers the clause records queued since the last run): up when
-/// the CPU had to wait, slowly down when it did not, so both parts end
-/// together.
-pub fn note_card_wait(wait_ns: u64) {
+/// Collecting a batch the card has finished (wait, output sync, parse).
+const SPLIT_COLLECT_NS: u64 = 60_000;
+
+/// The CPU waited `wait_ns` for a batch of `k` queries that took `run_ns`
+/// from its start to its collected results (the run also covers the clause
+/// records queued since the last run).  A wait beyond the collect cost means
+/// the card was the bottleneck: the run's time per query is then a sample of
+/// its cost.  Otherwise the card finished early, and that time per query is
+/// an upper bound: the estimate drops to it, or by 1/8, giving the card a
+/// larger part next time.
+pub fn note_card_wait(wait_ns: u64, run_ns: u64, k: u64) {
     let c = SPLIT_CARD_NS.load(Ordering::Relaxed);
-    let nc = if wait_ns > 30_000 { c + c / 4 } else { c - c / 32 };
+    let s = run_ns.saturating_sub(SPLIT_CARD_FIXED_NS) / k.max(1);
+    let nc = if wait_ns > SPLIT_COLLECT_NS { (3 * c + s) / 4 } else { (c - c / 8).min(s.max(2_000)) };
     SPLIT_CARD_NS.store(nc.clamp(2_000, 50_000_000), Ordering::Relaxed);
+    if let Some((r, min, deg)) = reload_slow() {
+        // the runs right after a reload carry its bulk clause load: skip them
+        // runs 4..12 set the lane's fresh cost (their mean); only a lane that
+        // got slower than deg times that since is stale
+        let n = SLOW_RUNS.fetch_add(1, Ordering::Relaxed);
+        if n >= 4 {
+            if n == 4 {
+                SLOW_NS.store(s, Ordering::Relaxed);
+            } else {
+                ema(&SLOW_NS, s);
+            }
+        }
+        if (4..12).contains(&n) {
+            SLOW_BASE_NS.fetch_add(s / 8, Ordering::Relaxed);
+        }
+        let slow = SLOW_NS.load(Ordering::Relaxed) as f64;
+        if n >= 12
+            && slow > r * SPLIT_CPU_NS.load(Ordering::Relaxed) as f64
+            && slow > deg * SLOW_BASE_NS.load(Ordering::Relaxed) as f64
+            && MIRRORED.load(Ordering::Relaxed) >= min
+            && !reload_pending()
+        {
+            SLOW_RELOADS.fetch_add(1, Ordering::Relaxed);
+            request_reload();
+        }
+    }
 }
+/// Card runs since the last reload, and their smoothed cost per query (ns).
+static SLOW_RUNS: AtomicU64 = AtomicU64::new(0);
+static SLOW_NS: AtomicU64 = AtomicU64::new(0);
+static SLOW_BASE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Adaptive reload (`INDUCTOR_FASTLANE_RELOAD_SLOW=<r>`): rebuild the pool
+/// when the card's cost per query, smoothed over the runs since the last
+/// reload (its first 4 skipped), exceeds both r CPU checks and
+/// `INDUCTOR_FASTLANE_RELOAD_SLOW_DEG` (default 2) times the cost of the
+/// fresh lane (runs 4..12), and at least
+/// `INDUCTOR_FASTLANE_RELOAD_SLOW_MIN` (default 1000) clauses were mirrored
+/// since the last reload.  A lane clogged with stale lemma copies searches
+/// far longer than the CPU; a healthy one is left alone.
+fn reload_slow() -> Option<(f64, u64, f64)> {
+    static R: OnceLock<Option<(f64, u64, f64)>> = OnceLock::new();
+    *R.get_or_init(|| {
+        let r = std::env::var("INDUCTOR_FASTLANE_RELOAD_SLOW").ok()?.parse().ok()?;
+        let min = std::env::var("INDUCTOR_FASTLANE_RELOAD_SLOW_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        let deg = std::env::var("INDUCTOR_FASTLANE_RELOAD_SLOW_DEG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.0);
+        Some((r, min, deg))
+    })
+}
+static SLOW_RELOADS: AtomicU64 = AtomicU64::new(0);
 
 /// How many of `n` push checks the card should take (0: none), so that the
 /// CPU's part plus its sync cost ends when the card's part does.
@@ -767,13 +934,32 @@ pub fn split_size(n: usize) -> usize {
         }
     });
     let c = SPLIT_CPU_NS.load(Ordering::Relaxed).max(1);
-    let k = SPLIT_CARD_NS.load(Ordering::Relaxed).max(1);
+    // INDUCTOR_FASTLANE_SPLIT_CARD_RATIO (control mode, which has no card to
+    // measure): the card cost per query as a multiple of the CPU's
+    static RATIO: OnceLock<Option<f64>> = OnceLock::new();
+    let ratio = *RATIO.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_SPLIT_CARD_RATIO").ok().and_then(|v| v.parse::<f64>().ok())
+    });
+    let k = match ratio {
+        Some(r) if push_split_cpu() => ((c as f64) * r) as u64,
+        _ => SPLIT_CARD_NS.load(Ordering::Relaxed),
+    }
+    .max(1);
     let total = n as u64 * c;
     if total <= SPLIT_CARD_FIXED_NS + SPLIT_CPU_FIXED_NS {
         return 0;
     }
-    // (n - x) c + F_cpu = F_card + x k
-    let x = (total + SPLIT_CPU_FIXED_NS).saturating_sub(SPLIT_CARD_FIXED_NS) / (c + k);
+    // (n - x) c + F_cpu = F_card + x k, scaled by INDUCTOR_FASTLANE_SPLIT_FRAC
+    // (default 0.75): the CPU waiting on a late card loses its whole time,
+    // a card finishing early only idles
+    static FRAC: OnceLock<u64> = OnceLock::new();
+    let frac = *FRAC.get_or_init(|| {
+        std::env::var("INDUCTOR_FASTLANE_SPLIT_FRAC")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(750, |f| (f.clamp(0.0, 1.0) * 1000.0) as u64)
+    });
+    let x = (total + SPLIT_CPU_FIXED_NS).saturating_sub(SPLIT_CARD_FIXED_NS) / (c + k) * frac / 1000;
     let x = (x as usize).min(n).min(SPLIT_CAP.load(Ordering::Relaxed) as usize);
     // worth it only if the CPU time it frees exceeds the CPU's sync cost
     if x < 2 || x as u64 * c < 2 * SPLIT_CPU_FIXED_NS {
@@ -804,6 +990,8 @@ pub struct PushSplit {
     pub at: usize,
     pub cubes: Vec<logicrs::LitVec>,
     kernel_ns0: u64,
+    /// When the card's run started (None: control mode).
+    started: Option<std::time::Instant>,
     results: Option<u32>,
     /// Control mode: the CPU's answers (blocked, core) for the tail.
     pub cpu: Option<Vec<(bool, Option<logicrs::LitVec>)>>,
@@ -819,12 +1007,14 @@ impl PushSplit {
         }
         // after the submit, which first ends any earlier run
         let kernel_ns0 = kernel_ns();
+        let started = Some(std::time::Instant::now());
         SPLIT_BATCHES.fetch_add(1, Ordering::Relaxed);
         SPLIT_CARD_QUERIES.fetch_add(queries.len() as u64, Ordering::Relaxed);
         Some(Self {
             at,
             cubes,
             kernel_ns0,
+            started,
             results: None,
             cpu: None,
         })
@@ -838,6 +1028,7 @@ impl PushSplit {
             at,
             cubes: Vec::new(),
             kernel_ns0: 0,
+            started: None,
             results: Some(answers.len() as u32),
             cpu: Some(answers),
         }
@@ -854,13 +1045,15 @@ impl PushSplit {
         let wait = t0.elapsed().as_nanos() as u64;
         SPLIT_WAIT_NS.fetch_add(wait, Ordering::Relaxed);
         let k = self.cubes.len() as u64;
-        note_card_wait(wait);
+        let run = self.started.map_or(wait, |t| t.elapsed().as_nanos() as u64);
+        note_card_wait(wait, run, k);
         SPLIT_KERNEL_NS.fetch_add(kernel_ns() - self.kernel_ns0, Ordering::Relaxed);
         let cap = SPLIT_CAP.load(Ordering::Relaxed);
-        if (n as u64) < k {
+        if split_lock().is_some() {
+        } else if (n as u64) < k {
             SPLIT_CAP.store((n as u64 * 3 / 4).max(2), Ordering::Relaxed);
         } else if k >= cap {
-            SPLIT_CAP.store((cap + cap / 8 + 1).min(256), Ordering::Relaxed);
+            SPLIT_CAP.store((cap + cap / 8 + 1).min(1024), Ordering::Relaxed);
         }
         self.results = Some(n);
         n
@@ -1228,6 +1421,77 @@ thread_local! {
     static POOL: std::cell::RefCell<Option<Pool>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Propagate-share gate (`INDUCTOR_FASTLANE_PROP_GATE=<share>`): the card only
+/// pays off when push checks are a large part of the run, so FastLane stays
+/// inert (no mirroring, no split, card not opened; the run is plain rIC3)
+/// until, at the end of a push phase at least `INDUCTOR_FASTLANE_PROP_GATE_S`
+/// seconds (default 3) into the run, the propagate time so far is at least
+/// that share of the elapsed time.  Then the card is opened and the pool
+/// rebuilt from the live frames.  Re-checked after every push phase, so a run
+/// whose push share grows later still opens.
+fn prop_gate() -> Option<(f64, f64)> {
+    static G: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+    *G.get_or_init(|| {
+        let share = std::env::var("INDUCTOR_FASTLANE_PROP_GATE").ok()?.parse().ok()?;
+        let after = std::env::var("INDUCTOR_FASTLANE_PROP_GATE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3.0);
+        Some((share, after))
+    })
+}
+static GATE_T0: OnceLock<std::time::Instant> = OnceLock::new();
+/// 0: no gate or open, 1: closed.
+static GATE_CLOSED: AtomicU8 = AtomicU8::new(0);
+pub static GATE_OPENED_AT_MS: AtomicU64 = AtomicU64::new(0);
+pub static GATE_PHASES: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub fn gate_open() -> bool {
+    GATE_CLOSED.load(Ordering::Relaxed) == 0
+}
+
+fn gate_start() {
+    GATE_T0.get_or_init(std::time::Instant::now);
+    if prop_gate().is_some() {
+        GATE_CLOSED.store(1, Ordering::Relaxed);
+    }
+}
+
+/// End of a push phase; `prop` is the propagate time of the run so far.
+pub fn gate_note(prop: std::time::Duration) {
+    if gate_open() {
+        return;
+    }
+    let Some((share, after)) = prop_gate() else {
+        return;
+    };
+    let Some(t0) = GATE_T0.get() else {
+        return;
+    };
+    let phases = GATE_PHASES.fetch_add(1, Ordering::Relaxed) + 1;
+    let el = t0.elapsed().as_secs_f64();
+    // INDUCTOR_FASTLANE_PROP_GATE_PHASE=<n>: open at the end of push phase n
+    // instead (a gate decision recorded from an earlier run, `closed_phases`),
+    // so that runs compared in lock mode open at the same point
+    static AT: OnceLock<Option<u64>> = OnceLock::new();
+    let at = *AT.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_PROP_GATE_PHASE").ok().and_then(|v| v.parse().ok()));
+    let open = match at {
+        Some(n) => phases >= n,
+        None => el >= after && prop.as_secs_f64() >= share * el,
+    };
+    if !open {
+        return;
+    }
+    GATE_CLOSED.store(0, Ordering::Relaxed);
+    GATE_OPENED_AT_MS.store((el * 1e3) as u64, Ordering::Relaxed);
+    #[cfg(has_fastlane)]
+    unsafe {
+        ffi::fl_board_go()
+    }
+    request_reload();
+}
+
 /// Create the pool from the first frame solver: transition (full range),
 /// plus every clause already added to it (constraints) as full range with
 /// their variables in the persistent domain.
@@ -1238,6 +1502,7 @@ pub fn pool_init(
     trans: &[Vec<u32>],
     base: &[Vec<u32>],
 ) {
+    gate_start();
     if !pool_mode() {
         return;
     }
@@ -1307,14 +1572,56 @@ fn reload_clauses() -> Option<u64> {
 }
 static MIRRORED: AtomicU64 = AtomicU64::new(0);
 
+/// Relative reload (`INDUCTOR_FASTLANE_RELOAD_REL=<b>`): rebuild the pool once
+/// the clauses mirrored since the last reload reach b times the live lemmas
+/// that reload loaded (at least 1000), i.e. once stale copies may outnumber
+/// the live ones, and the CPU spent at least `INDUCTOR_FASTLANE_RELOAD_REL_WAIT`
+/// (default 0.1) of the time since waiting on the card: a lane that keeps up
+/// gains nothing from a reload, which resends every live lemma.
+fn reload_rel() -> Option<(f64, f64)> {
+    static B: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+    *B.get_or_init(|| {
+        let b = std::env::var("INDUCTOR_FASTLANE_RELOAD_REL").ok()?.parse().ok()?;
+        let w = std::env::var("INDUCTOR_FASTLANE_RELOAD_REL_WAIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.1);
+        Some((b, w))
+    })
+}
+fn reload_clock() -> &'static std::time::Instant {
+    static T: OnceLock<std::time::Instant> = OnceLock::new();
+    T.get_or_init(std::time::Instant::now)
+}
+/// When the last reload happened (ns on reload_clock) and the CPU's total
+/// wait on the card then.
+static RELOAD_AT_NS: AtomicU64 = AtomicU64::new(0);
+static WAIT_AT_RELOAD_NS: AtomicU64 = AtomicU64::new(0);
+/// Live lemmas loaded by the last reload, and their sum over all reloads.
+static LOADED: AtomicU64 = AtomicU64::new(0);
+static LOADED_SUM: AtomicU64 = AtomicU64::new(0);
+static REL_RELOADS: AtomicU64 = AtomicU64::new(0);
+
 /// Mirror one frame-ranged clause (IC3 solver indices lo..=hi).
 pub fn pool_register(lits: &[u32], lo: u32, hi: u32) {
-    if !pool_mode() || hi < BAND_LO.load(Ordering::Relaxed) {
+    if !pool_mode() || !gate_open() || hi < BAND_LO.load(Ordering::Relaxed) {
         return;
     }
+    let mirrored = MIRRORED.fetch_add(1, Ordering::Relaxed) + 1;
     if let Some(n) = reload_clauses()
-        && MIRRORED.fetch_add(1, Ordering::Relaxed) + 1 >= n
+        && mirrored >= n
     {
+        request_reload();
+    }
+    if let Some((b, w)) = reload_rel()
+        && mirrored as f64 >= b * LOADED.load(Ordering::Relaxed).max(1000) as f64
+        && !reload_pending()
+        && {
+            let since = (reload_clock().elapsed().as_nanos() as u64).saturating_sub(RELOAD_AT_NS.load(Ordering::Relaxed));
+            (SPLIT_WAIT_NS.load(Ordering::Relaxed) - WAIT_AT_RELOAD_NS.load(Ordering::Relaxed)) as f64 >= w * since as f64
+        }
+    {
+        REL_RELOADS.fetch_add(1, Ordering::Relaxed);
         request_reload();
     }
     POOL.with(|pool| {
@@ -1340,6 +1647,41 @@ pub fn global_events() -> [u64; 32] {
     out
 }
 
+fn report_split() {
+    let ratio = |k: usize| {
+        CORE_LITS[k].load(Ordering::Relaxed) as f64 / CORE_LEMMA_LITS[k].load(Ordering::Relaxed).max(1) as f64
+    };
+    eprintln!("fastlane-split-lock: clone_ms={:.3}", SPLIT_CLONE_NS.load(Ordering::Relaxed) as f64 / 1e6);
+    if prop_gate().is_some() {
+        eprintln!(
+            "fastlane-gate: open={} opened_at_ms={} closed_phases={}",
+            gate_open() as u8,
+            GATE_OPENED_AT_MS.load(Ordering::Relaxed),
+            GATE_PHASES.load(Ordering::Relaxed)
+        );
+    }
+    eprintln!(
+        "fastlane-split-core: cpu_pushes={} cpu_core_ratio={:.3} card_pushes={} card_core_ratio={:.3}",
+        CORE_N[0].load(Ordering::Relaxed),
+        ratio(0),
+        CORE_N[1].load(Ordering::Relaxed),
+        ratio(1)
+    );
+    eprintln!(
+        "fastlane-split: batches={} card_queries={} card_unsat={} card_sat={} card_fallback={} cpu_checks={} wait_ms={:.3} cpu_us={:.1} card_us={:.1} batch_kernel_ms={:.3}",
+        SPLIT_BATCHES.load(Ordering::Relaxed),
+        SPLIT_CARD_QUERIES.load(Ordering::Relaxed),
+        SPLIT_CARD_UNSAT.load(Ordering::Relaxed),
+        SPLIT_CARD_SAT.load(Ordering::Relaxed),
+        SPLIT_CARD_FALLBACK.load(Ordering::Relaxed),
+        SPLIT_CPU_CHECKS.load(Ordering::Relaxed),
+        SPLIT_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        SPLIT_CPU_NS.load(Ordering::Relaxed) as f64 / 1e3,
+        SPLIT_CARD_NS.load(Ordering::Relaxed) as f64 / 1e3,
+        SPLIT_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1e6
+    );
+}
+
 pub fn report() {
     // the card bring-up thread must not outlive this point (see fl_board_shutdown)
     #[cfg(has_fastlane)]
@@ -1347,6 +1689,10 @@ pub fn report() {
         ffi::fl_board_shutdown()
     };
     if !enabled() {
+        // the CPU-split control runs without the card
+        if push_split_cpu() {
+            report_split();
+        }
         return;
     }
     let events = global_events();
@@ -1381,14 +1727,19 @@ pub fn report() {
         PMIC_QUERIES.load(Ordering::Relaxed)
     );
     eprintln!(
-        "fastlane-race: busy_skips={} busy_cpu_ms={:.3} budget={} adapt_up={} adapt_down={} reloads={} timed_submits={}",
+        "fastlane-race: busy_skips={} busy_cpu_ms={:.3} budget={} adapt_up={} adapt_down={} reloads={} slow_reloads={} rel_reloads={} loaded_last={} loaded_sum={} timed_submits={} dead_reloads={}",
         RACE_BUSY.load(Ordering::Relaxed),
         RACE_BUSY_NS.load(Ordering::Relaxed) as f64 / 1e6,
         cpu_first_budget().unwrap_or(0),
         ADAPT_UP.load(Ordering::Relaxed),
         ADAPT_DOWN.load(Ordering::Relaxed),
         RELOADS.load(Ordering::Relaxed),
-        TIMED_SUBMITS.load(Ordering::Relaxed)
+        SLOW_RELOADS.load(Ordering::Relaxed),
+        REL_RELOADS.load(Ordering::Relaxed),
+        LOADED.load(Ordering::Relaxed),
+        LOADED_SUM.load(Ordering::Relaxed),
+        TIMED_SUBMITS.load(Ordering::Relaxed),
+        DEAD_RELOADS.load(Ordering::Relaxed)
     );
     let hist = |h: &[AtomicU64; 8]| {
         h.iter()
@@ -1402,19 +1753,7 @@ pub fn report() {
         hist(&DEPTH_SUB),
         hist(&DEPTH_WIN)
     );
-    eprintln!(
-        "fastlane-split: batches={} card_queries={} card_unsat={} card_sat={} card_fallback={} cpu_checks={} wait_ms={:.3} cpu_us={:.1} card_us={:.1} batch_kernel_ms={:.3}",
-        SPLIT_BATCHES.load(Ordering::Relaxed),
-        SPLIT_CARD_QUERIES.load(Ordering::Relaxed),
-        SPLIT_CARD_UNSAT.load(Ordering::Relaxed),
-        SPLIT_CARD_SAT.load(Ordering::Relaxed),
-        SPLIT_CARD_FALLBACK.load(Ordering::Relaxed),
-        SPLIT_CPU_CHECKS.load(Ordering::Relaxed),
-        SPLIT_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6,
-        SPLIT_CPU_NS.load(Ordering::Relaxed) as f64 / 1e3,
-        SPLIT_CARD_NS.load(Ordering::Relaxed) as f64 / 1e3,
-        SPLIT_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1e6
-    );
+    report_split();
     eprintln!(
         "fastlane-fuse: pushes={} used={}",
         FUSED_PUSHES.load(Ordering::Relaxed),

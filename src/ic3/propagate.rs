@@ -290,6 +290,14 @@ impl IC3 {
                 self.fastlane_reload();
             }
             let mut split = self.push_split(frame_idx, &frame);
+            // lock mode, INDUCTOR_FASTLANE_SPLIT_FB_BATCH=1: the card's missing
+            // answers (an overflow leaves every later one UNKNOWN) are checked
+            // together on one clone, from the first one to the end of the tail
+            let fb_tail = split
+                .as_ref()
+                .filter(|sp| sp.cpu.is_none() && crate::fastlane::split_lock().is_some() && crate::fastlane::split_fb_batch())
+                .map(|sp| frame[sp.at..].to_vec());
+            let mut fb: Option<(usize, Vec<bool>)> = None;
             let mut live = 0usize;
             for (lemma_index, mut lemma) in frame.into_iter().enumerate() {
                 if self.frame[frame_idx].iter().all(|l| l.ne(&lemma)) {
@@ -380,6 +388,25 @@ impl IC3 {
                                 let (blocked, core) = std::mem::take(&mut cpu[lemma_index - sp.at]);
                                 split_core = core;
                                 Some(blocked)
+                            } else if crate::fastlane::split_lock().is_some() {
+                                // lock mode: a missing card answer is checked on a clone
+                                let blocked = match self.split_answer(frame_idx, sp, lemma_index) {
+                                    Some(b) => b,
+                                    None => match &fb_tail {
+                                        Some(tail) => {
+                                            let k = lemma_index - sp.at;
+                                            if fb.as_ref().is_none_or(|(s, _)| k < *s) {
+                                                let answers = self.split_cpu_answers(frame_idx, &tail[k..], true);
+                                                fb = Some((k, answers.into_iter().map(|a| a.0).collect()));
+                                            }
+                                            let (s, v) = fb.as_ref().unwrap();
+                                            v[k - s]
+                                        }
+                                        None => self.split_cpu_answers(frame_idx, std::slice::from_ref(&lemma), true)[0].0,
+                                    },
+                                };
+                                split_core = blocked.then(|| lemma.as_litvec().clone());
+                                Some(blocked)
                             } else {
                                 self.split_answer(frame_idx, sp, lemma_index)
                             }
@@ -414,6 +441,9 @@ impl IC3 {
                                 .inductive_core()
                                 .unwrap_or(lemma.as_litvec().clone())
                         });
+                        if ctp == 0 && split.is_some() {
+                            crate::fastlane::note_push_core(!on_cpu && split.as_ref().is_some_and(|sp| sp.cpu.is_none()), lemma.len(), core.len());
+                        }
                         if let Some(po) = &mut lemma.po
                             && po.frame < frame_idx + 2
                             && self.obligations.remove(po)
@@ -471,45 +501,30 @@ impl IC3 {
     /// when the CPU reaches it.
     fn push_split(&mut self, frame_idx: usize, frame: &Frame) -> Option<crate::fastlane::PushSplit> {
         use crate::fastlane as fl;
-        if fl::push_split_cpu() {
-            let k = fl::split_size(frame.len());
-            if k == 0 {
-                return None;
-            }
-            let at = frame.len() - k;
-            let mut answers = Vec::with_capacity(k);
-            for lemma in frame[at..].iter() {
-                let start = Instant::now();
-                let blocked = self
-                    .blocked(frame_idx + 1, lemma)
-                    .in_phase(inductor_trace::Phase::Push)
-                    .with_act_order(false)
-                    .check();
-                fl::note_cpu_check(start.elapsed().as_nanos() as u64);
-                let core = blocked.then(|| {
-                    self.solvers[frame_idx]
-                        .inductive_core()
-                        .unwrap_or(lemma.as_litvec().clone())
-                });
-                answers.push((blocked, core));
-            }
-            return Some(fl::PushSplit::cpu_answered(at, answers));
-        }
-        if !fl::push_split_enabled()
-            || !fl::enabled()
-            || !fl::pool_mode()
-            || !fl::routes_phase(inductor_trace::Phase::Push as u8)
-            || !fl::card_ready()
-            || fl::reload_pending()
-            || !fl::in_band(self.solvers[frame_idx].dcs.fastlane_frame)
-        {
+        if !fl::gate_open() {
             return None;
         }
-        let k = fl::split_size(frame.len());
+        let lock = fl::split_lock().is_some();
+        let card_ok = fl::push_split_enabled()
+            && fl::enabled()
+            && fl::pool_mode()
+            && fl::routes_phase(inductor_trace::Phase::Push as u8)
+            && fl::card_ready()
+            && !fl::reload_pending()
+            && !fl::split_card_off()
+            && fl::in_band(self.solvers[frame_idx].dcs.fastlane_frame);
+        let k = if lock { fl::lock_size(frame.len()) } else { fl::split_size(frame.len()) };
         if k == 0 {
             return None;
         }
         let at = frame.len() - k;
+        if fl::push_split_cpu() || (lock && !card_ok) {
+            let answers = self.split_cpu_answers(frame_idx, &frame[at..], lock);
+            return Some(fl::PushSplit::cpu_answered(at, answers));
+        }
+        if !card_ok {
+            return None;
+        }
         let mut cubes = Vec::with_capacity(k);
         let mut queries = Vec::with_capacity(k);
         for lemma in frame[at..].iter() {
@@ -520,6 +535,49 @@ impl IC3 {
         }
         let fl_frame = self.solvers[frame_idx].dcs.fastlane_frame.unwrap_or(0);
         fl::PushSplit::submit(at, cubes, queries, fl_frame)
+    }
+
+    /// CPU answers (blocked, core) for `lemmas` at `frame_idx`.  Lock mode:
+    /// checked on a clone of the frame solver, which sees no checks it would
+    /// not see with the card answering, and blocked lemmas keep all their
+    /// literals.
+    fn split_cpu_answers(
+        &mut self,
+        frame_idx: usize,
+        lemmas: &[FrameLemma],
+        lock: bool,
+    ) -> Vec<(bool, Option<LitVec>)> {
+        use crate::fastlane as fl;
+        let saved = lock.then(|| {
+            let start = Instant::now();
+            let clone = self.solvers[frame_idx].clone();
+            fl::SPLIT_CLONE_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            std::mem::replace(&mut self.solvers[frame_idx], clone)
+        });
+        let mut answers = Vec::with_capacity(lemmas.len());
+        for lemma in lemmas {
+            let start = Instant::now();
+            let blocked = self
+                .blocked(frame_idx + 1, lemma)
+                .in_phase(inductor_trace::Phase::Push)
+                .with_act_order(false)
+                .check();
+            fl::note_cpu_check(start.elapsed().as_nanos() as u64);
+            let core = blocked.then(|| {
+                if lock {
+                    lemma.as_litvec().clone()
+                } else {
+                    self.solvers[frame_idx]
+                        .inductive_core()
+                        .unwrap_or(lemma.as_litvec().clone())
+                }
+            });
+            answers.push((blocked, core));
+        }
+        if let Some(solver) = saved {
+            self.solvers[frame_idx] = solver;
+        }
+        answers
     }
 
     /// The card's push answer for frame lemma `index` installed into the
@@ -540,6 +598,7 @@ impl IC3 {
         };
         let missing = matches!(result, LaneResult::Unknown) && ((index - split.at) as u32) >= split.finish();
         let answer = match result {
+            LaneResult::Unsat { .. } if fl::split_lock().is_some() => Some(true),
             LaneResult::Unsat { .. } => {
                 let cube = split.cubes[index - split.at].clone();
                 self.solvers[frame_idx].install_push_result(&cube, result)
@@ -549,11 +608,15 @@ impl IC3 {
             LaneResult::Unknown => {
                 // no budget: an UNKNOWN answer means the lane overflowed
                 if !missing {
+                    fl::note_card_overflow();
                     fl::request_reload();
                 }
                 None
             }
         };
+        if answer.is_some() {
+            fl::note_card_answer();
+        }
         match answer {
             Some(true) => fl::SPLIT_CARD_UNSAT.fetch_add(1, Ordering::Relaxed),
             Some(false) => fl::SPLIT_CARD_SAT.fetch_add(1, Ordering::Relaxed),

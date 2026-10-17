@@ -417,6 +417,7 @@ impl IC3 {
                 self.propagate(None)
             });
             self.statistic.propagate.overall_time += start.elapsed();
+            crate::fastlane::gate_note(self.statistic.propagate.overall_time);
             if propagate {
                 if frame_event.is_some() {
                     crate::accel::cdcl_host::finish_exact_frame_events(
