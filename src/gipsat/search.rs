@@ -128,6 +128,15 @@ impl DagCnfSolver {
                 crate::inductor::ANALYZE_NS
                     .fetch_add(probe_an.ns() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.backtrack(btl, true);
+                if learnt.len() == 1 || !learnt.iter().any(|l| self.constrain_act == l.var()) {
+                    super::LEARNT_CAPTURE.with_borrow_mut(|c| {
+                        if let Some((max, buf)) = c
+                            && learnt.len() <= *max
+                        {
+                            buf.push(learnt.clone());
+                        }
+                    });
+                }
                 if learnt.len() == 1 {
                     debug_assert!(btl == 0);
                     self.assign(learnt[0], CREF_NONE);

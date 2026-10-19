@@ -78,6 +78,7 @@ mod ffi {
         pub fn fl_batch_submit(lane: *mut FlLane, words: *const u32, offs: *const u32, n: u32) -> i32;
         pub fn fl_batch_collect() -> u32;
         pub fn fl_batch_take(lane: *mut FlLane, i: u32) -> i32;
+        pub fn fl_learnts(lane: *const FlLane, out: *mut *const u32) -> u32;
         pub fn fl_board_kernel_ns() -> u64;
         pub fn fl_pmic_push(
             lanes: *mut *mut FlLane,
@@ -414,6 +415,19 @@ impl LaneHandle {
         }
         #[allow(unreachable_code)]
         LaneResult::Unknown
+    }
+
+    /// The learnts exported with the last card result (`x_len`), as records
+    /// [len, lo, hi, lits...].
+    pub fn learnts(&self) -> Vec<u32> {
+        #[cfg(has_fastlane)]
+        unsafe {
+            let mut p: *const u32 = std::ptr::null();
+            let n = ffi::fl_learnts(self.ptr, &mut p);
+            return if n == 0 { Vec::new() } else { std::slice::from_raw_parts(p, n as usize).to_vec() };
+        }
+        #[allow(unreachable_code)]
+        Vec::new()
     }
 
     /// Result of the submitted SOLVE (waits for the card).
@@ -765,6 +779,35 @@ pub fn split_fb_batch() -> bool {
     *B.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_SPLIT_FB_BATCH").is_ok_and(|v| v == "1"))
 }
 
+/// INDUCTOR_FASTLANE_SPLIT_IMPORT=L: lock mode copies the clauses of at most
+/// L literals that the clone learns on a split's CPU answers back into the
+/// frame solver (0: off), as the card would return its learnts.
+pub fn split_import() -> usize {
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_SPLIT_IMPORT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// INDUCTOR_FASTLANE_X_LEN=L (bitstream with learnt export): the card returns
+/// each push-split answer's learnts of at most L literals, and the frame
+/// solver imports those valid at its frame (0: off).
+pub fn x_len() -> usize {
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_X_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// INDUCTOR_FASTLANE_X_CHECK=1 (debug): check that every exported learnt is
+/// implied by the frame solver before importing it.
+pub fn x_check() -> bool {
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| std::env::var("INDUCTOR_FASTLANE_X_CHECK").is_ok_and(|v| v == "1"))
+}
+pub static X_CHECK_OK: AtomicU64 = AtomicU64::new(0);
+pub static X_CHECK_BAD: AtomicU64 = AtomicU64::new(0);
+pub static X_CHECK_UNK: AtomicU64 = AtomicU64::new(0);
+
+/// Learnt clauses imported into frame solvers (`split_import`, `x_len`).
+pub static SPLIT_IMPORTED: AtomicU64 = AtomicU64::new(0);
+
 /// Time spent cloning frame solvers for lock-mode CPU answers (ns).
 pub static SPLIT_CLONE_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -1066,6 +1109,30 @@ impl PushSplit {
             return LaneResult::Unknown;
         }
         with_pool(|pool| pool.replicas[0].batch_take(i as u32)).unwrap_or(LaneResult::Unknown)
+    }
+
+    /// The learnts the card exported with the last `take`, valid at query
+    /// frame `frame`.
+    pub fn learnts(&self, frame: u32) -> Vec<logicrs::LitVec> {
+        let w = with_pool(|pool| pool.replicas[0].learnts()).unwrap_or_default();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 3 <= w.len() {
+            let (n, lo, hi) = (w[at] as usize, w[at + 1], w[at + 2]);
+            if at + 3 + n > w.len() {
+                break;
+            }
+            if lo <= frame && frame <= hi {
+                out.push(
+                    w[at + 3..at + 3 + n]
+                        .iter()
+                        .map(|&r| logicrs::Lit::new(logicrs::Var::from(r >> 1), r & 1 == 0))
+                        .collect(),
+                );
+            }
+            at += 3 + n;
+        }
+        out
     }
 }
 
@@ -1651,7 +1718,15 @@ fn report_split() {
     let ratio = |k: usize| {
         CORE_LITS[k].load(Ordering::Relaxed) as f64 / CORE_LEMMA_LITS[k].load(Ordering::Relaxed).max(1) as f64
     };
-    eprintln!("fastlane-split-lock: clone_ms={:.3}", SPLIT_CLONE_NS.load(Ordering::Relaxed) as f64 / 1e6);
+    eprintln!("fastlane-split-lock: clone_ms={:.3} imported={}", SPLIT_CLONE_NS.load(Ordering::Relaxed) as f64 / 1e6, SPLIT_IMPORTED.load(Ordering::Relaxed));
+    if x_check() {
+        eprintln!(
+            "fastlane-x-check: implied={} not_implied={} unknown={}",
+            X_CHECK_OK.load(Ordering::Relaxed),
+            X_CHECK_BAD.load(Ordering::Relaxed),
+            X_CHECK_UNK.load(Ordering::Relaxed)
+        );
+    }
     if prop_gate().is_some() {
         eprintln!(
             "fastlane-gate: open={} opened_at_ms={} closed_phases={}",

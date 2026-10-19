@@ -14,6 +14,12 @@ use crate::gipsat::eq::Eqc;
 use analyze::Analyze;
 pub use cdb::ClauseKind;
 use cdb::{CREF_NONE, CRef, ClauseDB};
+thread_local! {
+    /// While set to `Some((max_len, buf))`, every clause this thread's solvers
+    /// learn with at most `max_len` literals (units included) is copied to `buf`.
+    pub static LEARNT_CAPTURE: std::cell::RefCell<Option<(usize, Vec<LitVec>)>> =
+        const { std::cell::RefCell::new(None) };
+}
 use domain::Domain;
 use giputils::bitvec::BitVec;
 use giputils::gvec::Gvec;
@@ -303,6 +309,24 @@ impl DagCnfSolver {
             return None;
         }
         Some(clause)
+    }
+
+    /// Add clauses learnt by another solver over the same clauses (a clone
+    /// of this one, see `LEARNT_CAPTURE`) as learnt clauses of this one.
+    pub fn import_learnts(&mut self, learnts: &[LitVec]) -> usize {
+        self.reset();
+        let mut n = 0;
+        for c in learnts {
+            if self.trivial_unsat {
+                break;
+            }
+            let cref = self.add_clause_inner(c, ClauseKind::Learnt);
+            if cref != CREF_NONE {
+                self.cdb.bump(cref);
+            }
+            n += 1;
+        }
+        n
     }
 
     fn add_clause_inner(&mut self, clause: &[Lit], mut kind: ClauseKind) -> CRef {

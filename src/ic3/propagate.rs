@@ -554,6 +554,10 @@ impl IC3 {
             fl::SPLIT_CLONE_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             std::mem::replace(&mut self.solvers[frame_idx], clone)
         });
+        let import = if lock { fl::split_import() } else { 0 };
+        if import > 0 {
+            crate::gipsat::LEARNT_CAPTURE.set(Some((import, Vec::new())));
+        }
         let mut answers = Vec::with_capacity(lemmas.len());
         for lemma in lemmas {
             let start = Instant::now();
@@ -577,6 +581,12 @@ impl IC3 {
         if let Some(solver) = saved {
             self.solvers[frame_idx] = solver;
         }
+        if import > 0
+            && let Some((_, learnts)) = crate::gipsat::LEARNT_CAPTURE.take()
+        {
+            let n = self.solvers[frame_idx].dcs.import_learnts(&learnts);
+            fl::SPLIT_IMPORTED.fetch_add(n as u64, Ordering::Relaxed);
+        }
         answers
     }
 
@@ -597,6 +607,26 @@ impl IC3 {
             LaneResult::Unknown
         };
         let missing = matches!(result, LaneResult::Unknown) && ((index - split.at) as u32) >= split.finish();
+        if fl::x_len() > 0 && !missing {
+            let fl_frame = self.solvers[frame_idx].dcs.fastlane_frame.unwrap_or(0);
+            let learnts = split.learnts(fl_frame);
+            if fl::x_check() && !learnts.is_empty() {
+                // debug: each exported clause must be implied by the frame solver
+                let mut probe = self.solvers[frame_idx].dcs.clone();
+                for c in learnts.iter() {
+                    let neg: Vec<_> = c.iter().map(|l| !*l).collect();
+                    match probe.solve_with_constraint_budget(&neg, vec![], 1_000_000) {
+                        Some(false) => fl::X_CHECK_OK.fetch_add(1, Ordering::Relaxed),
+                        Some(true) => fl::X_CHECK_BAD.fetch_add(1, Ordering::Relaxed),
+                        None => fl::X_CHECK_UNK.fetch_add(1, Ordering::Relaxed),
+                    };
+                }
+            }
+            if !learnts.is_empty() {
+                let n = self.solvers[frame_idx].dcs.import_learnts(&learnts);
+                fl::SPLIT_IMPORTED.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
         let answer = match result {
             LaneResult::Unsat { .. } if fl::split_lock().is_some() => Some(true),
             LaneResult::Unsat { .. } => {
